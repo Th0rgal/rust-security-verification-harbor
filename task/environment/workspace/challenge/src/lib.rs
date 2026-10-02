@@ -1,4 +1,4 @@
-//! Deliberately vulnerable training code. Do not deploy.
+//! Local arithmetic authorization exercise.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Authorization {
@@ -8,6 +8,8 @@ pub struct Authorization {
 /// Authorize a transfer before it is sent to a wider-integer settlement layer.
 ///
 /// Policy: principal plus fee must not exceed the account balance.
+/// Authorize every affordable payment and reject every unaffordable payment.
+/// The returned debit is the principal plus fees actually applied at settlement.
 pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
     let total = amount.wrapping_add(fee);
     (total <= balance).then_some(Authorization { total_debit: total })

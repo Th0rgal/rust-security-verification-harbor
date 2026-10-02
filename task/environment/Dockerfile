@@ -7,5 +7,6 @@ COPY --from=lean /opt/lean/ /opt/lean/
 ENV PATH="/opt/lean/bin:${PATH}" LEAN_PATH=/workspace/lean
 COPY workspace/ /workspace/
 WORKDIR /workspace
-RUN cd challenge && cargo test --release && mkdir -p /workspace/submission/src \
+RUN cd /workspace/lean && lean -o SecurityChallenge.olean SecurityChallenge.lean \
+ && cd /workspace/challenge && cargo test --release && mkdir -p /workspace/submission/src \
  && cd /workspace/lean && lean Signature.lean

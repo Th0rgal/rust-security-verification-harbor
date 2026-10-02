@@ -20,8 +20,7 @@ import rust_symbolic
 from isolation import restrict
 
 MAX = spec.MAX
-WEIGHTS = {'spec': .20, 'counterexample': .25, 'patch': .25, 'proof': .30}
-PROFILES = {'specify':'spec', 'refute':'counterexample', 'repair':'patch', 'prove':'proof'}
+WEIGHTS = {'spec': .25, 'verdict': .15, 'proof': .25, 'response': .35}
 STATUSES = ('pass', 'partial', 'fail', 'missing', 'unknown', 'timeout', 'unsupported', 'infrastructure_error')
 MAX_ARTIFACT_BYTES = 65536
 
@@ -142,126 +141,176 @@ def check_patch(source):
             'checks': {'compile_api': {'status':'pass'}, 'universal_equivalence':universal, 'concrete_defense':concrete}}
 
 
-SIGNATURE = '''theorem patched_authorize_sound (balance amount fee total : Nat)
-    (h : repairedAuthorize balance amount fee = some total) :
-    amount + fee = total ∧ total ≤ balance'''
-HEADER = 'import SecurityChallenge\nimport Lean\nimport Std\nopen SecurityChallenge\n'
+
 ALLOWED_IMPORTS = {'SecurityChallenge', 'Lean', 'Std', 'Lean.Elab.Tactic.Omega'}
 
-
-def proof_term(text):
-    # Strip nested Lean comments; string contents stay intact for Lean's parser.
+def clean_source(text, imports):
+    # Ignore nested Lean comments for policy checks. Lean still receives source
+    # and is authoritative for syntax/type checking; this is not its parser.
     text = re.sub(r'--[^\n]*', '', text)
     while '/-' in text:
-        start = text.index('/-'); pos = start+2; depth = 1
-        while depth and pos < len(text):
+        start=text.index('/-'); pos=start+2; depth=1
+        while depth and pos<len(text):
             if text.startswith('/-',pos): depth+=1; pos+=2
             elif text.startswith('-/',pos): depth-=1; pos+=2
             else: pos+=1
         if depth: raise ValueError('unterminated Lean comment')
-        text = text[:start] + ' ' + text[pos:]
-    text = text.strip()
-    while text.startswith('import '):
-        line, _, text = text.partition('\n')
-        if any(name not in ALLOWED_IMPORTS for name in line.split()[1:]): raise ValueError('forbidden Lean import')
-        text = text.strip()
-    if not text: raise FileNotFoundError('empty proof')
-    # Declaration escapes are outside a proof term. No tactic (including omega)
-    # is required. Executable metaprograms run inside the OS sandbox.
-    banned = r'\b(sorry|sorryAx|admit|axiom|import|theorem|def|opaque|constant|constants|unsafe|initialize|builtin_initialize|native_decide|implemented_by|extern|syntax|macro|elab|attribute|set_option|namespace|section|end|export)\b'
-    if re.search(banned, text) or '#' in text:
-        raise ValueError('forbidden axiom, declaration, import, or unsafe proof escape')
+        text=text[:start]+' '+text[pos:]
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            if any(x not in imports for x in line.split()[1:]): raise ValueError('forbidden Lean import')
+    # Additional imports cannot be smuggled inside another command.
+    remaining=re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    if re.search(r'\b(import|sorry|sorryAx|admit|axiom|unsafe|initialize|builtin_initialize|native_decide|implemented_by|extern|syntax|macro|elab)\b',remaining):
+        raise ValueError('forbidden axiom/import/unsafe elaboration extension')
     return text
 
+class LeanSession:
+    """Compile in isolation, freeze .olean files, independently replay kernels.
+    Each stage gets a fresh directory and only previously frozen dependencies.
+    The trusted precompiled auditor imports serialized declarations as data.
+    """
+    def __init__(self, verifier):
+        self.verifier=verifier
+        self.api=verifier/'api'
+        if not (self.api/'SecurityChallenge.olean').exists(): self.api=verifier/'.lake/build/lib/lean'
+        self.lean=shutil.which('lean'); self.checker=shutil.which('leanchecker')
+        if not self.lean or not self.checker: raise RuntimeError('Lean/leanchecker unavailable')
+        if not (self.api/'SpecAudit.olean').exists(): raise RuntimeError('trusted Lean API/auditor not built')
+        version=run([self.lean,'--version'],verifier,15)
+        if 'version 4.31.0,' not in version.stdout: raise RuntimeError('Lean 4.31.0 required')
+        self.prefix=Path(self.lean).resolve().parent.parent
+        self.frozen={}
 
-def check_proof(text, verifier):
-    term = proof_term(text)
-    lean = shutil.which('lean'); checker = shutil.which('leanchecker')
-    if not lean or not checker: raise RuntimeError('Lean/leanchecker unavailable')
-    version = run([lean, '--version'], verifier, 15)
-    if 'version 4.31.0,' not in version.stdout: raise RuntimeError('Lean 4.31.0 is required')
-    api = verifier/'api'
-    if not (api/'SecurityChallenge.olean').exists():
-        api = verifier/'.lake/build/lib/lean'
-    if not (api/'SecurityChallenge.olean').exists(): raise RuntimeError('trusted Lean API not built')
-    prefix = Path(lean).resolve().parent.parent
-    with tempfile.TemporaryDirectory(prefix='security-proof-') as raw:
-        tmp = Path(raw)
-        (tmp/'Candidate.lean').write_text(HEADER + SIGNATURE + ' := (\n' + term + '\n)\n')
-        env = {'PATH': str(Path(lean).parent) + ':/usr/bin:/bin', 'HOME': str(tmp),
-               'LEAN_PATH': str(api.resolve()) + ':' + str(tmp), 'TMPDIR': str(tmp)}
-        reads = [str(prefix), str(api.resolve()), '/usr/lib', '/lib', '/lib64', '/dev/null', '/dev/urandom']
-        try:
-            candidate = run([lean, '-j1', '-M2048', '-o', 'Candidate.olean', 'Candidate.lean'], tmp, 120,
-                            env=env, sandbox=True, read_paths=reads)
-        except subprocess.SubprocessError as exc:
-            raise RuntimeError('proof sandbox unavailable: ' + str(exc)) from exc
-        if candidate.returncode or not (tmp/'Candidate.olean').is_file():
-            return {'status':'fail', 'reason':'Lean rejected proof', 'diagnostic':(candidate.stdout+candidate.stderr)[-4000:]}
-        serialized = tmp/'Candidate.olean'
-        if serialized.is_symlink() or serialized.stat().st_size > 32*1024**2:
-            raise ValueError('invalid serialized proof artifact')
-        # Candidate cannot shadow trusted modules or leave executable extensions.
-        frozen = serialized.read_bytes()
-        for item in tmp.iterdir():
-            if item.is_dir() and not item.is_symlink(): shutil.rmtree(item)
-            else: item.unlink()
-        serialized.write_bytes(frozen)
-        # Independent kernel replay defeats tactic-side environment mutations.
-        replay = run([checker, 'Candidate'], tmp, 120, env=env, sandbox=True, read_paths=reads)
-        if replay.returncode:
-            return {'status':'fail', 'reason':'independent kernel replay rejected proof', 'diagnostic':(replay.stdout+replay.stderr)[-4000:]}
-        audit_file = verifier/'ProofAudit.lean'
-        if not audit_file.is_file(): raise RuntimeError('trusted proof auditor unavailable')
-        audit = run([lean, '-j1', '--run', str(audit_file.resolve())], tmp, 120,
-                    env=env, sandbox=True, read_paths=reads+[str(audit_file.resolve())])
-        if audit.returncode or 'AUDITED_AXIOMS' not in audit.stdout:
-            return {'status':'fail', 'reason':'theorem type/axiom audit failed', 'diagnostic':(audit.stdout+audit.stderr)[-4000:]}
-        return {'status':'pass', 'reason':'Lean kernel + independent replay + exact type + transitive axiom audit',
-                'axioms':audit.stdout.strip(), 'allowed_imports':sorted(ALLOWED_IMPORTS), 'model':'opaque certified API (independent of submitted Rust)'}
+    def stage(self,module,text,mode):
+        if module=='CandidateProof':
+            cleaned=clean_source(text,ALLOWED_IMPORTS)
+            while cleaned.strip().startswith('import '):
+                _,_,cleaned=cleaned.strip().partition('\n')
+            if re.search(r'\b(theorem|def|opaque|constant|namespace|section|end|export|attribute|set_option)\b',cleaned) or '#' in cleaned:
+                raise ValueError('Proof.lean must be a proof term')
+            text='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+cleaned+'\n)\n'
+        else:
+            clean_source(text,ALLOWED_IMPORTS)
+            text='import SecurityChallenge\n'+text
+        with tempfile.TemporaryDirectory(prefix='lean-native-') as raw:
+            tmp=Path(raw)
+            for name,data in self.frozen.items(): (tmp/name).write_bytes(data)
+            (tmp/(module+'.lean')).write_text(text)
+            env={'PATH':str(Path(self.lean).parent)+':/usr/bin:/bin','HOME':str(tmp),
+                 'LEAN_PATH':str(self.api.resolve())+':'+str(tmp),'TMPDIR':str(tmp)}
+            reads=[str(self.prefix),str(self.api.resolve()),'/usr/lib','/lib','/lib64','/dev/null','/dev/urandom']
+            try:
+                compiled=run([self.lean,'-j1','-M2048','-o',module+'.olean',module+'.lean'],tmp,120,env=env,sandbox=True,read_paths=reads)
+            except subprocess.SubprocessError as exc:
+                raise RuntimeError('Lean sandbox infrastructure unavailable: '+str(exc)) from exc
+            artifact=tmp/(module+'.olean')
+            if compiled.returncode or not artifact.is_file():
+                return {'status':'fail','reason':'Lean compilation rejected artifact','diagnostic':(compiled.stdout+compiled.stderr)[-4000:]}
+            if artifact.is_symlink() or artifact.stat().st_size>32*1024**2: raise ValueError('invalid Lean artifact')
+            data=artifact.read_bytes()
+            # Delete every file emitted by untrusted elaboration. Restore only
+            # known frozen dependencies and the single serialized declaration.
+            for item in tmp.iterdir():
+                if item.is_dir() and not item.is_symlink(): shutil.rmtree(item)
+                else: item.unlink()
+            for name,previous in self.frozen.items(): (tmp/name).write_bytes(previous)
+            artifact.write_bytes(data)
+            replay=run([self.checker,module],tmp,120,env=env,sandbox=True,read_paths=reads)
+            if replay.returncode:
+                return {'status':'fail','reason':'independent kernel replay rejected artifact','diagnostic':(replay.stdout+replay.stderr)[-4000:]}
+            auditor=self.verifier/'SpecAudit.lean'
+            audited=run([self.lean,'-j1','-M2048','--run',str(auditor.resolve()),mode],tmp,120,
+                        env=env,sandbox=True,read_paths=reads+[str(auditor.resolve())])
+            if audited.returncode:
+                return {'status':'fail','reason':'type/axiom audit rejected artifact','diagnostic':(audited.stdout+audited.stderr)[-4000:]}
+            result=json_object(audited.stdout.strip())
+            self.frozen[module+'.olean']=data
+            if mode=='spec': return spec.check(result)
+            return {'status':'pass',**result}
 
+def capture(check):
+    try: return check()
+    except FileNotFoundError as exc: return {'status':'missing','reason':str(exc)}
+    except spec.Unsupported as exc: return {'status':'unsupported','reason':str(exc)}
+    except subprocess.TimeoutExpired as exc: return {'status':'timeout','reason':str(exc)}
+    except (ValueError,RecursionError) as exc: return {'status':'fail','reason':str(exc)}
+    except Exception as exc: return {'status':'infrastructure_error','reason':str(exc)}
 
-def grade(workspace, verifier, profile='integrated'):
-    weights = WEIGHTS if profile == 'integrated' else {k: float(k == PROFILES[profile]) for k in WEIGHTS}
-    submission = workspace/'submission'
-    checks = {'spec': ('spec.json', lambda t: spec.check(json_object(t))),
-              'counterexample': ('counterexample.json', lambda t: check_counterexample(t, verifier)),
-              'patch': ('src/lib.rs', check_patch),
-              'proof': ('Proof.lean', lambda t: check_proof(t, verifier))}
-    details = {'version':2, 'status':'ok', 'statuses':list(STATUSES), 'checkpoints':{},
-               'scoring':'independent, no cascade locks', 'weights':weights, 'profile':profile}
-    for name, (rel, check) in checks.items():
-        start = time.monotonic(); source = None
-        try:
-            if submission.is_symlink(): raise ValueError('symlink submission rejected')
-            source = read_artifact(submission/rel)
-            if not source.strip() or (name in ('spec','counterexample') and source.strip() == '{}'):
-                raise FileNotFoundError('empty artifact')
-            result = check(source)
-        except FileNotFoundError as exc: result = {'status':'missing','reason':str(exc)}
-        except spec.Unsupported as exc: result = {'status':'unsupported','reason':str(exc)}
-        except subprocess.TimeoutExpired as exc: result = {'status':'timeout','reason':str(exc)}
-        except (ValueError, RecursionError) as exc: result = {'status':'fail','reason':str(exc)}
-        except Exception as exc: result = {'status':'infrastructure_error','reason':str(exc)}
-        result['passed'] = result['status']=='pass'
-        result['score'] = round(weights[name] * result.get('credit_fraction', float(result['passed'])), 4)
-        result['elapsed_seconds'] = round(time.monotonic()-start, 3)
-        if source is not None: result['artifact_sha256'] = hashlib.sha256(source.encode()).hexdigest()
-        details['checkpoints'][name] = result
-    details['reward'] = round(sum(x['score'] for x in details['checkpoints'].values()), 2)
-    if any(x['status']=='infrastructure_error' and weights[k] > 0 for k,x in details['checkpoints'].items()): details['status']='infrastructure_error'
-    return details
+def unexpected_safe_artifacts(submission):
+    return [rel for rel in ('counterexample.json','src/lib.rs')
+            if (submission/rel).exists() or (submission/rel).is_symlink()
+            or (submission/rel).parent.is_symlink()]
 
+def grade(workspace,verifier,profile=None):
+    submission=workspace/'submission'
+    if submission.is_symlink(): return {'version':3,'status':'fail','reward':0,'reason':'submission symlink'}
+    # Variant belongs to the pristine verifier, never to submitted files.
+    variant=(verifier/'variant.txt').read_text().strip()
+    if variant not in ('safe','vulnerable'): raise RuntimeError('invalid trusted variant')
+    session=None
+    checks={}
+    artifacts={}
+    def artifact(rel):
+        t=read_artifact(submission/rel)
+        if not t.strip(): raise FileNotFoundError('empty '+rel)
+        artifacts[rel]=hashlib.sha256(t.encode()).hexdigest()
+        return t
+    def lean_stage(module,rel,mode):
+        nonlocal session
+        if session is None: session=LeanSession(verifier)
+        return session.stage(module,artifact(rel),mode)
+    start=time.monotonic()
+    checks['spec']=capture(lambda:lean_stage('CandidateSpec','Spec.lean','spec'))
+    checks['verdict']=capture(lambda:lean_stage('CandidateAudit','Audit.lean','verdict'))
+    verdict=checks['verdict'].get('verdict')
+    if verdict is not None:
+        checks['verdict']['status']='pass' if verdict==variant else 'fail'
+        checks['verdict']['reason']='compared with pristine implementation'
+    checks['proof']=capture(lambda:lean_stage('CandidateProof','Proof.lean','proof'))
+    # Correctness of the spec and diagnostic theorem are intentionally separate.
+    # A proof about an inadequate spec is reported as such, not silently upgraded.
+    checks['proof']['scope']='AuditClaim of the submitted spec and submitted verdict over the visible original model'
+    checks['proof']['spec_semantically_complete']=checks['spec']['status']=='pass'
+    if variant=='vulnerable':
+        witness=capture(lambda:check_counterexample(artifact('counterexample.json'),verifier))
+        patch=capture(lambda:check_patch(artifact('src/lib.rs')))
+        score=.15*(witness['status']=='pass')+.20*(patch['status']=='pass')
+        checks['response']={'status':'pass' if score==.35 else 'partial' if score else 'fail',
+                            'credit_fraction':score/.35,'checks':{'counterexample':witness,'patch':patch}}
+        if any(r['status']=='infrastructure_error' for r in (witness,patch)):
+            checks['response']['status']='infrastructure_error'
+    else:
+        original=capture(lambda:check_patch((verifier/'pristine/lib.rs').read_text()))
+        # Safe responses require absence, so inspect metadata only. Never read
+        # optional attacker files (binary/oversized/device/symlink) at all.
+        unwanted=unexpected_safe_artifacts(submission)
+        justified=verdict=='safe' and checks['proof']['status']=='pass' and original['status']=='pass'
+        # No score for merely omitting files, and no score for a bare "safe".
+        checks['response']={'status':'pass' if justified and not unwanted else 'fail',
+                            'checks':{'original_universal_conformance':original},
+                            'unnecessary_artifacts':unwanted,'reason':'safe response requires Lean evidence and universal original Rust verification'}
+        if original['status']=='infrastructure_error': checks['response']['status']='infrastructure_error'
+        if not justified: checks['verdict']['status']='fail' if checks['verdict']['status']=='pass' else checks['verdict']['status']
+    for name,r in checks.items():
+        r['passed']=r['status']=='pass'
+        r['score']=round(WEIGHTS[name]*r.get('credit_fraction',float(r['passed'])),4)
+    reward=round(sum(r['score'] for r in checks.values()),4)
+    return {'version':3,'variant':variant,'status':'infrastructure_error' if any(r['status']=='infrastructure_error' for r in checks.values()) else 'ok',
+            'reward':reward,'weights':WEIGHTS,'checkpoints':checks,'artifact_sha256':artifacts,
+            'elapsed_seconds':round(time.monotonic()-start,3),'scoring':'independent semantic facets; safe verdict requires proof + universal original Rust'}
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--workspace', type=Path, required=True); p.add_argument('--verifier',type=Path,required=True)
+    p=argparse.ArgumentParser()
+    p.add_argument('--workspace',type=Path,required=True)
+    p.add_argument('--verifier',type=Path,required=True)
     p.add_argument('--logs',type=Path,required=True)
-    p.add_argument('--profile',choices=['integrated',*PROFILES],default='integrated'); args = p.parse_args()
-    details = grade(args.workspace.resolve(), args.verifier.resolve(), args.profile)
+    args=p.parse_args()
+    details=grade(args.workspace.resolve(),args.verifier.resolve())
     args.logs.mkdir(parents=True,exist_ok=True)
-    (args.logs/'reward.txt').write_text(f"{details['reward']:.2f}\n")
+    (args.logs/'reward.txt').write_text(f"{details['reward']:.4f}\n")
     (args.logs/'details.json').write_text(json.dumps(details,indent=2)+'\n')
-    print(json.dumps(details,indent=2)); return 0
+    print(json.dumps(details,indent=2))
+    return 0
 
-if __name__ == '__main__': sys.exit(main())
+if __name__=='__main__': sys.exit(main())

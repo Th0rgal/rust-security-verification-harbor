@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Rebuild the opaque agent API and trusted precompiled auditor in pinned Docker.
+# Rebuild the visible agent model and trusted auditor in pinned Docker.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-docker build --target api -t security-api:v2 -f task/tests/Dockerfile task/tests
-api_container=$(docker create security-api:v2)
+docker build --target api -t security-api:v3 -f task/tests/Dockerfile task/tests
+api_container=$(docker create security-api:v3)
 api_tmp=$(mktemp -d)
 trap 'docker rm "$api_container" >/dev/null; rm -rf "$api_tmp"' EXIT
 docker cp "$api_container:/build-api/.lake/build/lib/lean/SecurityChallenge.olean" "$api_tmp/SecurityChallenge.olean"

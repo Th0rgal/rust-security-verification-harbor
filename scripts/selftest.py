@@ -78,174 +78,154 @@ def main():
         except spec.Unsupported: pass
         else: raise AssertionError(('unsupported Rust executed', name))
 
-    typed = json.loads((TASK/'solution/spec.json').read_text())
-    expect(spec.check(typed)['status']=='pass','typed reference')
-    for prop in ('amount + fee <= balance','authorized_total_le_balance'):
-        legacy=spec.check({'property':prop,'arithmetic':'mathematical_unsigned','on_overflow':'reject'})
-        expect(legacy['status']=='partial' and legacy['credit_fraction']==.5,legacy)
-        expect(legacy['facets']['total_debit']['status']=='missing',legacy)
-        expect(legacy['facets']['completeness']['status']=='missing',legacy)
-    def check_expr(expression): return spec.check({'version':2,'accept':expression})
-    add = {'op':'add','args':['amount','fee']}
-    cases = [('true',True,'pass','fail'),('false',False,'fail','pass'),
-      ('weak',{'op':'le','args':['amount','balance']},'pass','fail'),
-      ('strong',{'op':'lt','args':[add,'balance']},'fail','pass')]
-    for name, expr, validity, safety in cases:
-        result = check_expr(expr); c = result['checks']
-        expect(result['status']!='pass',(name,result))
-        expect(c['reference_validity']['status']==validity,(name,result))
-        expect(c['safety_adequacy']['status']==safety,(name,result))
-    expect(check_expr({'op':'add','args':[True,1]})['status']=='fail','type error')
-    deep = True
-    for _ in range(15): deep={'op':'not','args':[deep]}
-    expect(check_expr(deep)['status']=='fail','depth bound')
-    try: verify.json_object('{"version":2,"version":2}')
-    except ValueError: pass
-    else: raise AssertionError('duplicate JSON keys')
-    # Each contract facet must stand on its own; mathematical add does not
-    # silently specify Some.total_debit, explicit overflow or an iff contract.
-    bare=spec.check({'version':2,'accept':typed['accept']})
-    expect(bare['credit_fraction']==.25 and bare['status']=='partial',bare)
-    for field in ('total_debit','on_overflow','completeness'):
-        reduced={k:v for k,v in typed.items() if k!=field}
-        result=spec.check(reduced)
-        expect(result['credit_fraction']==.75,(field,result))
-    wrong=dict(typed,total_debit='amount'); result=spec.check(wrong)
-    expect(result['facets']['total_debit']['status']=='fail',result)
-    weak=dict(typed,accept={'op':'le','args':['amount','balance']}); result=spec.check(weak)
-    expect(result['facets']['explicit_overflow']['status']=='fail',result)
-    strict=dict(typed,accept={'op':'lt','args':[add,'balance']}); result=spec.check(strict)
-    expect(result['facets']['completeness']['status']=='fail',result)
-    vacuous=dict(typed,accept=False); result=spec.check(vacuous)
-    expect(result['credit_fraction']==0,result)
-    swapped=dict(typed,total_debit={'op':'add','args':['fee','amount']})
-    expect(spec.check(swapped)['status']=='pass','commutative output')
-    malformed=[dict(typed,total_debit=True),dict(typed,version=True),dict(typed,on_overflow='wrap'),
-               dict(typed,completeness=True),dict(typed,extra=1),
-               {'version':2,'accept':{'op':'le','args':[-1,'balance']}},
-               {'version':2,'accept':{'op':'le','args':[2**128,'balance']}},
-               {'version':2,'accept':{'op':'mul','args':['amount','fee']}}]
-    for obj in malformed: expect(spec.check(obj)['credit_fraction']==0,obj)
-    wide=True
-    for _ in range(6): wide={'op':'and','args':[wide,wide]}
-    expect(check_expr(wide)['credit_fraction']==0,'node bound')
-    # Timeout/unknown is never upgraded to successful universal evidence.
+
+    reference=(TASK/'solution/Spec.lean').read_text()
+    def candidate(accept='a.toNat + f.toNat ≤ b.toNat',output='t.toNat = a.toNat + f.toNat',helpers=''):
+        return 'import SecurityChallenge\nopen SecurityChallenge\n'+helpers+'\ndef candidateSpec : AuthorizationSpec where\n  accepts := fun b a f => '+accept+'\n  output := fun b a f t => '+output+'\n'
+    def check(text):
+        return verify.LeanSession(VERIFIER).stage('CandidateSpec',text,'spec')
+    for name,text in {
+        'reference':reference,
+        'commutative':candidate('f.toNat + a.toNat ≤ b.toNat','a.toNat + f.toNat = t.toNat'),
+        'guarded_subtraction':candidate('a.toNat ≤ b.toNat ∧ f.toNat ≤ b.toNat - a.toNat'),
+        'if':candidate('if a.toNat ≤ b.toNat then f.toNat ≤ b.toNat - a.toNat else False'),
+        'helper':candidate('affordable b a f','t.toNat = sum a f',
+            'def sum (a f : UInt64) := a.toNat + f.toNat\ndef affordable (b a f : UInt64) := sum a f ≤ b.toNat'),
+        'negation':candidate('¬ (b.toNat < a.toNat + f.toNat)'),
+        'implication':candidate('(a.toNat + f.toNat ≤ b.toNat) ∧ (True → True)'),
+        'let':candidate('(let total := a.toNat + f.toNat; total ≤ b.toNat)'),
+        'identity_helper':candidate('a.toNat + f.toNat ≤ (identity b).toNat',helpers='def identity (x : UInt64) := x'),
+        'builtin_id':candidate('a.toNat + f.toNat ≤ (id b).toNat'),
+    }.items():
+        result=check(text); expect(result['status']=='pass',(name,result))
+    cases=[
+      ('always_true',candidate('True'),'safety','fail'),
+      ('always_false',candidate('False'),'completeness','fail'),
+      ('weak',candidate('a.toNat ≤ b.toNat'),'safety','fail'),
+      ('strict',candidate('a.toNat + f.toNat < b.toNat'),'completeness','fail'),
+      ('truncated_subtraction',candidate('f.toNat ≤ b.toNat - a.toNat'),'safety','fail'),
+      ('wrong_output',candidate(output='t.toNat = a.toNat'),'output_exactness','fail'),
+      ('output_true',candidate(output='True'),'output_exactness','fail'),
+      ('output_false',candidate(output='False'),'existence_coherence','fail'),
+    ]
+    for name,text,facet,status in cases:
+        r=check(text); expect(r['facets'][facet]['status']==status,(name,r))
+        if name=='output_false':
+            expect(r['facets']['output_exactness']['status']=='fail',r)
+            expect(r['facets']['output_exactness']['exact_implication']['status']=='pass',r)
+            expect('vacuously' in r['vacuity'],r)
+    for output in ('False','t.toNat = a.toNat + f.toNat'):
+        r=check(candidate('False',output))
+        expect(r['credit_fraction']==.25 and r['facets']['existence_coherence']['status']=='fail',r)
+    r=check(candidate(output='False')); expect(r['credit_fraction']==.5,r)
+    r=check(candidate(output='∀ n : Nat, n = n'))
+    expect(r['status']=='partial' and r['facets']['safety']['status']=='pass' and
+           r['facets']['output_exactness']['status']=='unsupported',r)
+    r=check(candidate('a.toNat * f.toNat ≤ b.toNat'))
+    expect(r['status']=='unsupported',r)
+    r=check(candidate('(a + f).toNat ≤ b.toNat'))
+    expect(r['status']=='unsupported',r)
+    for text in ('import SecurityChallenge\ndef candidateSpec : Nat := 0',
+                 'import SecurityChallenge\nopen SecurityChallenge\naxiom bad : AuthorizationSpec\ndef candidateSpec := bad',
+                 reference.replace('amount.toNat + fee.toNat ≤ balance.toNat','by sorry'),
+                 'import Mathlib\n'+reference):
+        r=verify.capture(lambda:check(text)); expect(r['status']=='fail',r)
     from unittest.mock import patch as mock
     for status in ('unknown','timeout'):
-        with mock('spec.query',return_value={'status':status,'reason':'injected solver result'}):
-            result=spec.check(typed)
-            expect(result['status']==status and result['credit_fraction']==0,result)
-    combined=True
-    for _ in range(5): combined={'op':'and','args':[combined,combined]}
-    too_many=dict(typed,accept=combined)
-    expect(spec.check(too_many)['credit_fraction']==0,'combined expression node bound')
-    print('Spec: all four facets, weak/strict/vacuous/wrong output, legacy partial, typing/bounds and unknown/timeout passed')
+        with mock('spec.query',return_value={'status':status,'reason':'injected result'}):
+            r=check(reference); expect(r['credit_fraction']==0 and r['status']==status,r)
+    print('Lean specs: 10 equivalent forms, false/weak/strict/vacuous, truncation, wrong output, unsupported components, type/axiom/import and solver unknown/timeout passed')
 
     witness=(TASK/'solution/counterexample.json').read_text()
     expect(verify.check_counterexample(witness,VERIFIER)['status']=='pass','reference witness')
-    expect(verify.check_counterexample('{"balance":10,"amount":1,"fee":1}',VERIFIER)['status']=='fail','non-exploit witness')
-    for obj in ({'balance':False,'amount':2**64-1,'fee':1},
-                {'balance':0,'amount':2**64,'fee':1},
-                {'balance':0,'amount':2**64-1,'fee':1.0},
-                {'balance':0,'amount':2**64-1,'fee':1,'extra':0}):
-        try: verify.check_counterexample(json.dumps(obj),VERIFIER)
-        except ValueError: pass
-        else: raise AssertionError(('malformed witness accepted',obj))
-    print('Witness: pristine exploit, non-exploit and malformed u64/JSON cases passed')
+    expect(verify.check_counterexample('{"balance":10,"amount":1,"fee":1}',VERIFIER)['status']=='fail','non-witness')
+    for bad in ('{"balance":false,"amount":1,"fee":1}','{"balance":0,"amount":18446744073709551616,"fee":1}','{"balance":0,"amount":1,"fee":1,"fee":2}'):
+        r=verify.capture(lambda:verify.check_counterexample(bad,VERIFIER)); expect(r['status']=='fail',r)
+    print('Witness: pristine actual Rust and malformed/ordinary inputs passed')
 
-    proof = (TASK/'solution/Proof.lean').read_text()
-    for term in (proof, 'import Lean\n'+proof,
-                 'by\n  have facts := (repairedAuthorize_success balance amount fee total).mp h\n  constructor\n  · exact facts.1.symm\n  · omega'):
-        result=verify.check_proof(term, VERIFIER)
-        expect(result['status']=='pass',result)
-    bad_proofs = ['by sorry', 'by admit', 'axiom bad : False\nby exact False.elim bad',
-                  'import Mathlib.Tactic\n'+proof, 'by native_decide', 'by exact True.intro', proof+'\ntheorem escape : True := by trivial', 'by\n  exact False.elim (by sorry)']
-    for term in bad_proofs:
-        try: result=verify.check_proof(term, VERIFIER)
-        except ValueError: continue
-        expect(result['status']=='fail',result)
-    injected = '''by
+    def proof_result(term):
+        session=verify.LeanSession(VERIFIER)
+        session.stage('CandidateSpec',reference,'spec')
+        session.stage('CandidateAudit',(TASK/'solution/Audit.lean').read_text(),'verdict')
+        return verify.capture(lambda:session.stage('CandidateProof',term,'proof'))
+    proof=(TASK/'solution/Proof.lean').read_text()
+    expect(proof_result(proof)['status']=='pass','non-omega proof')
+    for term in ('by sorry','by admit','by exact True.intro','by native_decide',
+                 'axiom bad : False\nby exact False.elim bad','import Mathlib.Tactic\n'+proof,
+                 proof+'\ntheorem escape : True := by trivial'):
+        r=proof_result(term); expect(r['status']=='fail',(term,r))
+    injected='''by
   run_tac
-    Lean.addDecl (.axiomDecl { name := `patched_authorize_sound.fabricated, levelParams := [], type := Lean.mkConst ``False, isUnsafe := false })
-  exact False.elim patched_authorize_sound.fabricated
+    Lean.addDecl (.axiomDecl { name := `auditEvidence.fabricated, levelParams := [], type := Lean.mkConst ``False, isUnsafe := false })
+  exact False.elim auditEvidence.fabricated
 '''
-    result=verify.check_proof(injected, VERIFIER)
-    expect(result['status']=='fail',result)
-    expect('axiom' in result.get('diagnostic',''),result)
+    r=proof_result(injected); expect(r['status']=='fail',r)
     with tempfile.TemporaryDirectory() as raw:
         protected=Path(raw)/'protected.txt'; protected.write_text('pristine')
         malicious='by\n  run_tac\n    Lean.Elab.Tactic.liftMetaTactic fun g => do\n      IO.FS.writeFile '+json.dumps(str(protected))+' "tampered"\n      pure [g]\n'+proof[3:]
-        result=verify.check_proof(malicious,VERIFIER)
-        expect(result['status']=='fail',result)
-        expect(protected.read_text()=='pristine','proof sandbox file isolation')
-        expect(any(x in result.get('diagnostic','').lower() for x in ('permission denied','not permitted')),result)
-    print('Lean: 3 valid proofs accepted; sorry/axiom/import/unsafe execution and injected axiom rejected')
+        r=proof_result(malicious)
+        expect(r['status']=='fail' and protected.read_text()=='pristine',r)
+    print('Lean proof: non-omega reference passes; sorry/axiom/import/type/escape/injected axiom and write outside sandbox rejected')
 
-    with tempfile.TemporaryDirectory(prefix='semantic-selftest-') as raw:
-        root=Path(raw); workspace=root/'workspace'
-        shutil.copytree(TASK/'environment/workspace',workspace)
-        details=verify.grade(workspace,VERIFIER)
-        expect(details['reward']==0,details)
-        for rel in ('spec.json','counterexample.json','src/lib.rs','Proof.lean'):
-            shutil.copy(TASK/'solution'/rel,workspace/'submission'/rel)
-        details=verify.grade(workspace,VERIFIER)
-        expect(details['reward']==1.0,details)
-        # No previous checkpoint gates: witness, patch and proof earn .80 alone.
-        (workspace/'submission/spec.json').write_text('{}')
-        details=verify.grade(workspace,VERIFIER)
-        expect(details['reward']==.8,details)
-        expect(details['checkpoints']['spec']['status']=='missing',details)
-        # Editing the visible challenge has no effect on witness execution.
-        (workspace/'challenge/src/lib.rs').write_text('THIS IS NOT RUST')
-        details=verify.grade(workspace,VERIFIER)
-        expect(details['checkpoints']['counterexample']['status']=='pass',details)
-        witness=workspace/'submission/counterexample.json'; witness.unlink()
-        witness.symlink_to(TASK/'solution/counterexample.json')
-        details=verify.grade(workspace,VERIFIER)
-        expect(details['checkpoints']['counterexample']['status']=='fail',details)
-        expect(details['checkpoints']['patch']['status']=='pass',details)
-        # Oversized artifacts and links in nested source parents fail closed.
-        specfile=workspace/'submission/spec.json'
-        specfile.write_text(' '*65537)
-        expect(verify.grade(workspace,VERIFIER)['checkpoints']['spec']['status']=='fail','artifact size bound')
-        srcdir=workspace/'submission/src'; shutil.rmtree(srcdir)
-        srcdir.symlink_to(TASK/'solution/src',target_is_directory=True)
-        details=verify.grade(workspace,VERIFIER)
-        expect(details['checkpoints']['patch']['status']=='fail','source parent symlink')
-        srcdir.unlink(); srcdir.mkdir()
-        # Explicit READY contains no textual checked_add requirement.
-        witness.unlink(); shutil.copy(TASK/'solution/counterexample.json',witness)
-        shutil.copy(TASK/'solution/spec.json',workspace/'submission/spec.json')
-        (workspace/'submission/src/lib.rs').write_text(variants['wide'])
-        ready=subprocess.run([sys.executable,str(TASK/'environment/workspace/harness/checkpoint.py'),
-                              '--workspace',str(workspace)],text=True,capture_output=True)
-        expect('\nREADY\n' in ready.stdout,ready.stdout)
-        # Exact real snapshot replay; artifacts are immutable fixtures with original hashes.
-        fixture=ROOT/'scripts/fixtures/glm-5.3-flash'
-        for line in (fixture/'original-SHA256SUMS').read_text().splitlines():
-            digest, rel=line.split(None,1)
-            rel = 'submission/' + rel.split('/submission/', 1)[-1]
-            if rel.startswith('submission/'):
-                expect(hashlib.sha256((fixture/rel).read_bytes()).hexdigest()==digest,'GLM fixture drift: '+rel)
-        glm=verify.grade(fixture,VERIFIER)
-        expect(glm['reward']==.6,glm)
-        expect([x['status'] for x in glm['checkpoints'].values()]==['partial','pass','pass','fail'],glm)
-        # Write replay evidence outside source tree unless explicitly requested.
-        if os.environ.get('GLM_DETAILS_OUT'):
-            Path(os.environ['GLM_DETAILS_OUT']).write_text(json.dumps(glm,indent=2)+'\n')
-        print('GLM actual snapshot: spec=.10 (safety=.05, overflow=.05; output/completeness missing) witness=.25 patch=.25 proof=.00 total=.60')
-        print('Reference=1.00; skeleton=0.00; missing spec with independent credits=.80; pristine/READY checks passed')
-    with tempfile.TemporaryDirectory(prefix='semantic-family-') as raw:
-        out=Path(raw)/'family'
-        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(out)],check=True,capture_output=True)
-        for profile in ('specify','refute'):
-            task=out/('overflow-'+profile)
-            expect(not (task/'environment/workspace/lean').exists(),'discovery exposes Lean contract')
-            public=(task/'instruction.md').read_text()+(task/'environment/workspace/spec.schema.json').read_text()
-            for leaked in ('amount + fee <= balance','repairedAuthorize_success','checked_add','authorized_total_le_balance'):
-                expect(leaked not in public,('discovery leak',profile,leaked))
-            expect('Signature.lean' not in (task/'environment/Dockerfile').read_text(),'broken discovery Dockerfile')
-    print('Discovery: isolated prompts/schema/images omit the repaired Lean contract and solution examples')
-    print('selftest: PASS')
+    with tempfile.TemporaryDirectory(prefix='lean-native-family-') as raw:
+        raw=Path(raw)
+        # A root-run verifier drops untrusted Lean to uid 65534. The generated
+        # trusted APIs must remain readable through this temporary parent.
+        raw.chmod(0o755)
+        family=raw/'family'
+        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--build-api'],check=True)
+        instructions=[]
+        for variant in ('vulnerable','safe'):
+            task=family/('authorization-'+variant)
+            instructions.append((task/'instruction.md').read_bytes())
+            verifier=task/'tests/verifier'
+            workspace=task/'environment/workspace'
+            skeleton=verify.grade(workspace,verifier)
+            expect(skeleton['reward']==0,(variant,'skeleton',skeleton))
+            for rel in ('Spec.lean','Audit.lean','Proof.lean','counterexample.json','src/lib.rs'):
+                if (task/'solution'/rel).is_file():
+                    (workspace/'submission'/rel).parent.mkdir(parents=True,exist_ok=True)
+                    shutil.copy(task/'solution'/rel,workspace/'submission'/rel)
+            reference_result=verify.grade(workspace,verifier)
+            expect(reference_result['reward']==1,(variant,reference_result))
+            if os.environ.get('V3_EVIDENCE_DIR'):
+                dest=Path(os.environ['V3_EVIDENCE_DIR']); dest.mkdir(parents=True,exist_ok=True)
+                (dest/(variant+'-reference.json')).write_text(json.dumps(reference_result,indent=2)+'\n')
+            if variant=='safe':
+                (workspace/'submission/Proof.lean').write_text('by exact True.intro')
+                r=verify.grade(workspace,verifier)
+                expect(r['checkpoints']['verdict']['score']==0 and r['checkpoints']['response']['score']==0,r)
+                shutil.copy(task/'solution/Proof.lean',workspace/'submission/Proof.lean')
+                (workspace/'submission/counterexample.json').write_text(witness)
+                r=verify.grade(workspace,verifier)
+                expect(r['checkpoints']['response']['score']==0,r)
+                for rel in ('counterexample.json','src/lib.rs'):
+                    extra=workspace/'submission'/rel
+                    extra.parent.mkdir(parents=True,exist_ok=True)
+                    for payload in (b'\xff',b'x'*65537):
+                        extra.write_bytes(payload)
+                        expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
+                    extra.unlink(); extra.symlink_to('/nonexistent-untrusted-target')
+                    expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
+                    extra.unlink()
+                optional=workspace/'submission/counterexample.json'
+                for payload in (b'\xff',b'x'*65537):
+                    optional.write_bytes(payload)
+                    r=verify.grade(workspace,verifier)
+                    expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
+                optional.unlink(); optional.symlink_to('/nonexistent-untrusted-target')
+                r=verify.grade(workspace,verifier)
+                expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
+            else:
+                (workspace/'submission/Spec.lean').write_text('NOT LEAN')
+                (workspace/'challenge/src/lib.rs').write_text('NOT RUST')
+                r=verify.grade(workspace,verifier)
+                expect(r['checkpoints']['verdict']['score']==.15 and r['checkpoints']['response']['score']==.35,r)
+                expect(r['checkpoints']['response']['checks']['counterexample']['status']=='pass',r)
+                symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')
+                r=verify.grade(workspace,verifier); expect(r['checkpoints']['response']['checks']['counterexample']['status']=='fail',r)
+            print(variant+': reference=1.00 skeleton=0.00; verdict/evidence and independent response checked')
+        expect(instructions[0]==instructions[1],'prompts differ')
+    print('selftest v3: PASS')
 
 if __name__=='__main__':main()
