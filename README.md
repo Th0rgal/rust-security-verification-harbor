@@ -38,3 +38,58 @@ The scenario is inspired by the
 [Rust Verification Benchmark](https://github.com/lfglabs-dev/rust-verification-benchmark-harbor).
 Its vulnerable code models release-mode wrapping before wider settlement.
 Never deploy it.
+
+## CTRL-G / external evaluation
+
+Requirements: Docker, Python 3.12+, x86_64 Linux, Harbor 0.9.0 and roughly
+10 GB of free disk. The task is self-contained and the verifier runs offline.
+
+```bash
+git clone https://github.com/Th0rgal/rust-security-verification-harbor.git
+cd rust-security-verification-harbor
+python3 -m venv .venv
+.venv/bin/pip install -r scripts/harbor-requirements.lock
+
+# Rebuild locally (authoritative and reproducible path).
+docker build -t rust-security-overflow-agent:v2 \
+  -f task/environment/Dockerfile task/environment
+docker build -t rust-security-overflow-verifier:v2 \
+  -f task/tests/Dockerfile task/tests
+
+# Validate the reference, immutable GLM replay and focused task family.
+.venv/bin/python scripts/harbor-smoke.py \
+  --harbor "$PWD/.venv/bin/harbor" \
+  --agent-image rust-security-overflow-agent:v2 \
+  --verifier-image rust-security-overflow-verifier:v2 \
+  --output /tmp/rust-security-overflow-results
+```
+
+Prebuilt amd64 images are also published for quick testing. If GHCR requests
+authentication, use a GitHub token with `read:packages`:
+
+```bash
+echo <TOKEN> | docker login ghcr.io -u <GITHUB_USER> --password-stdin
+docker pull ghcr.io/th0rgal/rust-security-overflow-agent@sha256:50367933d7c10fae2f7eb88837f33d9169496a623a1938e8dc0467391e567d85
+docker pull ghcr.io/th0rgal/rust-security-overflow-verifier@sha256:22fc68e9f8ca662a7984834aaedcea2dc9627072a216a0d9f81fa71010e8aad6
+docker tag ghcr.io/th0rgal/rust-security-overflow-agent@sha256:50367933d7c10fae2f7eb88837f33d9169496a623a1938e8dc0467391e567d85 security-agent:v2
+docker tag ghcr.io/th0rgal/rust-security-overflow-verifier@sha256:22fc68e9f8ca662a7984834aaedcea2dc9627072a216a0d9f81fa71010e8aad6 security-verifier:v2
+.venv/bin/python scripts/harbor-smoke.py --harbor "$PWD/.venv/bin/harbor"
+```
+
+To test another Harbor-compatible agent/model on the integrated task:
+
+```bash
+harbor run -p task -a <agent> -m <model> -e docker
+```
+
+To benchmark one capability at a time, generate `integrated`, `specify`,
+`refute`, `repair` and `prove` tasks and point Harbor at the generated folder:
+
+```bash
+python3 scripts/make-family.py /tmp/rust-security-overflow-family
+harbor run -p /tmp/rust-security-overflow-family -a <agent> -m <model> -e docker
+```
+
+Expected control scores are reference `1.00`, empty skeleton `0.00`, and the
+immutable GLM 5.3 Flash artifact replay `0.60`. See `evidence/VALIDATION.md` and
+`evidence/harbor/summary.json` for machine-readable evidence.
