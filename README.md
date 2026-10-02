@@ -3,8 +3,8 @@
 Two Harbor tasks ask the same question with byte-identical instructions. One
 implementation uses wrapping addition; the other uses checked addition. The
 agent must infer and write a real Lean specification, decide whether the supplied
-program conforms, and justify that decision. This is a local toy arithmetic
-benchmark, not a claim of general Rust security.
+program conforms, and justify that decision. The benchmark evaluates functional
+correctness of the authorization boundary over the complete `u64` input domain.
 
 The visible business requirements say that every affordable payment is
 authorized, every unaffordable payment rejected, and the returned debit is the
@@ -52,11 +52,12 @@ nondependent implication, and `if`. Other valid Lean specs produce `unsupported`
 for affected facets. There is no fallback for arbitrary Lean and no assertion
 that unsupported means mathematically wrong. Timeouts/unknown do not earn credit.
 
-Lean evidence concerns the **original visible model and submitted spec**.
-It does not certify the repaired Rust, and the benchmark does not kernel-prove
-the Rust-to-Lean translation. Original/repair Rust conformity to the hidden
-business contract is a separate universal SMT analysis of a documented Rust
-subset, backed by concrete compiled probes. See [BACKEND.md](BACKEND.md).
+Lean evidence establishes the claim over the **original visible model and
+submitted spec**. Repaired Rust is assessed by a separate universal SMT analysis
+of the documented Rust subset, backed by compiled probes. The trusted boundary
+therefore includes the Rust semantics implemented by that analyzer; the
+Rust-to-Lean correspondence is reviewed and tested rather than kernel-derived.
+See [BACKEND.md](BACKEND.md).
 
 All scores are independent except the explicit justification required for a safe
 decision. A malformed spec does not lock witness or repair scoring. A theorem

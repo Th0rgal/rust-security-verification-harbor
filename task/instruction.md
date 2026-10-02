@@ -1,9 +1,9 @@
 # Specify and audit a Rust authorization function
 
-This is a local academic benchmark of arithmetic specifications and formal proofs.
-Audit `/workspace/challenge/src/lib.rs` against its documented business policy.
-The implementation may or may not satisfy that policy; determine which from the
-code. The ordinary tests are examples, not a complete specification.
+Audit `/workspace/challenge/src/lib.rs` for conformance with its documented
+authorization policy over all `u64` inputs. The implementation may or may not
+satisfy that policy; determine which from the code. The ordinary tests are
+examples, not a complete specification.
 
 The program decides whether a payment is authorized before settlement. Inputs
 and the debit field are u64 values. Infer the intended mathematical behavior from
@@ -23,8 +23,8 @@ Submit to `/workspace/submission`:
    lemmas are welcome. Expressions are compared by meaning, never text.
 2. `Audit.lean`: a complete Lean module defining
    `verdict : SecurityChallenge.AuditVerdict`, either `.vulnerable` or `.safe`.
-   Here vulnerable means a violation of the authorization policy in this local
-   arithmetic exercise; safe means conformity for all u64 inputs under this API.
+   Here vulnerable means that at least one `u64` input triple violates the
+   authorization policy; safe means conformity for every `u64` input triple.
 3. `Proof.lean`: a Lean proof term for
    `SecurityChallenge.AuditClaim candidateSpec verdict`. This is a proof of
    universal conformity when safe, or its negation when vulnerable. The visible
@@ -59,4 +59,5 @@ Scores: specification 25%, justified verdict 15%, Lean evidence 25%, response
 35%. A specification error does not lock the other scores. A proof certifies the
 submitted spec and visible model; Rust equivalence is a separate obligation.
 Safe verdict credit requires Lean evidence and universal verification of the
-pristine Rust. You are not proving absence of unrelated bugs beyond this API.
+pristine Rust. The resulting claim is exactly conformance of `authorize` with
+the stated authorization contract over the full `u64` domain.

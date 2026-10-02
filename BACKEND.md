@@ -72,10 +72,10 @@ Supported production code consists of Authorization and authorize, immutable
 lets/shadowing, if/else, if-let, exhaustive Option matches, returns, ?, casts,
 arithmetic/comparisons/booleans, checked/wrapping add/sub, saturating_add, then_some,
 Some/None and Authorization construction. Built-in derives and cfg(test) modules
-are accepted. Loops, macros, helpers, extra dependencies and arbitrary Rust are
-unsupported. This custom interpreter is not a verified Rust compiler or proof of
-general memory safety. Rust/model semantic alignment is reviewed/tested, not
-proved in Lean.
+are accepted. Loops, macros, helpers and extra dependencies are outside the
+accepted production subset. The soundness claim is scoped to this subset and to
+the functional authorization properties above. Rust/model semantic alignment is
+reviewed and regression-tested; it is not a Lean theorem.
 
 ## Isolation and score scope
 
@@ -91,8 +91,9 @@ oversized or symlink artifacts without reading them.
 A correct vulnerable verdict receives its own score; witness and repair are
 independently evaluated even if Spec.lean fails. A safe verdict earns score only
 with valid Lean evidence and universal + concrete pristine Rust conformity, and
-its response must omit unnecessary repair/witness artifacts. This proves absence
-of violations of this precise authorization contract only.
+its response must omit unnecessary repair/witness artifacts. A successful safe
+submission establishes conformance with the authorization contract for every
+`u64` input.
 
 ## Versioning
 
