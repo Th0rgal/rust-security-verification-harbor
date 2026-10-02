@@ -1,43 +1,40 @@
-# Rust security prove-or-refute Harbor
+# Rust security verification Harbor
 
-One deliberately difficult training environment derived from the structure of
-the [Rust Verification Benchmark](https://github.com/lfglabs-dev/rust-verification-benchmark-harbor).
-The agent receives a realistic vulnerable Rust payment authorizer, but no Lean
-model. It must recover the security property, exhibit the overflow exploit,
-repair Rust, and prove the repair.
+A settlement authorizer challenge with four independently graded artifacts:
+semantic specification (0.20), pristine overflow witness (0.25), universally
+checked Rust repair (0.25), and audited Lean proof (0.30).
 
-## Curriculum and reward
+Specification credit is split equally between affordability/safety, exact
+`total_debit`, explicit overflow rejection and completeness. An acceptance
+inequality alone earns partial credit. There are no cascade locks: a failed
+spec cannot suppress a valid witness, repair or proof.
 
-| checkpoint | submitted artifact | verifier evidence | reward |
-|---|---|---|---:|
-| 1. Specify | `submission/spec.json` | canonical machine-readable invariant | 0.20 |
-| 2. Refute | `submission/counterexample.json` | runs against pristine vulnerable code | 0.25 |
-| 3. Repair | `submission/src/lib.rs` | compile + oracle, boundary, metamorphic tests | 0.25 |
-| 4. Prove | `submission/Proof.lean` | Lean kernel checks the repaired theorem | 0.30 |
+The Rust backend checks a bounded, typed production subset over the full u64
+input domain using pinned Z3, then validates compiled Rust against concrete
+cases. Lean checks an opaque certified mathematical API, with independent
+kernel replay and transitive axiom audit; its proof is independent of Rust.
 
-Scores are cumulative and partial: `0`, `.20`, `.45`, `.70`, or `1.00`. The
-verifier is a separate container and uses pristine sources. The agent cannot
-alter tests or the hidden Lean model. Checkpoints prevent a lucky proof from
-skipping vulnerability discovery.
+[BACKEND.md](BACKEND.md) describes the precise contract, scoring, trusted
+components, supported subset, limitations and reproducible Docker/Harbor tests.
+The immutable historical GLM snapshot scores **0.60** under v2; its spec is
+partial and its proof fails. This is artifact replay, not a fresh model run.
 
 ```bash
-pip install harbor==0.9.0
-# Authenticate to ghcr.io for the source benchmark's pinned Lean dependency image.
-harbor run -p task -a <agent> -m <model> -e docker
+# Install Harbor and dependencies as described in BACKEND.md, then build images.
+scripts/build-lean-api.sh --check
+docker build -t security-agent:v2 -f task/environment/Dockerfile task/environment
+docker build -t security-verifier:v2 -f task/tests/Dockerfile task/tests
+.venv/bin/python scripts/harbor-smoke.py --harbor "$PWD/.venv/bin/harbor" \
+  --output /tmp/security-harbor-evidence
 ```
 
-For development without Harbor: `python3 scripts/selftest.py`. Docker/Lean is
-tested separately with `docker build -f task/tests/Dockerfile task/tests`.
+Generate focused tasks with `python3 scripts/make-family.py /tmp/security-family`.
+Use **specify/refute** to measure discovery: they omit the repaired Lean contract,
+proof skeleton and canonical answer examples. Integrated/prove expose the proof
+API deliberately. For a model run use `harbor run -p <task> -a <agent> -m <model>
+-e docker`; `task/task.toml` defines offline separate verification and artifacts.
 
-## What Harbor does here
-
-`task/task.toml` declares the agent image, isolated verifier, timeouts, and the
-four artifacts Harbor copies from `/workspace`. `instruction.md` is the staged
-harness prompt: it nudges invariant → exploit → patch → proof, while exposing
-only the Rust code and a proof skeleton. `tests/test.sh` computes the scalar
-reward and writes `/logs/verifier/{reward.txt,details.json}`.
-
-The bug is intentionally exploitable: release-mode `u64` wrapping lets a debit
-near `u64::MAX` appear affordable. The scenario models a service that checks a
-ledger amount before handing it to a wider settlement backend. Never deploy
-the code.
+The scenario is inspired by the
+[Rust Verification Benchmark](https://github.com/lfglabs-dev/rust-verification-benchmark-harbor).
+Its vulnerable code models release-mode wrapping before wider settlement.
+Never deploy it.

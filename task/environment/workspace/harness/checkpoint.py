@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""Public curriculum guide; authoritative checks remain in the verifier."""
+"""Readiness hints only: independent artifacts, explicit READY, no textual patch gate."""
+import argparse
 import json
 from pathlib import Path
 
-root = Path("/workspace/submission")
-def object_at(name):
+p = argparse.ArgumentParser()
+p.add_argument('--workspace', type=Path, default=Path('/workspace'))
+p.add_argument('--profile', choices=['integrated','specify','refute','repair','prove'], default='integrated')
+a = p.parse_args(); root = a.workspace/'submission'
+artifacts = {'specify':'spec.json', 'refute':'counterexample.json', 'repair':'src/lib.rs', 'prove':'Proof.lean'}
+hints = {'specify':'Specify a mathematical acceptance predicate using the bounded typed DSL.',
+         'refute':'Find a pristine release-Rust authorization whose mathematical total exceeds balance.',
+         'repair':'Preserve the API and return Some exactly when the mathematical total is affordable.',
+         'prove':'Use lean/Signature.lean and the opaque API; run python3 /workspace/lean/check.py.'}
+ready = True
+for stage, rel in artifacts.items():
+    if a.profile not in ('integrated', stage): continue
     try:
-        return json.loads((root / name).read_text())
-    except Exception:
-        return {}
-
-if not object_at("spec.json"):
-    print("CHECKPOINT 1 · Specify: distinguish mathematical addition from u64 execution.")
-elif not object_at("counterexample.json"):
-    print("CHECKPOINT 2 · Refute: seek a+b > u64::MAX whose wrapped result fits balance.")
-elif "checked_add" not in (root / "src/lib.rs").read_text():
-    print("CHECKPOINT 3 · Repair: reject overflow before comparing the exact total.")
-elif "sorry" in (root / "Proof.lean").read_text():
-    print("CHECKPOINT 4 · Prove: unfold, split the successful branch, then use omega.")
-else:
-    print("All artifacts populated. Submit for isolated verification.")
+        source = (root/rel).read_text().strip()
+        populated = bool(source)
+        if rel.endswith('.json'): populated = bool(json.loads(source))
+        if stage == 'prove': populated = populated and 'sorry' not in source
+        if stage == 'repair': populated = populated and 'todo!' not in source
+    except (OSError, ValueError): populated = False
+    print(f'{stage.upper()}: ' + ('POPULATED' if populated else 'MISSING — '+hints[stage]))
+    ready &= populated
+print('READY' if ready else 'NOT_READY')
+print('Readiness is advisory. All checkpoints receive independent semantic verdicts.')

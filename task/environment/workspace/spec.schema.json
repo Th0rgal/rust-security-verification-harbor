@@ -1,11 +1,143 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Verifier additionally enforces <=64 expression nodes and depth <=12. Inputs are u64; add is mathematical; constants are unsigned u128.",
+  "$defs": {
+    "nat": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 340282366920938463463374607431768211455
+        },
+        {
+          "enum": [
+            "balance",
+            "amount",
+            "fee"
+          ]
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "args"
+          ],
+          "properties": {
+            "op": {
+              "const": "add"
+            },
+            "args": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "$ref": "#/$defs/nat"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "bool": {
+      "oneOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "args"
+          ],
+          "properties": {
+            "op": {
+              "enum": [
+                "le",
+                "lt",
+                "eq"
+              ]
+            },
+            "args": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "$ref": "#/$defs/nat"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "args"
+          ],
+          "properties": {
+            "op": {
+              "enum": [
+                "and",
+                "or"
+              ]
+            },
+            "args": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "$ref": "#/$defs/bool"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "op",
+            "args"
+          ],
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "args": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "$ref": "#/$defs/bool"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
   "type": "object",
-  "required": ["property", "arithmetic", "on_overflow"],
+  "required": [
+    "version",
+    "accept"
+  ],
   "properties": {
-    "property": {"type": "string", "description": "Invariant guaranteed whenever Some is returned"},
-    "arithmetic": {"enum": ["rust_u64", "mathematical_unsigned"]},
-    "on_overflow": {"enum": ["authorize_wrapped", "reject", "panic"]}
+    "version": {
+      "const": 2
+    },
+    "accept": {
+      "$ref": "#/$defs/bool"
+    },
+    "total_debit": {
+      "$ref": "#/$defs/nat"
+    },
+    "on_overflow": {
+      "const": "reject"
+    },
+    "completeness": {
+      "const": "iff"
+    }
   },
   "additionalProperties": false
 }

@@ -1,8 +1,5 @@
 by
-  unfold repairedAuthorize at h
-  split at h
-  · rename_i accepted
-    simp only [Option.some.injEq] at h
-    obtain ⟨_, within_balance⟩ := accepted
-    omega
-  · simp at h
+  obtain ⟨hTotal, _, hBalance⟩ :=
+    (repairedAuthorize_success balance amount fee total).mp h
+  subst total
+  exact ⟨rfl, hBalance⟩
