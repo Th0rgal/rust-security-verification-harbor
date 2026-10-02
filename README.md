@@ -179,14 +179,14 @@ shared with that host, because verifier logs are bind-mounted.
   prompt SHA-256 is `24406f25…`. Later commits only reworded `instruction.md`
   (current SHA-256 `9ebb3742…`) and documentation; the verifier and task
   artifacts are unchanged.
-- **GLM 5.3 Flash: no v3 baseline exists.** The only GLM submission came from
-  Harbor's `terminus-2` agent on the original **v1** task, where it scored 0.00.
-  The same unmodified artifacts were replayed under v2 JSON grading and scored
-  **0.60**: spec 0.10, witness 0.25, repair 0.25, proof 0.00. This was a regrade,
-  not a new model run; the artifact SHA-256s are pinned in
-  `scripts/fixtures/glm-5.3-flash/`.
-  That 0.60 measures a different interface and must not be quoted as a v3
-  score. A v3 baseline requires new runs on both tasks.
+- **GLM 5.3 Flash:** fresh Harbor 0.9.0 runs with `terminus-2` and
+  `zai/glm-5.3-flash` scored **1.00 on each v3 task** (mean 1.00). Both trials
+  passed all four checkpoints: spec 0.25, verdict 0.15, proof 0.25 and response
+  0.35. Complete trajectories, terminal recordings, submitted artifacts and
+  verifier reports are in `evidence/v3/glm-5.3-flash/`.
+- The historical GLM submission scored 0.00 on v1. Replaying its unchanged
+  artifacts under v2 JSON grading produced 0.60; that replay remains in
+  `scripts/fixtures/glm-5.3-flash/` and is not a v3 result.
 
 ## Trust boundary and limits
 
@@ -212,4 +212,5 @@ scripts/references/       safe-variant reference proof
 scripts/selftest.py       adversarial regression suite
 scripts/harbor-smoke.py   Harbor E2E check of both references
 evidence/v3/              current-version validation; other evidence/ entries are v1/v2
+evidence/v3/glm-5.3-flash complete GLM 5.3 Flash v3 Harbor runs and traces
 ```
