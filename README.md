@@ -22,6 +22,7 @@ skipping vulnerability discovery.
 
 ```bash
 pip install harbor==0.9.0
+# Authenticate to ghcr.io for the source benchmark's pinned Lean dependency image.
 harbor run -p task -a <agent> -m <model> -e docker
 ```
 
