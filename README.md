@@ -66,7 +66,7 @@ that exact scope. Proofs can use any accepted kernel proof, not only `omega`.
 Lean 4.31.0, independent replay, fixed theorem type and transitive axiom audit are
 required. Allowed axioms: propext, Classical.choice, Quot.sound.
 
-## CTRL-G / external evaluation
+## Running the benchmark
 
 Build locally; previously published v2 images and the historic GLM 60% result
 refer to the old JSON task and are **not v3 results**. No new GLM baseline is
@@ -91,7 +91,7 @@ done
 .venv/bin/harbor run -p /tmp/authorization-family/authorization-safe -a oracle -e docker -n 1
 ```
 
-Use your usual CTRL-G Harbor agent in place of `oracle`. Runtime networking is
+Use any Harbor-compatible agent in place of `oracle`. Runtime networking is
 disabled. Keep the agent and verifier separate, and select matching task-specific
 images if setting `docker_image` in task.toml. The verifier takes its variant and
 original Rust from its own image, never from the agent environment.
