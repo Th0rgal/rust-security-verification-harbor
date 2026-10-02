@@ -7,25 +7,6 @@ The two tasks receive byte-identical instructions. One implementation is
 vulnerable to integer overflow (CWE-190); the other is correct. A fixed verdict
 therefore cannot score well on both.
 
-## Provenance
-
-- Authored by LFG Labs (MIT, see [LICENSE](LICENSE)). The Rust function is a
-  purpose-written benchmark exercise, not code extracted from an upstream
-  repository. No CVE inspired or corresponds to it; CWE-190 is its weakness
-  classification, not a provenance claim.
-- `task/` is the single source tree and defines the **vulnerable** task.
-  `scripts/make-family.py` derives both tasks from it and asserts that their
-  `instruction.md` files are byte-identical.
-- Toolchains are pinned. Lean is `leanprover/lean4:v4.31.0` and Z3 is
-  `z3-solver==4.13.3.0`. Rust is `rust:1.85-bookworm`, and Lean ships in
-  `ghcr.io/lfglabs-dev/rvb-lean-deps`; both are pinned by digest in the
-  Dockerfiles. Harbor is `harbor==0.9.0`, pinned in
-  `scripts/harbor-requirements.lock`.
-- This is benchmark version 3 (`track = "lean-native-symmetric-v3"`). Versions 1
-  and 2 graded a JSON specification DSL against the vulnerable program only. Their code, fixtures and
-  evidence remain for reproducibility in `scripts/archive/`, `scripts/fixtures/`
-  and `evidence/` (outside `evidence/v3/`), but they are not v3 results.
-
 ## The two variants
 
 | Task | `authorize` computes `total` as | Visible Lean model | Expected verdict |
