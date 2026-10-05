@@ -13,6 +13,7 @@ RUN python3 -c "import shutil; shutil.rmtree('/opt/security-verifier', ignore_er
 COPY verifier/*.py verifier/requirements.txt /opt/security-verifier/
 COPY verifier/pristine/ /opt/security-verifier/pristine/
 COPY verifier/variant.txt /opt/security-verifier/variant.txt
+COPY verifier/problem.txt /opt/security-verifier/problem.txt
 COPY --from=api /build-api/.lake/build/lib/lean/SecurityChallenge.olean /opt/security-verifier/api/SecurityChallenge.olean
 COPY --from=api /build-api/.lake/build/lib/lean/SpecAudit.olean /opt/security-verifier/api/SpecAudit.olean
 COPY verifier/SpecAudit.lean /opt/security-verifier/SpecAudit.lean
