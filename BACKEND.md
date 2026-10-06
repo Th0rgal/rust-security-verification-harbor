@@ -111,3 +111,8 @@ v3 uses real Lean specs and two symmetric tasks with byte-identical instruction.
 Only the supplied original program/model and the trusted variant/configuration
 differ. v1/v2 JSON fixtures and results are historical; the old GLM score cannot
 be transferred to this new interface. Both variants require a fresh model run.
+
+The module subset requires globally unique production item names and rejects
+renamed imports (`use ... as ...`), external imports, and qualified struct
+constructors. Qualified function/constant paths must resolve exactly. Its short-name resolver cannot represent
+Rust lexical collisions or import aliases, so these forms receive no credit.

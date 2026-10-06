@@ -178,6 +178,27 @@ def main():
         # Settlement-specific Rust & Lean checks across isolation levels
         settlement_safe_rs=(ROOT/'problems/settlement/safe/lib.rs').read_text()
         settlement_vuln_rs=(ROOT/'problems/settlement/vulnerable/lib.rs').read_text()
+        # Rust resolves the imported alias to evil::wrong; the old interpreter
+        # instead picked trusted::correct by short name, missing this rare branch.
+        alias_patch = settlement_safe_rs.replace('pub fn authorize',
+            'pub mod trusted { use crate::Authorization; pub fn correct(b:u64,a:u64,f:u64)->Option<Authorization> { None } }\n'
+            'pub mod evil { use crate::Authorization; pub fn wrong(b:u64,a:u64,f:u64)->Option<Authorization> { Some(Authorization { total_debit:0u64 }) } }\n'
+            'use crate::evil::wrong as correct;\npub fn authorize').replace(
+            '    let raw_sum',
+            '    if balance == 0u64 && amount == 9000000000000000000u64 && fee == 0u64 { return correct(balance,amount,fee); }\n    let raw_sum', 1)
+        duplicate_patch = alias_patch.replace('wrong', 'correct').replace(' as correct', '')
+        for name, source in (('renamed_import', alias_patch), ('duplicate_item', duplicate_patch)):
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw); probe = verify.compile_probe(source, tmp)
+                actual = verify.run([str(probe), '0', '9000000000000000000', '0'], tmp)
+                expect(actual.returncode == 0 and actual.stdout.strip() == 'some:0', (name, actual))
+            try: verify.check_patch(source, problem='settlement')
+            except spec.Unsupported: pass
+            else: raise AssertionError((name, 'ambiguous Rust name resolution accepted'))
+        for untrusted in ('use std::process::exit;\n', 'use ::std::process::exit;\n'):
+            try: rust_symbolic.check(untrusted + settlement_safe_rs, problem='settlement')
+            except spec.Unsupported: pass
+            else: raise AssertionError('external import accepted')
         settlement_div_ceil_rs=settlement_safe_rs.replace(
             '(((raw_sum % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)',
             '(raw_sum % BPS_DENOM).div_ceil(BPS_DENOM)')

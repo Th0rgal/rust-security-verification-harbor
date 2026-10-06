@@ -32,6 +32,7 @@ class Parser:
         self.int_types = ('u64', 'u128') if allow_u128 else ('u64',)
         self.allow_modules = allow_modules
         self.structs = {}
+        self.item_names = set()
     def peek(self, offset=0):
         idx = self.i + offset
         return self.ts[idx] if idx < len(self.ts) else '<eof>'
@@ -65,14 +66,23 @@ class Parser:
         if t == 'Authorization': return 'Authorization'
         if self.allow_modules and t in self.structs: return ('struct', t)
         raise Unsupported(f'unsupported type: {t}')
+    def reserve_item(self, name):
+        # The interpreter uses globally unique short names rather than Rust's
+        # lexical module resolver. Reject collisions instead of guessing.
+        if name in self.item_names:
+            raise Unsupported('ambiguous production item name: ' + name)
+        self.item_names.add(name)
     def register_aliases(self, table, mod_prefix, short_name, value):
         table[short_name] = value
+        if not mod_prefix:
+            table[f'crate::{short_name}'] = value
+            table[f'super::{short_name}'] = value
         if mod_prefix:
             table[f'{mod_prefix}::{short_name}'] = value
             table[f'crate::{mod_prefix}::{short_name}'] = value
             table[f'super::{mod_prefix}::{short_name}'] = value
     def const_decl(self, consts, mod_prefix=''):
-        cname = self.name(); self.take(':'); cty = self.take()
+        cname = self.name(); self.reserve_item(cname); self.take(':'); cty = self.take()
         if cty not in self.int_types: raise Unsupported('unsupported const type')
         self.take('='); cval = self.expr(); self.take(';')
         qual = f'{mod_prefix}::{cname}' if mod_prefix else cname
@@ -120,7 +130,11 @@ class Parser:
             if has_derive == 'skip': continue
             if self.allow_modules and (self.accept('use') or (self.peek() == 'pub' and self.peek(1) == 'use')):
                 if self.peek() == 'pub': self.take('pub'); self.take('use')
-                while not self.accept(';'): self.take()
+                if self.peek() not in ('crate', 'self', 'super'):
+                    raise Unsupported('imports must be rooted in this crate')
+                while not self.accept(';'):
+                    if self.take() == 'as':
+                        raise Unsupported('renamed imports require lexical name resolution')
                 continue
             is_pub = self.accept('pub')
             if not is_pub and not self.allow_modules:
@@ -134,11 +148,11 @@ class Parser:
                 self.const_decl(state['consts'], mod_prefix)
             elif item == 'mod':
                 if not self.allow_modules or mod_prefix: raise Unsupported('nested or unexpected mod')
-                mname = self.name(); self.take('{')
+                mname = self.name(); self.reserve_item(mname); self.take('{')
                 self.parse_items(state, mod_prefix=mname)
                 self.take('}')
             elif item == 'struct':
-                sname = self.name()
+                sname = self.name(); self.reserve_item(sname)
                 if sname == 'Authorization':
                     if not is_pub or mod_prefix or state['struct'] is not None:
                         raise Unsupported('invalid or duplicate Authorization struct')
@@ -149,7 +163,7 @@ class Parser:
                     raise Unsupported('only Authorization struct is supported')
             elif item == 'fn':
                 if has_derive: raise Unsupported('derive attribute must attach to a struct')
-                fname = self.name()
+                fname = self.name(); self.reserve_item(fname)
                 if fname == 'authorize' and not mod_prefix:
                     if not is_pub or state['body'] is not None: raise Unsupported('duplicate or private authorize')
                     self.take('('); names = []
@@ -250,6 +264,8 @@ class Parser:
                 ident = f'{ident}::{self.name()}'
             last_seg = ident.split('::')[-1]
             if self.allow_modules and last_seg in self.structs and self.peek() == '{':
+                if '::' in ident:
+                    raise Unsupported('qualified struct constructors require lexical resolution')
                 self.take('{'); fvals = []
                 while not self.accept('}'):
                     fname = self.name()
@@ -372,8 +388,6 @@ class Interpreter:
             name = e[1]
             if name in env: return [(guard, env[name])]
             if name in self.const_env: return [(guard, self.const_env[name])]
-            short = name.split('::')[-1]
-            if short in self.const_env: return [(guard, self.const_env[short])]
             raise Unsupported('unbound name: ' + name)
         if k == 'num':
             val = Value('literal', e[1]); val = typed(val, e[2]) if e[2] else val
@@ -414,7 +428,7 @@ class Interpreter:
             return out
         if k == 'call':
             fname, arg_exprs = e[1], e[2]
-            fn_def = self.funcs.get(fname) or self.funcs.get(fname.split('::')[-1])
+            fn_def = self.funcs.get(fname)
             if not fn_def: raise Unsupported('unknown function ' + fname)
             params, ret_ty, fbody = fn_def
             if len(arg_exprs) != len(params): raise Unsupported('argument count mismatch in ' + fname)
