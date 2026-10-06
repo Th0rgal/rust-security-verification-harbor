@@ -116,3 +116,8 @@ The module subset requires globally unique production item names and rejects
 renamed imports (`use ... as ...`), external imports, and qualified struct
 constructors. Qualified function/constant paths must resolve exactly. Its short-name resolver cannot represent
 Rust lexical collisions or import aliases, so these forms receive no credit.
+
+GitHub CI builds a public Lean base from the pinned Ubuntu amd64 manifest and
+the SHA-256-verified official Lean 4.31.0 release (`.github/lean-base.Dockerfile`),
+then runs the same offline selftest as the benchmark verifier. This avoids
+requiring access to the benchmark registry image on clean runners.
