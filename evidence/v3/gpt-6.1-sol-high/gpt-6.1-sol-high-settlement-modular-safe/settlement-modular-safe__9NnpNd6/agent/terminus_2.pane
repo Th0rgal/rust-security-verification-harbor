@@ -1,0 +1,1486 @@
+[?2004hroot@afea28d80eac:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@afea28d80eac:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@afea28d80eac:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod constants {
+    /// Basis-point denominator (100% = 10_000 bps).
+    pub const BPS_DENOM: u64 = 10_000;
+    /// Ceiling-division bias for `BPS_DENOM` (`BPS_DENOM - 1`).
+    pub const BPS_MAX_REM: u64 = 9_999;
+    /// Floor quotient of `2^64` by `BPS_DENOM`: `floor(2^64 / 10_000)`.
+    pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+    /// Exact remainder of `2^64` modulo `BPS_DENOM`: `2^64 % 10_000 = 1_616`.
+    pub const U64_MOD_BPS_REM: u64 = 1_616;
+    /// Protocol tier rebate divisor (10% rebate on gross fee, rounded down).
+    pub const REBATE_DIVISOR: u64 = 10;
+    /// Reference liquidity band threshold for diagnostics.
+    pub const HIGH_VALUE_THRESHOLD: u64 = 1_000_000_000_000;
+}
+
+pub mod bps_math {
+    use crate::constants::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SumFold {
+        pub low_word: u64,
+        pub wrapped_u64: bool,
+    }
+
+    /// Folds the unbounded notional sum `amount + fee` into a 64-bit low word
+    /// and an explicit `2^64` carry flag without `u128` promotion.
+    #[inline]
+    pub fn fold_u64_sum(amount: u64, fee: u64) -> SumFold {
+        let low_word = amount.wrapping_add(fee);
+        let wrapped_u64 = low_word < amount;
+        SumFold { low_word, wrapped_u64 }
+    }
+
+    /// Computes the floor basis-point levy `floor((amount + fee) / 10_000)`
+    /// in pure `u64` arithmetic across the `2^64` boundary.
+    #[inline]
+    pub fn floor_div_bps_folded(fold: SumFold) -> u64 {
+        if fold.wrapped_u64 {
+            let rem_sum = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + (rem_sum / BPS_DENOM)
+        } else {
+            fold.low_word / BPS_DENOM
+        }
+    }
+
+    /// Computes the ceiling basis-point levy `ceil((amount + fee) / 10_000)`
+    /// in pure `u64` arithmetic from a folded 64-bit sum.
+    #[inline]
+    pub fn ceil_div_bps_folded(fold: SumFold) -> u64 {
+        if fold.wrapped_u64 {
+            let folded_rem = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+        } else {
+            let biased = fold.low_word.wrapping_add(BPS_MAX_REM);
+            if biased < fold.low_word {
+                (fold.low_word / BPS_DENOM) + (((fold.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+            } else {
+                biased / BPS_DENOM
+            }
+        }
+    }
+}
+
+pub mod rebate {
+    use crate::constants::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FeeBreakdown {
+        pub gross_fee: u64,
+        pub rebate: u64,
+        pub net_fee: u64,
+    }
+
+    /// Computes the floor tier rebate `floor(gross_fee / 10)` in favor of the protocol.
+    #[inline]
+    pub fn tier_rebate_floor(gross_fee: u64) -> u64 {
+        gross_fee / REBATE_DIVISOR
+    }
+
+    /// Assembles the gross fee, floor rebate, and net settlement fee `gross_fee - rebate`.
+    #[inline]
+    pub fn compute_fee_breakdown(gross_fee: u64) -> FeeBreakdown {
+        let rebate = tier_rebate_floor(gross_fee);
+        let net_fee = gross_fee - rebate;
+        FeeBreakdown { gross_fee, rebate, net_fee }
+    }
+
+    /// Diagnostic helper checking whether a fee breakdown qualifies as high-volume.
+    #[inline]
+    pub fn is_high_volume_levy(breakdown: FeeBreakdown) -> bool {
+        breakdown.gross_fee >= HIGH_VALUE_THRESHOLD
+    }
+}
+
+pub mod quote {
+    use crate::Authorization;
+    use crate::rebate::FeeBreakdown;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SettlementQuote {
+        pub principal: u64,
+        pub net_fee: u64,
+        pub total_debit: u64,
+    }
+
+    /// Combines the payment principal `amount` with `breakdown.net_fee`, rejecting
+    /// if the resulting settlement debit exceeds `u64::MAX`.
+    #[inline]
+    pub fn build_settlement_quote(amount: u64, breakdown: FeeBreakdown) -> Option<SettlementQuote> {
+        let total_debit = amount.checked_add(breakdown.net_fee)?;
+        Some(SettlementQuote {
+            principal: amount,
+            net_fee: breakdown.net_fee,
+            total_debit,
+        })
+    }
+
+    /// Authorizes the settlement quote iff `quote.total_debit <= balance`.
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: SettlementQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization { total_debit: quote.total_debit })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+///
+/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+///    rounded down (`floor(gross_fee / 10)`).
+/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+///
+/// Authorize every affordable transfer (`total_debit <= balance`) and return
+/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+/// Target word constraint: production code must use `u64` only (no `u128`).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let fold = bps_math::fold_u64_sum(amount, fee);
+    let gross_fee = bps_math::ceil_div_bps_folded(fold);
+    let breakdown = rebate::compute_fee_breakdown(gross_fee);
+    let settlement_quote = quote::build_settlement_quote(amount, breakdown)?;
+    quote::verify_affordability(balance, settlement_quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_settlement() {
+        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+    }
+
+    #[test]
+    fn ceiling_rounding_and_rebate() {
+        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+        assert_eq!(authorize(8, 0, 99_991), None);
+    }
+
+    #[test]
+    fn wide_basis_carry_folding() {
+        let expected = 1_660_206_966_643_862;
+        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_bias_wrap_at_u64_max() {
+        let expected = 1_660_206_966_633_861;
+        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn total_debit_overflow_rejected() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn floor_div_helper_matches_exact_quotient() {
+        let fold = bps_math::fold_u64_sum(10_000, 18_446_744_073_709_550_000);
+        assert_eq!(bps_math::floor_div_bps_folded(fold), 1_844_674_407_370_956);
+    }
+}
+[?2004hroot@afea28d80eac:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def bpsDenom : UInt64 := 10000
+def bpsMaxRem : UInt64 := 9999
+def u64ModBpsQuot : UInt64 := 1844674407370955
+def u64ModBpsRem : UInt64 := 1616
+def rebateDivisor : UInt64 := 10
+def u64Max : UInt64 := 18446744073709551615
+def highValueThreshold : UInt64 := 1000000000000
+
+structure SumFold where
+  lowWord : UInt64
+  wrappedU64 : Bool
+
+def foldU64Sum (amount fee : UInt64) : SumFold :=
+  let lowWord := amount + fee
+  { lowWord := lowWord, wrappedU64 := decide (lowWord < amount) }
+
+def floorDivBpsFolded (fold : SumFold) : UInt64 :=
+  if fold.wrappedU64 then
+    let remSum := (fold.lowWord % bpsDenom) + u64ModBpsRem
+    u64ModBpsQuot + (fold.lowWord / bpsDenom) + (remSum / bpsDenom)
+  else
+    fold.lowWord / bpsDenom
+
+def ceilDivBpsFolded (fold : SumFold) : UInt64 :=
+  if fold.wrappedU64 then
+    let foldedRem := (fold.lowWord % bpsDenom) + u64ModBpsRem
+    u64ModBpsQuot + (fold.lowWord / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+  else
+    let biased := fold.lowWord + bpsMaxRem
+    if biased < fold.lowWord then
+      (fold.lowWord / bpsDenom) + (((fold.lowWord % bpsDenom) + bpsMaxRem) / bpsDenom)
+    else
+      biased / bpsDenom
+
+structure FeeBreakdown where
+  grossFee : UInt64
+  rebate : UInt64
+  netFee : UInt64
+
+def tierRebateFloor (grossFee : UInt64) : UInt64 :=
+  grossFee / rebateDivisor
+
+def computeFeeBreakdown (grossFee : UInt64) : FeeBreakdown :=
+  let rebate := tierRebateFloor grossFee
+  let netFee := grossFee - rebate
+  { grossFee := grossFee, rebate := rebate, netFee := netFee }
+
+def isHighVolumeLevy (breakdown : FeeBreakdown) : Bool :=
+  decide (highValueThreshold ≤ breakdown.grossFee)
+
+structure SettlementQuote where
+  principal : UInt64
+  netFee : UInt64
+  totalDebit : UInt64
+
+def buildSettlementQuote (amount : UInt64) (breakdown : FeeBreakdown) : Option SettlementQuote :=
+  if breakdown.netFee ≤ u64Max - amount then
+    some { principal := amount, netFee := breakdown.netFee, totalDebit := amount + breakdown.netFee }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : SettlementQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  let fold := foldU64Sum amount fee
+  let grossFee := ceilDivBpsFolded fold
+  let breakdown := computeFeeBreakdown grossFee
+  match buildSettlementQuote amount breakdown with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@afea28d80eac:/workspace# ls -la /workspace/lean /workspace/submission; cat /workspace/lean/check.py
+[?2004l/workspace/lean:
+total 224
+drwxr-xr-x 1 root root   4096 Oct  6 07:46 .
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root   3308 Oct  6 05:03 SecurityChallenge.lean
+-rw-r--r-- 1 root root 204296 Oct  6 07:46 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  6 05:03 Signature.lean
+-rw-r--r-- 1 root root   1034 Oct  6 05:03 check.py
+-rw-r--r-- 1 root root     25 Oct  6 05:03 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  6 07:46 .
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root  126 Oct  6 05:03 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  6 05:03 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  6 05:03 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  6 07:46 src
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import subprocess
+import tempfile
+root=Path(__file__).resolve().parent
+submission=root.parent/'submission'
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp=Path(raw)
+    env={**os.environ,'LEAN_PATH':str(root)+':'+str(tmp)}
+    for name,rel in [('CandidateSpec','Spec.lean'),('CandidateAudit','Audit.lean')]:
+        (tmp/(name+'.lean')).write_text('import SecurityChallenge\n'+(submission/rel).read_text())
+        subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+    proof='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+(submission/'Proof.lean').read_text()+'\n)\n'
+    (tmp/'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean','CandidateProof.lean'],cwd=tmp,env=env))
+[?2004hroot@afea28d80eac:/workspace# sed -n '130,280p' /workspace/challenge/src/lib.rs
+[?2004l        }
+    }
+}
+
+/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+///
+/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+///    rounded down (`floor(gross_fee / 10)`).
+/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+///
+/// Authorize every affordable transfer (`total_debit <= balance`) and return
+/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+/// Target word constraint: production code must use `u64` only (no `u128`).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let fold = bps_math::fold_u64_sum(amount, fee);
+    let gross_fee = bps_math::ceil_div_bps_folded(fold);
+    let breakdown = rebate::compute_fee_breakdown(gross_fee);
+    let settlement_quote = quote::build_settlement_quote(amount, breakdown)?;
+    quote::verify_affordability(balance, settlement_quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_settlement() {
+        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+    }
+
+    #[test]
+    fn ceiling_rounding_and_rebate() {
+        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+        assert_eq!(authorize(8, 0, 99_991), None);
+    }
+
+    #[test]
+    fn wide_basis_carry_folding() {
+        let expected = 1_660_206_966_643_862;
+        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_bias_wrap_at_u64_max() {
+        let expected = 1_660_206_966_633_861;
+        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn total_debit_overflow_rejected() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn floor_div_helper_matches_exact_quotient() {
+        let fold = bps_math::fold_u64_sum(10_000, 18_446_744_073_709_550_000);
+        assert_eq!(bps_math::floor_div_bps_folded(fold), 1_844_674_407_370_956);
+    }
+}
+[?2004hroot@afea28d80eac:/workspace# head -25 /workspace/lean/SecurityChallenge.lean; cat /workspace/submission/{Spec,Audit,Proof}.lean; cat /workspace/lean/Signature.lean; cat /workspace/lean/lean-toolchain; which lean; ls /workspace/challenge
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def bpsDenom : UInt64 := 10000
+def bpsMaxRem : UInt64 := 9999
+def u64ModBpsQuot : UInt64 := 1844674407370955
+def u64ModBpsRem : UInt64 := 1616
+def rebateDivisor : UInt64 := 10
+def u64Max : UInt64 := 18446744073709551615
+def highValueThreshold : UInt64 := 1000000000000
+
+structure SumFold where
+  lowWord : UInt64
+  wrappedU64 : Bool
+
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+leanprover/lean4:v4.31.0
+Cargo.lock  Cargo.toml	src  target
+[?2004hroot@afea28d80eac:/workspace# echo "$PATH"; ls -la /root/.elan/bin; find / -name lean -type f 2>/dev/null | head; ls /workspace
+[?2004l/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ls: cannot access '/root/.elan/bin': No such file or directory
+/opt/lean/bin/lean
+challenge  harness  lean  submission
+[?2004hroot@afea28d80eac:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Settlement arithmetic is unbounded; no intermediate sum is reduced modulo 2^64.
+[?2004l[?2004h> def grossFee (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   (amount.toNat + fee.toNat + 9999) / 10000
+[?2004l[?2004h> 
+[?2004l[?2004h> def settlementDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat + (grossFee amount fee - grossFee amount fee / 10)
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := settlementDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     settlementDebit amount fee ≤ balance.toNat ∧
+[?2004l[?2004h>     totalDebit.toNat = settlementDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@afea28d80eac:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@afea28d80eac:/workspace# export PATH=/opt/lean/bin:$PATH
+[?2004l[?2004hroot@afea28d80eac:/workspace# rg 'theorem.*(toNat|lt_iff|le_iff)' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | tail -100
+[?2004lbash: rg: command not found
+[?2004hroot@afea28d80eac:/workspace# ls /opt/lean/src/lean/Init/Data/UInt; rg -n 'toNat_add|toNat_sub|toNat_div|toNat_mod|toNat_lt|lt_iff|le_iff|toNat_ofNat' /opt/lean/src/lean/Init/Data/UInt*
+[?2004lBasic.lean  BasicAux.lean  Bitwise.lean  Lemmas.lean  Log2.lean
+bash: rg: command not found
+[?2004hroot@afea28d80eac:/workspace# grep -nE 'toNat_add|toNat_sub|toNat_div|toNat_mod|lt_iff|le_iff|toNat_ofNat|toNat_lt' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -100
+[?2004l43:  @[simp] theorem toNat_ofNat' {n : Nat} : (ofNat n).toNat = n % 2 ^ $bits := BitVec.toNat_ofNat ..
+46:  theorem toNat_ofNat {n : Nat} : toNat (no_index (OfNat.ofNat n)) = n % 2 ^ $bits := toNat_ofNat'
+48:  @[simp] theorem toNat_ofNatLT {n : Nat} {h : n < size} : (ofNatLT n h).toNat = n := BitVec.toNat_ofNatLT ..
+60:  theorem toNat_ofNat_of_lt' {n : Nat} (h : n < size) : (ofNat n).toNat = n := by
+61:    rw [toNat, toBitVec_ofNat', BitVec.toNat_ofNat, Nat.mod_eq_of_lt h]
+62:  theorem toNat_ofNat_of_lt {n : Nat} (h : n < size) : toNat (OfNat.ofNat n) = n :=
+63:    toNat_ofNat_of_lt' h
+65:  @[int_toBitVec] theorem le_iff_toBitVec_le {a b : $typeName} : a ≤ b ↔ a.toBitVec ≤ b.toBitVec := .rfl
+67:  @[int_toBitVec] theorem lt_iff_toBitVec_lt {a b : $typeName} : a < b ↔ a.toBitVec < b.toBitVec := .rfl
+69:  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+71:  theorem lt_iff_toNat_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+74:    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+77:    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+79:  @[simp] protected theorem le_refl (a : $typeName) : a ≤ a := by simp [le_iff_toBitVec_le]
+134:    simpa [lt_iff_toBitVec_lt] using h
+138:  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+140:  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+144:  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+146:  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+148:  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+150:  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+152:  open $typeName (toNat_mod toNat_lt_size) in
+153:  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+156:    · rw [toNat_mod, toNat_ofNat_of_lt' h2]
+159:      · apply toNat_lt_size
+163:    simp only [lt_iff_toBitVec_lt, mod_def]
+190:  lt_iff _ _ := by
+197:    simp [Nat.mod_eq_of_lt x.toNat_lt_size]
+250:@[simp] theorem USize.toNat_ofNat32 {n : Nat} {h : n < 4294967296} : (ofNat32 n h).toNat = n := (rfl)
+257:theorem USize.toNat_ofNat_of_lt_32 {n : Nat} (h : n < 4294967296) : toNat (ofNat n) = n :=
+258:  toNat_ofNat_of_lt (Nat.lt_of_lt_of_le h USize.le_size)
+279:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+280:theorem UInt8.ofNat_lt_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+281:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+283:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+284:theorem UInt8.ofNat_le_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+285:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+288:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+289:theorem UInt16.ofNat_lt_iff {n : UInt16} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+290:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+292:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+293:theorem UInt16.ofNat_le_iff {n : UInt16} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+294:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+297:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+298:theorem UInt32.ofNat_lt_iff {n : UInt32} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+299:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+301:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+302:theorem UInt32.ofNat_le_iff {n : UInt32} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+303:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+306:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+307:theorem UInt64.ofNat_lt_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+308:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+310:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+311:theorem UInt64.ofNat_le_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+312:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+315:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+316:theorem USize.ofNat_lt_iff {n : USize} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+317:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+319:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+320:theorem USize.ofNat_le_iff {n : USize} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+321:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+329:@[simp] theorem UInt8.toNat_lt (n : UInt8) : n.toNat < 2 ^ 8 := n.toFin.isLt
+330:@[simp] theorem UInt16.toNat_lt (n : UInt16) : n.toNat < 2 ^ 16 := n.toFin.isLt
+331:@[simp] theorem UInt32.toNat_lt (n : UInt32) : n.toNat < 2 ^ 32 := n.toFin.isLt
+332:@[simp] theorem UInt64.toNat_lt (n : UInt64) : n.toNat < 2 ^ 64 := n.toFin.isLt
+345:theorem USize.toNat_lt_two_pow_numBits (n : USize) : n.toNat < 2 ^ System.Platform.numBits := n.toFin.isLt
+346:@[simp] theorem USize.toNat_lt (n : USize) : n.toNat < 2 ^ 64 := Nat.lt_of_lt_of_le n.toFin.isLt size_le
+350:theorem UInt8.toNat_lt_usizeSize (n : UInt8) : n.toNat < USize.size :=
+351:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+352:theorem UInt16.toNat_lt_usizeSize (n : UInt16) : n.toNat < USize.size :=
+353:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+354:theorem UInt32.toNat_lt_usizeSize (n : UInt32) : n.toNat < USize.size :=
+355:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+380:@[simp] theorem UInt8.toNat_mod_size (n : UInt8) : n.toNat % UInt8.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+381:@[simp] theorem UInt8.toNat_mod_uInt16Size (n : UInt8) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+382:@[simp] theorem UInt8.toNat_mod_uInt32Size (n : UInt8) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+383:@[simp] theorem UInt8.toNat_mod_uInt64Size (n : UInt8) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+384:@[simp] theorem UInt8.toNat_mod_uSizeSize (n : UInt8) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+386:@[simp] theorem UInt16.toNat_mod_size (n : UInt16) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+387:@[simp] theorem UInt16.toNat_mod_uInt32Size (n : UInt16) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+388:@[simp] theorem UInt16.toNat_mod_uInt64Size (n : UInt16) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+389:@[simp] theorem UInt16.toNat_mod_uSizeSize (n : UInt16) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+391:@[simp] theorem UInt32.toNat_mod_size (n : UInt32) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+392:@[simp] theorem UInt32.toNat_mod_uInt64Size (n : UInt32) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+393:@[simp] theorem UInt32.toNat_mod_uSizeSize (n : UInt32) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+395:@[simp] theorem UInt64.toNat_mod_size (n : UInt64) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+397:@[simp] theorem USize.toNat_mod_size (n : USize) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_size
+398:@[simp] theorem USize.toNat_mod_uInt64Size (n : USize) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+476:@[simp] theorem UInt8.ofNatLT_toNat (n : UInt8) : UInt8.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+477:@[simp] theorem UInt16.ofNatLT_uInt8ToNat (n : UInt8) : UInt16.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt16 := (rfl)
+478:@[simp] theorem UInt32.ofNatLT_uInt8ToNat (n : UInt8) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt32 := (rfl)
+479:@[simp] theorem UInt64.ofNatLT_uInt8ToNat (n : UInt8) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+480:@[simp] theorem USize.ofNatLT_uInt8ToNat (n : UInt8) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+482:@[simp] theorem UInt16.ofNatLT_toNat (n : UInt16) : UInt16.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+483:@[simp] theorem UInt32.ofNatLT_uInt16ToNat (n : UInt16) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt32 := (rfl)
+484:@[simp] theorem UInt64.ofNatLT_uInt16ToNat (n : UInt16) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+485:@[simp] theorem USize.ofNatLT_uInt16ToNat (n : UInt16) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+487:@[simp] theorem UInt32.ofNatLT_toNat (n : UInt32) : UInt32.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+488:@[simp] theorem UInt64.ofNatLT_uInt32ToNat (n : UInt32) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+489:@[simp] theorem USize.ofNatLT_uInt32ToNat (n : UInt32) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+grep: write error: Broken pipe
+[?2004hroot@afea28d80eac:/workspace# grep -nE 'UInt64|toNat' /opt/lean/src/lean/Init/Data/UInt/Basic.lean | tail -55; grep -n 'toNat' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | tail -40
+[?2004l621:protected def UInt64.mod (a b : UInt64) : UInt64 := ⟨BitVec.umod a.toBitVec b.toBitVec⟩
+625:@[deprecated UInt64.mod (since := "2024-09-23")]
+626:protected def UInt64.modn (a : UInt64) (n : Nat) : UInt64 := ⟨Fin.modn a.toFin n⟩
+635:protected def UInt64.land (a b : UInt64) : UInt64 := ⟨a.toBitVec &&& b.toBitVec⟩
+645:protected def UInt64.lor (a b : UInt64) : UInt64 := ⟨a.toBitVec ||| b.toBitVec⟩
+655:protected def UInt64.xor (a b : UInt64) : UInt64 := ⟨a.toBitVec ^^^ b.toBitVec⟩
+662:protected def UInt64.shiftLeft (a b : UInt64) : UInt64 := ⟨a.toBitVec <<< (UInt64.mod b 64).toBitVec⟩
+669:protected def UInt64.shiftRight (a b : UInt64) : UInt64 := ⟨a.toBitVec >>> (UInt64.mod b 64).toBitVec⟩
+674:protected def UInt64.lt (a b : UInt64) : Prop := a.toBitVec < b.toBitVec
+679:protected def UInt64.le (a b : UInt64) : Prop := a.toBitVec ≤ b.toBitVec
+681:instance : Add UInt64       := ⟨UInt64.add⟩
+682:instance : Sub UInt64       := ⟨UInt64.sub⟩
+683:instance : Mul UInt64       := ⟨UInt64.mul⟩
+684:instance : Pow UInt64 Nat   := ⟨UInt64.pow⟩
+685:instance : Mod UInt64       := ⟨UInt64.mod⟩
+688:instance : HMod UInt64 Nat UInt64 := ⟨UInt64.modn⟩
+690:instance : Div UInt64       := ⟨UInt64.div⟩
+691:instance : LT UInt64        := ⟨UInt64.lt⟩
+692:instance : LE UInt64        := ⟨UInt64.le⟩
+703:protected def UInt64.complement (a : UInt64) : UInt64 := ⟨~~~a.toBitVec⟩
+705:Negation of 64-bit unsigned integers, computed modulo `UInt64.size`.
+707:`UInt64.neg a` is equivalent to `18_446_744_073_709_551_615 - a + 1`.
+712:protected def UInt64.neg (a : UInt64) : UInt64 := ⟨-a.toBitVec⟩
+714:instance : Complement UInt64 := ⟨UInt64.complement⟩
+715:instance : Neg UInt64 := ⟨UInt64.neg⟩
+716:instance : AndOp UInt64     := ⟨UInt64.land⟩
+717:instance : OrOp UInt64      := ⟨UInt64.lor⟩
+718:instance : XorOp UInt64       := ⟨UInt64.xor⟩
+719:instance : ShiftLeft UInt64  := ⟨UInt64.shiftLeft⟩
+720:instance : ShiftRight UInt64 := ⟨UInt64.shiftRight⟩
+726:def Bool.toUInt64 (b : Bool) : UInt64 := if b then 1 else 0
+730:`DecidableLT UInt64` instance.
+735: * `(if (6 : UInt64) < 7 then "yes" else "no") = "yes"`
+736: * `(if (5 : UInt64) < 5 then "yes" else "no") = "no"`
+737: * `show ¬((7 : UInt64) < 7) by decide`
+740:def UInt64.decLt (a b : UInt64) : Decidable (a < b) :=
+745:`DecidableLE UInt64` instance.
+750: * `(if (15 : UInt64) ≤ 15 then "yes" else "no") = "yes"`
+751: * `(if (15 : UInt64) ≤ 5 then "yes" else "no") = "no"`
+752: * `(if (5 : UInt64) ≤ 15 then "yes" else "no") = "yes"`
+753: * `show (7 : UInt64) ≤ 7 by decide`
+756:def UInt64.decLe (a b : UInt64) : Decidable (a ≤ b) :=
+759:attribute [instance] UInt64.decLt UInt64.decLe
+761:instance : Max UInt64 := maxOfLe
+762:instance : Min UInt64 := minOfLe
+768:def USize.ofInt (x : Int) : USize := ofNat (x % 2 ^ System.Platform.numBits).toNat
+881:  USize.ofNat32 a.toBitVec.toNat (Nat.lt_trans a.toBitVec.isLt (by decide))
+888:def USize.toUInt8 (a : USize) : UInt8 := a.toNat.toUInt8
+896:  USize.ofNat32 a.toBitVec.toNat (Nat.lt_trans a.toBitVec.isLt (by decide))
+903:def USize.toUInt16 (a : USize) : UInt16 := a.toNat.toUInt16
+910:def UInt32.toUSize (a : UInt32) : USize := USize.ofNat32 a.toBitVec.toNat a.toBitVec.isLt
+918:def USize.toUInt32 (a : USize) : UInt32 := a.toNat.toUInt32
+926:def UInt64.toUSize (a : UInt64) : USize := a.toNat.toUSize
+934:def USize.toUInt64 (a : USize) : UInt64 :=
+935:  UInt64.ofNatLT a.toBitVec.toNat (Nat.lt_of_lt_of_le a.toBitVec.isLt USize.size_le)
+3490:  simpa [le_iff_toNat_le, lt_iff_toNat_lt] using Nat.lt_of_lt_of_le
+3492:  simpa [le_iff_toNat_le, lt_iff_toNat_lt] using Nat.lt_of_lt_of_le
+3494:  simpa [le_iff_toNat_le, lt_iff_toNat_lt] using Nat.lt_of_lt_of_le
+3496:  simpa [le_iff_toNat_le, lt_iff_toNat_lt] using Nat.lt_of_lt_of_le
+3498:  simpa [le_iff_toNat_le, lt_iff_toNat_lt] using Nat.lt_of_lt_of_le
+3501:  simpa [lt_iff_toNat_lt, ← UInt8.toNat_inj] using Nat.lt_or_lt_of_ne
+3503:  simpa [lt_iff_toNat_lt, ← UInt16.toNat_inj] using Nat.lt_or_lt_of_ne
+3505:  simpa [lt_iff_toNat_lt, ← UInt32.toNat_inj] using Nat.lt_or_lt_of_ne
+3507:  simpa [lt_iff_toNat_lt, ← UInt64.toNat_inj] using Nat.lt_or_lt_of_ne
+3509:  simpa [lt_iff_toNat_lt, ← USize.toNat_inj] using Nat.lt_or_lt_of_ne
+3512:  simp [lt_iff_toNat_lt, le_iff_toNat_le]; omega
+3514:  simp [lt_iff_toNat_lt, le_iff_toNat_le]; omega
+3516:  simp [lt_iff_toNat_lt, le_iff_toNat_le]; omega
+3518:  simp [lt_iff_toNat_lt, le_iff_toNat_le]; omega
+3520:  simp [lt_iff_toNat_lt, le_iff_toNat_le]; omega
+3535:  simpa [← UInt8.toNat_inj, le_iff_toNat_le, lt_iff_toNat_lt] using Nat.le_iff_lt_or_eq
+3537:  simpa [← UInt16.toNat_inj, le_iff_toNat_le, lt_iff_toNat_lt] using Nat.le_iff_lt_or_eq
+3539:  simpa [← UInt32.toNat_inj, le_iff_toNat_le, lt_iff_toNat_lt] using Nat.le_iff_lt_or_eq
+3541:  simpa [← UInt64.toNat_inj, le_iff_toNat_le, lt_iff_toNat_lt] using Nat.le_iff_lt_or_eq
+3543:  simpa [← USize.toNat_inj, le_iff_toNat_le, lt_iff_toNat_lt] using Nat.le_iff_lt_or_eq
+3552:  simp [le_iff_toNat_le, UInt8.toNat_sub_of_le _ _ hab]
+3554:  simp [le_iff_toNat_le, UInt16.toNat_sub_of_le _ _ hab]
+3556:  simp [le_iff_toNat_le, UInt32.toNat_sub_of_le _ _ hab]
+3558:  simp [le_iff_toNat_le, UInt64.toNat_sub_of_le _ _ hab]
+3560:  simp [le_iff_toNat_le, USize.toNat_sub_of_le _ _ hab]
+3563:  rw [lt_iff_toNat_lt, UInt8.toNat_sub_of_le _ _ hab]
+3564:  refine Nat.sub_lt ?_ (UInt8.lt_iff_toNat_lt.1 hb)
+3565:  exact UInt8.lt_iff_toNat_lt.1 (UInt8.lt_of_lt_of_le hb hab)
+3567:  rw [lt_iff_toNat_lt, UInt16.toNat_sub_of_le _ _ hab]
+3568:  refine Nat.sub_lt ?_ (UInt16.lt_iff_toNat_lt.1 hb)
+3569:  exact UInt16.lt_iff_toNat_lt.1 (UInt16.lt_of_lt_of_le hb hab)
+3571:  rw [lt_iff_toNat_lt, UInt32.toNat_sub_of_le _ _ hab]
+3572:  refine Nat.sub_lt ?_ (UInt32.lt_iff_toNat_lt.1 hb)
+3573:  exact UInt32.lt_iff_toNat_lt.1 (UInt32.lt_of_lt_of_le hb hab)
+3575:  rw [lt_iff_toNat_lt, UInt64.toNat_sub_of_le _ _ hab]
+3576:  refine Nat.sub_lt ?_ (UInt64.lt_iff_toNat_lt.1 hb)
+3577:  exact UInt64.lt_iff_toNat_lt.1 (UInt64.lt_of_lt_of_le hb hab)
+3579:  rw [lt_iff_toNat_lt, USize.toNat_sub_of_le _ _ hab]
+3580:  refine Nat.sub_lt ?_ (USize.lt_iff_toNat_lt.1 hb)
+3581:  exact USize.lt_iff_toNat_lt.1 (USize.lt_of_lt_of_le hb hab)
+[?2004hroot@afea28d80eac:/workspace# cp /workspace/submission/Spec.lean /workspace/lean/Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace# cat >> /workspace/lean/Work.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> import Lean.Elab.Tactic.Omega
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> set_option maxRecDepth 4096
+[?2004l[?2004h> set_option maxHeartbeats 2000000
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem ceil_correct (a f : UInt64) :
+[?2004l[?2004h>     (ceilDivBpsFolded (foldU64Sum a f)).toNat = grossFee a f := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l[?2004h>   unfold ceilDivBpsFolded foldU64Sum grossFee
+[?2004l[?2004h>   simp only [Bool.decide_coe]
+[?2004l[?2004h>   split
+[?2004l[?2004h>   · simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>       UInt64.toNat_ofNat, bpsDenom, bpsMaxRem, u64ModBpsQuot, u64ModBpsRem,
+[?2004l[?2004h>       UInt64.lt_iff_toNat_lt] at *
+[?2004l[?2004h>     norm_num at *
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · split
+[?2004l[?2004h>     · simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>         UInt64.toNat_ofNat, bpsDenom, bpsMaxRem, u64ModBpsQuot, u64ModBpsRem,
+[?2004l[?2004h>         UInt64.lt_iff_toNat_lt] at *
+[?2004l[?2004h>       norm_num at *
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     · simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>         UInt64.toNat_ofNat, bpsDenom, bpsMaxRem, u64ModBpsQuot, u64ModBpsRem,
+[?2004l[?2004h>         UInt64.lt_iff_toNat_lt] at *
+[?2004l[?2004h>       norm_num at *
+[?2004l[?2004h>       omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@afea28d80eac:/workspace# # Move imports before declarations; norm_num is unavailable, use numeric simp instead.
+[?2004l[?2004hroot@afea28d80eac:/workspace# sed -i '/import Lean.Elab.Tactic.Omega/d; 1a import Lean.Elab.Tactic.Omega' /workspace/lean/Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace# sed -i 's/norm_num at \*/simp only [Nat.reducePow, Nat.reduceMod] at */g' /workspace/lean/Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace# cd /workspace/lean; LEAN_PATH=/workspace/lean lean Work.lean
+[?2004lWork.lean:32:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  -1844674407370955 ≤ e - 18446744073709551616*g ≤ 18444899399302180660
+  -1844674407370955 ≤ e - 18446744073709551616*g + h - 18446744073709551616*i ≤ 18444899399302180660
+  d - e + 18446744073709551616*g - h + 18446744073709551616*i ≥ 1844674407370956
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  -9999 ≤ b + c - 10000*d ≤ 0
+  -11615 ≤ b + c - 10000*e - 10000*h - 18446744073709551616*j - 18446744073709551616*k - 18446744073709551616*l ≤ -1616
+  0 ≤ b + c - 10000*e - 18446744073709551616*j ≤ 9999
+  -1616 ≤ b + c - 10000*e - 18446744073709551616*j - 18446744073709551616*k ≤ 18446744073709549999
+  -11615 ≤ b + c - 10000*e - 18446744073709551616*j - 18446744073709551616*k - 18446744073709551616*l ≤ 18446744073709540000
+  0 ≤ b + c - 18446744073709551616*j ≤ 18446744073709551615
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat + 9999) / 10000
+ e := ↑((a.toNat + f.toNat) % 18446744073709551616) / 10000
+ g := ↑(1844674407370955 + (a.toNat + f.toNat) % 18446744073709551616 / 10000) / 18446744073709551616
+ h := ↑((((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) %
+      18446744073709551616) /
+  10000
+ i := ↑((1844674407370955 + (a.toNat + f.toNat) % 18446744073709551616 / 10000) % 18446744073709551616 +
+      (((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) %
+          18446744073709551616 /
+        10000) /
+  18446744073709551616
+ j := ↑(a.toNat + f.toNat) / 18446744073709551616
+ k := ↑((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) / 18446744073709551616
+ l := ↑(((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) /
+  18446744073709551616
+Work.lean:38:6: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ h + i - 18446744073709551616*j ≤ 18446744073709551615
+  g - h - i + 18446744073709551616*j ≥ 1
+  e ≥ 1
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  0 ≤ b + c - 18446744073709551616*d ≤ 18446744073709551615
+  -9999 ≤ b + c - 18446744073709551616*d - 18446744073709551616*e ≤ 18446744073709541616
+  0 ≤ b + c - 18446744073709551616*d - 10000*h ≤ 9999
+  -9999 ≤ b + c - 18446744073709551616*d - 10000*h - 10000*i - 18446744073709551616*k ≤ 0
+  -9999 ≤ b + c - 18446744073709551616*d - 10000*h - 18446744073709551616*k ≤ 18446744073709541616
+  -9999 ≤ b + c - 10000*g ≤ 0
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat) / 18446744073709551616
+ e := ↑((a.toNat + f.toNat) % 18446744073709551616 + 9999) / 18446744073709551616
+ g := ↑(a.toNat + f.toNat + 9999) / 10000
+ h := ↑((a.toNat + f.toNat) % 18446744073709551616) / 10000
+ i := ↑(((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 9999) % 18446744073709551616) / 10000
+ j := ↑((a.toNat + f.toNat) % 18446744073709551616 / 10000 +
+      ((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 9999) % 18446744073709551616 / 10000) /
+  18446744073709551616
+ k := ↑((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 9999) / 18446744073709551616
+Work.lean:43:6: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g - h ≥ 1
+  e ≤ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  0 ≤ b + c - 18446744073709551616*d ≤ 18446744073709551615
+  -9999 ≤ b + c - 18446744073709551616*d - 18446744073709551616*e ≤ 18446744073709541616
+  -9999 ≤ b + c - 18446744073709551616*d - 18446744073709551616*e - 10000*h ≤ 0
+  -9999 ≤ b + c - 10000*g ≤ 0
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat) / 18446744073709551616
+ e := ↑((a.toNat + f.toNat) % 18446744073709551616 + 9999) / 18446744073709551616
+ g := ↑(a.toNat + f.toNat + 9999) / 10000
+ h := ↑(((a.toNat + f.toNat) % 18446744073709551616 + 9999) % 18446744073709551616) / 10000
+Work.lean:26:13: warning: This simp argument is unused:
+  Bool.decide_coe
+
+Hint: Omit it from the simp argument list.
+  simp only ̵[̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵c̵o̵e̵]̵
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:35:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:35:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:39:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵UInt64.toNat_ofNat, bpsDenom, bpsMaxRem,
+  ̲  ̲ ̲ ̲ ̲ ̲u64ModBpsQuot, u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:40:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:40:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# cp Work.lean Work.backup; python3 - <<'PY'
+[?2004l[?2004h> p='Work.lean'
+[?2004l[?2004h> s=open(p).read().replace('simp only [Bool.decide_coe]', 'simp only [Bool.decide_eq_true, Bool.decide_eq_false]')
+[?2004l[?2004h> s=s.replace('    omega\n', '    trace_state\n    omega\n',1)
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean 2>&1 | head -110
+[?2004lWork.lean:33:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  -1844674407370955 ≤ e - 18446744073709551616*g ≤ 18444899399302180660
+  -1844674407370955 ≤ e - 18446744073709551616*g + h - 18446744073709551616*i ≤ 18444899399302180660
+  d - e + 18446744073709551616*g - h + 18446744073709551616*i ≥ 1844674407370956
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  -9999 ≤ b + c - 10000*d ≤ 0
+  -11615 ≤ b + c - 10000*e - 10000*h - 18446744073709551616*j - 18446744073709551616*k - 18446744073709551616*l ≤ -1616
+  0 ≤ b + c - 10000*e - 18446744073709551616*j ≤ 9999
+  -1616 ≤ b + c - 10000*e - 18446744073709551616*j - 18446744073709551616*k ≤ 18446744073709549999
+  -11615 ≤ b + c - 10000*e - 18446744073709551616*j - 18446744073709551616*k - 18446744073709551616*l ≤ 18446744073709540000
+  0 ≤ b + c - 18446744073709551616*j ≤ 18446744073709551615
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat + 9999) / 10000
+ e := ↑((a.toNat + f.toNat) % 18446744073709551616) / 10000
+ g := ↑(1844674407370955 + (a.toNat + f.toNat) % 18446744073709551616 / 10000) / 18446744073709551616
+ h := ↑((((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) %
+      18446744073709551616) /
+  10000
+ i := ↑((1844674407370955 + (a.toNat + f.toNat) % 18446744073709551616 / 10000) % 18446744073709551616 +
+      (((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) %
+          18446744073709551616 /
+        10000) /
+  18446744073709551616
+ j := ↑(a.toNat + f.toNat) / 18446744073709551616
+ k := ↑((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) / 18446744073709551616
+ l := ↑(((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) /
+  18446744073709551616
+Work.lean:39:6: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ h + i - 18446744073709551616*j ≤ 18446744073709551615
+  g - h - i + 18446744073709551616*j ≥ 1
+  e ≥ 1
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  0 ≤ b + c - 18446744073709551616*d ≤ 18446744073709551615
+  -9999 ≤ b + c - 18446744073709551616*d - 18446744073709551616*e ≤ 18446744073709541616
+  0 ≤ b + c - 18446744073709551616*d - 10000*h ≤ 9999
+  -9999 ≤ b + c - 18446744073709551616*d - 10000*h - 10000*i - 18446744073709551616*k ≤ 0
+  -9999 ≤ b + c - 18446744073709551616*d - 10000*h - 18446744073709551616*k ≤ 18446744073709541616
+  -9999 ≤ b + c - 10000*g ≤ 0
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat) / 18446744073709551616
+ e := ↑((a.toNat + f.toNat) % 18446744073709551616 + 9999) / 18446744073709551616
+ g := ↑(a.toNat + f.toNat + 9999) / 10000
+ h := ↑((a.toNat + f.toNat) % 18446744073709551616) / 10000
+ i := ↑(((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 9999) % 18446744073709551616) / 10000
+ j := ↑((a.toNat + f.toNat) % 18446744073709551616 / 10000 +
+      ((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 9999) % 18446744073709551616 / 10000) /
+  18446744073709551616
+ k := ↑((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 9999) / 18446744073709551616
+Work.lean:44:6: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g - h ≥ 1
+  e ≤ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  0 ≤ b + c - 18446744073709551616*d ≤ 18446744073709551615
+  -9999 ≤ b + c - 18446744073709551616*d - 18446744073709551616*e ≤ 18446744073709541616
+  -9999 ≤ b + c - 18446744073709551616*d - 18446744073709551616*e - 10000*h ≤ 0
+  -9999 ≤ b + c - 10000*g ≤ 0
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat) / 18446744073709551616
+ e := ↑((a.toNat + f.toNat) % 18446744073709551616 + 9999) / 18446744073709551616
+ g := ↑(a.toNat + f.toNat + 9999) / 10000
+ h := ↑(((a.toNat + f.toNat) % 18446744073709551616 + 9999) % 18446744073709551616) / 10000
+case isTrue
+a f : UInt64
+ha : a.toNat < 18446744073709551616
+hf : f.toNat < 18446744073709551616
+h✝ : decide ((a.toNat + f.toNat) % 18446744073709551616 < a.toNat) = true
+⊢ ((1844674407370955 + (a.toNat + f.toNat) % 18446744073709551616 / 10000) % 18446744073709551616 +
+        (((a.toNat + f.toNat) % 18446744073709551616 % 10000 + 1616) % 18446744073709551616 + 9999) %
+            18446744073709551616 /
+          10000) %
+      18446744073709551616 =
+    (a.toNat + f.toNat + 9999) / 10000
+Work.lean:26:13: warning: This simp argument is unused:
+  Bool.decide_eq_true
+
+Hint: Omit it from the simp argument list.
+  simp only [Bool.decide_eq_t̵r̵u̵e̵,̵ ̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵false]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:26:34: warning: This simp argument is unused:
+  Bool.decide_eq_false
+
+Hint: Omit it from the simp argument list.
+  simp only [Bool.decide_eq_true,̵ ̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:36:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:36:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+[?2004hroot@afea28d80eac:/workspace/lean# grep -n 'theorem.*decide.*\|lemma.*decide.*' /opt/lean/src/lean/Init/PropLemmas.lean | head -45
+[?2004l510:@[bool_to_prop] theorem decide_eq_true_iff {p : Prop} [Decidable p] : (decide p = true) ↔ p := by simp
+512:@[simp, bool_to_prop] theorem decide_eq_decide {p q : Prop} {_ : Decidable p} {_ : Decidable q} :
+682:theorem decide_implies (u v : Prop)
+701:theorem decide_ite (u : Prop) [du : Decidable u] (p q : Prop)
+707:@[simp] theorem ite_then_decide_self (p : Prop) [h : Decidable p] {w : Decidable p} (q : Bool) :
+712:@[simp] theorem ite_else_decide_self (p : Prop) [h : Decidable p] {w : Decidable p} (q : Bool) :
+716:@[simp] theorem ite_then_decide_not_self (p : Prop) [h : Decidable p] {w : Decidable p} (q : Bool) :
+720:@[simp] theorem ite_else_decide_not_self (p : Prop) [h : Decidable p] {w : Decidable p} (q : Bool) :
+[?2004hroot@afea28d80eac:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Work.lean';s=open(p).read().replace('    trace_state\n','')
+[?2004l[?2004h> s=s.replace('simp only [Nat.reducePow, Nat.reduceMod] at *', 'simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq, decide_eq_false_iff_not] at *\n'+ '    '+'simp only [Nat.mod_eq_of_lt (by omega)]')
+[?2004l[?2004h> # fix indentation in nested branches
+[?2004l[?2004h> s=s.replace('      simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq, decide_eq_false_iff_not] at *\n    simp', '      simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq, decide_eq_false_iff_not] at *\n      simp')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean 2>&1 | head -100
+[?2004lWork.lean:32:4: error: `simp` made no progress
+Work.lean:39:6: error: `simp` made no progress
+Work.lean:45:6: error: `simp` made no progress
+Work.lean:26:13: warning: This simp argument is unused:
+  Bool.decide_eq_true
+
+Hint: Omit it from the simp argument list.
+  simp only [Bool.decide_eq_t̵r̵u̵e̵,̵ ̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵false]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:26:34: warning: This simp argument is unused:
+  Bool.decide_eq_false
+
+Hint: Omit it from the simp argument list.
+  simp only [Bool.decide_eq_true,̵ ̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:31:64: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:36:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:36:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:38:66: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:41:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵UInt64.toNat_ofNat, bpsDenom, bpsMaxRem,
+  ̲  ̲ ̲ ̲ ̲ ̲u64ModBpsQuot, u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:42:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:42:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:44:66: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# sed -i 's/simp only \[Nat.mod_eq_of_lt (by omega)\]/simp (disch := omega) only [Nat.mod_eq_of_lt]/' Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean > /tmp/leanlog 2>&1; head -95 /tmp/leanlog
+[?2004lWork.lean:46:6: error: No goals to be solved
+Work.lean:26:13: warning: This simp argument is unused:
+  Bool.decide_eq_true
+
+Hint: Omit it from the simp argument list.
+  simp only [Bool.decide_eq_t̵r̵u̵e̵,̵ ̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵false]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:26:34: warning: This simp argument is unused:
+  Bool.decide_eq_false
+
+Hint: Omit it from the simp argument list.
+  simp only [Bool.decide_eq_true,̵ ̵B̵o̵o̵l̵.̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:31:64: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:36:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:36:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:38:66: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:41:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵UInt64.toNat_ofNat, bpsDenom, bpsMaxRem,
+  ̲  ̲ ̲ ̲ ̲ ̲u64ModBpsQuot, u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:42:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:42:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:44:66: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# sed -i 's/^    omega$/    all_goals omega/; s/^      omega$/      all_goals omega/' Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# cat >> Work.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem net_correct (a f : UInt64) :
+[?2004l[?2004h>     (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee.toNat =
+[?2004l[?2004h>       grossFee a f - grossFee a f / 10 := by
+[?2004l[?2004h>   have h (g : UInt64) : tierRebateFloor g ≤ g := by
+[?2004l[?2004h>     simp only [tierRebateFloor, rebateDivisor, UInt64.le_iff_toNat_le,
+[?2004l[?2004h>       UInt64.toNat_div, UInt64.toNat_ofNat, Nat.reduceMod]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   simp only [computeFeeBreakdown, UInt64.toNat_sub_of_le _ _ (h _),
+[?2004l[?2004h>     tierRebateFloor, rebateDivisor, UInt64.toNat_div,
+[?2004l[?2004h>     UInt64.toNat_ofNat, Nat.reduceMod, ceil_correct]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem authorize_iff (b a f t : UInt64) :
+[?2004l[?2004h>     challengeAuthorize b a f = some t ↔
+[?2004l[?2004h>       settlementDebit a f ≤ b.toNat ∧ t.toNat = settlementDebit a f := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hb := b.toNat_lt
+[?2004l[?2004h>   have hn := net_correct a f
+[?2004l[?2004h>   have hmax : a ≤ u64Max := by
+[?2004l[?2004h>     simp only [u64Max, UInt64.le_iff_toNat_le, UInt64.toNat_ofNat, Nat.reduceMod]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   have hsub : (u64Max - a).toNat = 18446744073709551615 - a.toNat := by
+[?2004l[?2004h>     rw [UInt64.toNat_sub_of_le _ _ hmax]
+[?2004l[?2004h>     rfl
+[?2004l[?2004h>   unfold challengeAuthorize buildSettlementQuote
+[?2004l[?2004h>   split
+[?2004l[?2004h>   · rename_i hfit
+[?2004l[?2004h>     have hfitNat := UInt64.le_iff_toNat_le.mp hfit
+[?2004l[?2004h>     rw [hsub, hn] at hfitNat
+[?2004l[?2004h>     have htotal : (a + (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee).toNat =
+[?2004l[?2004h>         settlementDebit a f := by
+[?2004l[?2004h>       simp only [UInt64.toNat_add, hn, settlementDebit]
+[?2004l[?2004h>       apply Nat.mod_eq_of_lt
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     simp only [verifyAffordability]
+[?2004l[?2004h>     split
+[?2004l[?2004h>     · rename_i haff
+[?2004l[?2004h>       have haffNat := UInt64.le_iff_toNat_le.mp haff
+[?2004l[?2004h>       rw [htotal] at haffNat
+[?2004l[?2004h>       simp only [Option.some.injEq, ← UInt64.toNat_inj, htotal]
+[?2004l[?2004h>       exact ⟨fun h => ⟨haffNat, h.symm⟩, fun h => h.2.symm⟩
+[?2004l[?2004h>     · rename_i haff
+[?2004l[?2004h>       have haffNat : ¬ settlementDebit a f ≤ b.toNat := by
+[?2004l[?2004h>         simpa only [UInt64.le_iff_toNat_le, htotal] using haff
+[?2004l[?2004h>       simp only [Option.noConfusion, false_iff]
+[?2004l[?2004h>       exact fun h => haffNat h.1
+[?2004l[?2004h>   · rename_i hfit
+[?2004l[?2004h>     have hfitNat : ¬ (grossFee a f - grossFee a f / 10) ≤ 18446744073709551615 - a.toNat := by
+[?2004l[?2004h>       simpa only [UInt64.le_iff_toNat_le, hsub, hn] using hfit
+[?2004l[?2004h>     have hnot : ¬ settlementDebit a f ≤ b.toNat := by
+[?2004l[?2004h>       unfold settlementDebit
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     simp only [Option.noConfusion, false_iff]
+[?2004l[?2004h>     exact fun h => hnot h.1
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean > /tmp/leanlog 2>&1; grep -A22 'error:' /tmp/leanlog
+[?2004lWork.lean:54:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  c ≥ 0
+  b - c ≥ 1
+where
+ b := ↑g.toNat / ↑(10 % 2 ^ 64)
+ c := ↑g.toNat
+Work.lean:50:42: error: unsolved goals
+a f : UInt64
+h : ∀ (g : UInt64), tierRebateFloor g ≤ g
+⊢ (ceilDivBpsFolded (foldU64Sum a f) - ceilDivBpsFolded (foldU64Sum a f) / 10).toNat = grossFee a f - grossFee a f / 10
+Work.lean:53:44: warning: This simp argument is unused:
+  Nat.reduceMod
+
+Hint: Omit it from the simp argument list.
+  simp only [tierRebateFloor, rebateDivisor, UInt64.le_iff_toNat_le, UInt64.toNat_div,
+  ̲  ̲ ̲ ̲ ̲ ̲U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵o̵f̵N̵a̵t̵,̵ ̵N̵a̵t̵.̵r̵e̵d̵u̵c̵e̵M̵o̵d̵]̵U̲I̲n̲t̲6̲4̲.̲t̲o̲N̲a̲t̲_̲o̲f̲N̲a̲t̲]̲
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:55:34: warning: This simp argument is unused:
+  UInt64.toNat_sub_of_le _ _ (h _)
+
+Hint: Omit it from the simp argument list.
+  simp only [computeFeeBreakdown, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵s̵u̵b̵_̵o̵f̵_̵l̵e̵ ̵_̵ ̵_̵ ̵(̵h̵ ̵_̵)̵,̵tierRebateFloor, rebateDivisor, UInt64.toNat_div,
+  ̲  ̲ ̲ ̲UInt64.toNat_ofNat, Nat.reduceMod, ceil_correct]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:56:36: warning: This simp argument is unused:
+  UInt64.toNat_div
+
+--
+Work.lean:72:2: error: Tactic `split` failed: Could not split an `if` or `match` expression in the goal
+
+Hint: Use `set_option trace.split.failure true` to display additional diagnostic information
+
+b a f t : UInt64
+ha : a.toNat < 2 ^ 64
+hb : b.toNat < 2 ^ 64
+hn : (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee.toNat = grossFee a f - grossFee a f / 10
+hmax : a ≤ u64Max
+hsub : (u64Max - a).toNat = 18446744073709551615 - a.toNat
+⊢ (have fold := foldU64Sum a f;
+      have grossFee := ceilDivBpsFolded fold;
+      have breakdown := computeFeeBreakdown grossFee;
+      match
+        if breakdown.netFee ≤ u64Max - a then
+          some { principal := a, netFee := breakdown.netFee, totalDebit := a + breakdown.netFee }
+        else none with
+      | some quote => verifyAffordability b quote
+      | none => none) =
+      some t ↔
+    settlementDebit a f ≤ b.toNat ∧ t.toNat = settlementDebit a f
+Work.lean:66:67: warning: This simp argument is unused:
+  Nat.reduceMod
+[?2004hroot@afea28d80eac:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Work.lean';s=open(p).read();start=s.index('  simp only [computeFeeBreakdown, UInt64.toNat_sub_of_le');end=s.index('\ntheorem authorize_iff',start)
+[?2004l[?2004h> s=s[:start]+'''  change (ceilDivBpsFolded (foldU64Sum a f) -
+[?2004l[?2004h>     tierRebateFloor (ceilDivBpsFolded (foldU64Sum a f))).toNat = _
+[?2004l[?2004h>   rw [UInt64.toNat_sub_of_le _ _ (h _)]
+[?2004l[?2004h>   simp only [tierRebateFloor, rebateDivisor, UInt64.toNat_div,
+[?2004l[?2004h>     UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod, ceil_correct]
+[?2004l[?2004h> ''' + s[end:]
+[?2004l[?2004h> s=s.replace('UInt64.toNat_ofNat, Nat.reduceMod]', 'UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]')
+[?2004l[?2004h> s=s.replace('  unfold challengeAuthorize buildSettlementQuote\n  split', '  unfold challengeAuthorize buildSettlementQuote\n  dsimp only\n  split')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean > /tmp/leanlog 2>&1; grep -A30 'error:' /tmp/leanlog
+[?2004lWork.lean:77:46: error: Application type mismatch: The argument
+  hfit
+has type
+  (if (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee ≤ u64Max - a then
+      some
+        { principal := a, netFee := (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee,
+          totalDebit := a + (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee }
+    else none) =
+    some quote✝
+but is expected to have type
+  ?m.87 ≤ ?m.88
+in the application
+  UInt64.le_iff_toNat_le.mp hfit
+Work.lean:98:6: error: Type mismatch: After simplification, term
+  hfit
+ has type
+  (if grossFee a f - grossFee a f / 10 ≤ 18446744073709551615 - a.toNat then
+      some
+        { principal := a, netFee := (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee,
+          totalDebit := a + (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee }
+    else none) =
+    none
+but is expected to have type
+  ¬grossFee a f - grossFee a f / 10 ≤ 18446744073709551615 - a.toNat
+Work.lean:102:4: error: `simp` made no progress
+[?2004hroot@afea28d80eac:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Work.lean';s=open(p).read().replace('  dsimp only\n  split\n  · rename_i hfit', '  dsimp only\n  by_cases hfit : (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee ≤ u64Max - a\n  · simp only [hfit, if_pos, Option.some.injEq]\n    dsimp only')
+[?2004l[?2004h> s=s.replace('  · rename_i hfit\n    have hfitNat', '  · simp only [hfit, if_neg]\n    have hfitNat')
+[?2004l[?2004h> s=s.replace('simp only [Option.noConfusion, false_iff]', 'simp only [reduceCtorEq, false_iff]')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean > /tmp/leanlog 2>&1; grep -A30 'error:' /tmp/leanlog
+[?2004lWork.lean:77:4: error: `dsimp` made no progress
+Work.lean:103:4: error: `simp` made no progress
+Work.lean:76:29: warning: This simp argument is unused:
+  Option.some.injEq
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit, if_pos,̵ ̵O̵p̵t̵i̵o̵n̵.̵s̵o̵m̵e̵.̵i̵n̵j̵E̵q̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:97:21: warning: This simp argument is unused:
+  if_neg
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit,̵ ̵i̵f̵_̵n̵e̵g̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# nl -ba Work.lean | tail -48
+[?2004l    57	  rw [UInt64.toNat_sub_of_le _ _ (h _)]
+    58	  simp only [tierRebateFloor, rebateDivisor, UInt64.toNat_div,
+    59	    UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod, ceil_correct]
+    60	
+    61	theorem authorize_iff (b a f t : UInt64) :
+    62	    challengeAuthorize b a f = some t ↔
+    63	      settlementDebit a f ≤ b.toNat ∧ t.toNat = settlementDebit a f := by
+    64	  have ha := a.toNat_lt
+    65	  have hb := b.toNat_lt
+    66	  have hn := net_correct a f
+    67	  have hmax : a ≤ u64Max := by
+    68	    simp only [u64Max, UInt64.le_iff_toNat_le, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+    69	    omega
+    70	  have hsub : (u64Max - a).toNat = 18446744073709551615 - a.toNat := by
+    71	    rw [UInt64.toNat_sub_of_le _ _ hmax]
+    72	    rfl
+    73	  unfold challengeAuthorize buildSettlementQuote
+    74	  dsimp only
+    75	  by_cases hfit : (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee ≤ u64Max - a
+    76	  · simp only [hfit, if_pos, Option.some.injEq]
+    77	    dsimp only
+    78	    have hfitNat := UInt64.le_iff_toNat_le.mp hfit
+    79	    rw [hsub, hn] at hfitNat
+    80	    have htotal : (a + (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee).toNat =
+    81	        settlementDebit a f := by
+    82	      simp only [UInt64.toNat_add, hn, settlementDebit]
+    83	      apply Nat.mod_eq_of_lt
+    84	      omega
+    85	    simp only [verifyAffordability]
+    86	    split
+    87	    · rename_i haff
+    88	      have haffNat := UInt64.le_iff_toNat_le.mp haff
+    89	      rw [htotal] at haffNat
+    90	      simp only [Option.some.injEq, ← UInt64.toNat_inj, htotal]
+    91	      exact ⟨fun h => ⟨haffNat, h.symm⟩, fun h => h.2.symm⟩
+    92	    · rename_i haff
+    93	      have haffNat : ¬ settlementDebit a f ≤ b.toNat := by
+    94	        simpa only [UInt64.le_iff_toNat_le, htotal] using haff
+    95	      simp only [reduceCtorEq, false_iff]
+    96	      exact fun h => haffNat h.1
+    97	  · simp only [hfit, if_neg]
+    98	    have hfitNat : ¬ (grossFee a f - grossFee a f / 10) ≤ 18446744073709551615 - a.toNat := by
+    99	      simpa only [UInt64.le_iff_toNat_le, hsub, hn] using hfit
+   100	    have hnot : ¬ settlementDebit a f ≤ b.toNat := by
+   101	      unfold settlementDebit
+   102	      omega
+   103	    simp only [reduceCtorEq, false_iff]
+   104	    exact fun h => hnot h.1
+[?2004hroot@afea28d80eac:/workspace/lean# sed -i '77d; s/^    simp only \[reduceCtorEq, false_iff\]/    try simp only [reduceCtorEq, false_iff]/; s/^      simp only \[reduceCtorEq, false_iff\]/      try simp only [reduceCtorEq, false_iff]/' Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean > /tmp/leanlog 2>&1; grep -A30 'error:' /tmp/leanlog
+[?2004lWork.lean:103:24: error: Invalid projection: Type of
+  h
+is not known; cannot resolve projection `1`
+Work.lean:76:29: warning: This simp argument is unused:
+  Option.some.injEq
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit, if_pos,̵ ̵O̵p̵t̵i̵o̵n̵.̵s̵o̵m̵e̵.̵i̵n̵j̵E̵q̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:96:21: warning: This simp argument is unused:
+  if_neg
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit,̵ ̵i̵f̵_̵n̵e̵g̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# find /workspace/submission -maxdepth 2 -type f -printf '%P\n'; tail -8 /tmp/leanlog
+[?2004lProof.lean
+Spec.lean
+Audit.lean
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:96:21: warning: This simp argument is unused:
+  if_neg
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit,̵ ̵i̵f̵_̵n̵e̵g̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# sed -i '$i\    trace_state' Work.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# LEAN_PATH=/workspace/lean lean Work.lean > /tmp/leanlog 2>&1; tail -35 /tmp/leanlog
+[?2004lis not known; cannot resolve projection `1`
+case neg
+b a f t : UInt64
+ha : a.toNat < 2 ^ 64
+hb : b.toNat < 2 ^ 64
+hn : (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee.toNat = grossFee a f - grossFee a f / 10
+hmax : a ≤ u64Max
+hsub : (u64Max - a).toNat = 18446744073709551615 - a.toNat
+hfit : ¬(computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee ≤ u64Max - a
+hfitNat : ¬grossFee a f - grossFee a f / 10 ≤ 18446744073709551615 - a.toNat
+hnot : ¬settlementDebit a f ≤ b.toNat
+⊢ (match
+        if False then
+          some
+            { principal := a, netFee := (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee,
+              totalDebit := a + (computeFeeBreakdown (ceilDivBpsFolded (foldU64Sum a f))).netFee }
+        else none with
+      | some quote => verifyAffordability b quote
+      | none => none) =
+      some t ↔
+    settlementDebit a f ≤ b.toNat ∧ t.toNat = settlementDebit a f
+Work.lean:76:29: warning: This simp argument is unused:
+  Option.some.injEq
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit, if_pos,̵ ̵O̵p̵t̵i̵o̵n̵.̵s̵o̵m̵e̵.̵i̵n̵j̵E̵q̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Work.lean:96:21: warning: This simp argument is unused:
+  if_neg
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit,̵ ̵i̵f̵_̵n̵e̵g̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Work.lean';s=open(p).read();i=s.rfind('    try simp only [reduceCtorEq, false_iff]');s=s[:i]+'    simp [hnot]\n';open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# cp Work.lean /workspace/submission/Spec.lean
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   change Conforms candidateSpec challengeAuthorize
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     change (∃ t, challengeAuthorize b a f = some t) ↔ settlementDebit a f ≤ b.toNat
+[?2004l[?2004h>     constructor
+[?2004l[?2004h>     · rintro ⟨t, ht⟩
+[?2004l[?2004h>       exact ((authorize_iff b a f t).mp ht).1
+[?2004l[?2004h>     · intro haff
+[?2004l[?2004h>       have hb := b.toNat_lt
+[?2004l[?2004h>       have hbound : settlementDebit a f < UInt64.size := by
+[?2004l[?2004h>         exact Nat.lt_of_le_of_lt haff hb
+[?2004l[?2004h>       refine ⟨UInt64.ofNat (settlementDebit a f), ?_⟩
+[?2004l[?2004h>       apply (authorize_iff b a f _).mpr
+[?2004l[?2004h>       exact ⟨haff, UInt64.toNat_ofNat_of_lt' hbound⟩
+[?2004l[?2004h>   · intro b a f t ht
+[?2004l[?2004h>     exact (authorize_iff b a f t).mp ht
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@afea28d80eac:/workspace/lean# python3 /workspace/lean/check.py > /tmp/checklog 2>&1; tail -45 /tmp/checklog
+[?2004lCandidateSpec.lean:42:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵UInt64.toNat_ofNat, bpsDenom, bpsMaxRem,
+  ̲  ̲ ̲ ̲ ̲ ̲u64ModBpsQuot, u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:43:49: warning: This simp argument is unused:
+  u64ModBpsQuot
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u̵6̵4̵M̵o̵d̵B̵p̵s̵Q̵u̵o̵t̵,̵ ̵u64ModBpsRem, UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:43:64: warning: This simp argument is unused:
+  u64ModBpsRem
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat,
+  ̲  ̲ ̲ ̲ ̲ ̲bpsDenom, bpsMaxRem, u64ModBpsQuot, u̵6̵4̵M̵o̵d̵B̵p̵s̵R̵e̵m̵,̵UInt64.lt_iff_toNat_lt] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:45:66: warning: This simp argument is unused:
+  decide_eq_false_iff_not
+
+Hint: Omit it from the simp argument list.
+  simp only [Nat.reducePow, Nat.reduceMod, decide_eq_true_eq,̵ ̵d̵e̵c̵i̵d̵e̵_̵e̵q̵_̵f̵a̵l̵s̵e̵_̵i̵f̵f̵_̵n̵o̵t̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:77:29: warning: This simp argument is unused:
+  Option.some.injEq
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit, if_pos,̵ ̵O̵p̵t̵i̵o̵n̵.̵s̵o̵m̵e̵.̵i̵n̵j̵E̵q̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:97:21: warning: This simp argument is unused:
+  if_neg
+
+Hint: Omit it from the simp argument list.
+  simp only [hfit,̵ ̵i̵f̵_̵n̵e̵g̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@afea28d80eac:/workspace/lean# 

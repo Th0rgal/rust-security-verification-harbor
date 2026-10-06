@@ -196,11 +196,33 @@ shared with that host, because verifier logs are bind-mounted.
   both tasks, plus the selftest pass. Those runs used commit `11489ee`, whose
   prompt SHA-256 is `24406f25…`. Later commits only reworded `instruction.md`
   and added the `settlement` task pairs.
-- **GLM 5.3 Flash:** fresh Harbor 0.9.0 runs with `terminus-2` and
+- **GLM 5.3 Flash (`authorization`):** fresh Harbor 0.9.0 runs with `terminus-2` and
   `zai/glm-5.3-flash` scored **1.00 on each `authorization` v3 task** (mean 1.00). Both trials
   passed all four checkpoints: spec 0.25, verdict 0.15, proof 0.25 and response
   0.35. Complete trajectories, terminal recordings, submitted artifacts and
   verifier reports are in `evidence/v3/glm-5.3-flash/`.
+- **Claude Opus 5.5 & GPT 6.1 Sol (`high`) across the 3 `settlement` isolation levels:**
+  fresh Harbor 0.9.0 runs via `sandboxed.sh` (`terminus-2`, `reasoning_effort=high`, `max_turns=25`)
+  evaluated both models on all six `settlement*` tasks (`settlement`, `settlement-modular`,
+  and `settlement-engine` in both `vulnerable` and `safe` variants). Complete trajectories,
+  terminal recordings, submitted artifacts and verifier reports are in
+  `evidence/v3/claude-opus-5-5/` and `evidence/v3/gpt-6.1-sol-high/`:
+
+| Task | Isolation level | Model | Reward | Episodes | Input / Output tokens |
+|---|---|---|---:|---:|---:|
+| `settlement-vulnerable` | Level 0 — Isolated | `claude-opus-5-5` | **1.00** | 11 | 125,566 / 13,927 |
+| `settlement-safe` | Level 0 — Isolated | `claude-opus-5-5` | **1.00** | 13 | 204,438 / 26,781 |
+| `settlement-modular-vulnerable` | Level 1 — Modular (4 modules) | `claude-opus-5-5` | **1.00** | 7 | 82,393 / 13,037 |
+| `settlement-modular-safe` | Level 1 — Modular (4 modules) | `claude-opus-5-5` | **1.00** | 15 | 291,454 / 17,616 |
+| `settlement-engine-vulnerable` | Level 2 — Engine + noise (6 modules) | `claude-opus-5-5` | **1.00** | 12 | 203,563 / 14,746 |
+| `settlement-engine-safe` | Level 2 — Engine + noise (6 modules) | `claude-opus-5-5` | **1.00** | 20 | 326,168 / 28,548 |
+| `settlement-vulnerable` | Level 0 — Isolated | `gpt-6.1-sol` (`high`) | **1.00** | 11 | 85,546 / 4,823 |
+| `settlement-safe` | Level 0 — Isolated | `gpt-6.1-sol` (`high`) | **1.00** | 19 | 222,260 / 6,129 |
+| `settlement-modular-vulnerable` | Level 1 — Modular (4 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 11 | 100,604 / 4,862 |
+| `settlement-modular-safe` | Level 1 — Modular (4 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 25 | 512,074 / 7,345 |
+| `settlement-engine-vulnerable` | Level 2 — Engine + noise (6 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 12 | 141,956 / 4,373 |
+| `settlement-engine-safe` | Level 2 — Engine + noise (6 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 25 | 574,267 / 7,982 |
+
 - The historical GLM submission scored 0.00 on v1. Replaying its unchanged
   artifacts under v2 JSON grading produced 0.60; that replay remains in
   `scripts/fixtures/glm-5.3-flash/` and is not a v3 result.
@@ -233,4 +255,7 @@ scripts/selftest.py             adversarial regression suite covering all 4 task
 scripts/harbor-smoke.py         Harbor E2E check of reference task pairs
 evidence/v3/                    current-version validation; other evidence/ entries are v1/v2
 evidence/v3/glm-5.3-flash       complete GLM 5.3 Flash v3 Harbor runs and traces
+evidence/v3/claude-opus-5-5     complete Claude Opus 5.5 v3 Harbor runs and traces across settlement*
+evidence/v3/gpt-6.1-sol-high    complete GPT 6.1 Sol (high) v3 Harbor runs and traces across settlement*
 ```
+

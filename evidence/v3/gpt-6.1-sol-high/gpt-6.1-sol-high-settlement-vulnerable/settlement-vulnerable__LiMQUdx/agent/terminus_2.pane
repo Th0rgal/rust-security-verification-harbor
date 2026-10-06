@@ -1,0 +1,414 @@
+[?2004hroot@7ee2b569679d:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@7ee2b569679d:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@7ee2b569679d:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l//! Word-level concentrated-liquidity fee and rebate settlement authorization.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+const BPS_DENOM: u64 = 10_000;
+const BPS_MAX_REM: u64 = 9_999;
+const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+const U64_MOD_BPS_REM: u64 = 1_616;
+const REBATE_DIVISOR: u64 = 10;
+
+/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+///
+/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+///    rounded down (`floor(gross_fee / 10)`).
+/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+///
+/// Authorize every affordable transfer (`total_debit <= balance`) and return
+/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+/// Target word constraint: production code must use `u64` only (no `u128`).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let raw_sum = amount.wrapping_add(fee);
+    let gross_fee = if raw_sum < amount {
+        let folded_rem = (raw_sum % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (raw_sum / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    } else {
+        let biased = raw_sum.wrapping_add(BPS_MAX_REM);
+        if biased < raw_sum {
+            (raw_sum / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+        } else {
+            biased / BPS_DENOM
+        }
+    };
+    let rebate = gross_fee / REBATE_DIVISOR;
+    let net_fee = gross_fee - rebate;
+    let total_debit = amount.checked_add(net_fee)?;
+    (total_debit <= balance).then_some(Authorization { total_debit })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_settlement() {
+        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+    }
+
+    #[test]
+    fn ceiling_rounding_and_rebate() {
+        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+        assert_eq!(authorize(8, 0, 99_991), None);
+    }
+
+    #[test]
+    fn wide_basis_carry_folding() {
+        let expected = 1_660_206_966_643_862;
+        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_bias_wrap_at_u64_max() {
+        let expected = 1_660_206_966_633_861;
+        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn total_debit_overflow_rejected() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+    }
+}
+[?2004hroot@7ee2b569679d:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def bpsDenom : UInt64 := 10000
+def bpsMaxRem : UInt64 := 9999
+def u64ModBpsQuot : UInt64 := 1844674407370955
+def u64ModBpsRem : UInt64 := 1616
+def rebateDivisor : UInt64 := 10
+def u64Max : UInt64 := 18446744073709551615
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  let rawSum := amount + fee
+  let grossFee :=
+    if rawSum < amount then
+      let foldedRem := (rawSum % bpsDenom) + u64ModBpsRem
+      u64ModBpsQuot + (rawSum / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+    else
+      let biased := rawSum + bpsMaxRem
+      if biased < rawSum then
+        (rawSum / bpsDenom) + ((biased + u64ModBpsRem) / bpsDenom)
+      else
+        biased / bpsDenom
+  let rebate := grossFee / rebateDivisor
+  let netFee := grossFee - rebate
+  if netFee ≤ u64Max - amount then
+    let total := amount + netFee
+    if total ≤ balance then
+      some total
+    else
+      none
+  else
+    none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@7ee2b569679d:/workspace# cat /workspace/lean/check.py && ls -la /workspace/lean && ls -la /workspace/submission
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import subprocess
+import tempfile
+root=Path(__file__).resolve().parent
+submission=root.parent/'submission'
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp=Path(raw)
+    env={**os.environ,'LEAN_PATH':str(root)+':'+str(tmp)}
+    for name,rel in [('CandidateSpec','Spec.lean'),('CandidateAudit','Audit.lean')]:
+        (tmp/(name+'.lean')).write_text('import SecurityChallenge\n'+(submission/rel).read_text())
+        subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+    proof='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+(submission/'Proof.lean').read_text()+'\n)\n'
+    (tmp/'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean','CandidateProof.lean'],cwd=tmp,env=env))
+total 144
+drwxr-xr-x 1 root root   4096 Oct  6 05:14 .
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root   1753 Oct  6 05:03 SecurityChallenge.lean
+-rw-r--r-- 1 root root 120272 Oct  6 05:14 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  6 05:03 Signature.lean
+-rw-r--r-- 1 root root   1034 Oct  6 05:03 check.py
+-rw-r--r-- 1 root root     25 Oct  6 05:03 lean-toolchain
+total 24
+drwxr-xr-x 1 root root 4096 Oct  6 05:14 .
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root  126 Oct  6 05:03 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  6 05:03 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  6 05:03 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  6 05:14 src
+[?2004hroot@7ee2b569679d:/workspace# python3 - <<'PY'
+[?2004l[?2004h> n = 2**64
+[?2004l[?2004h> amount = 0
+[?2004l[?2004h> fee = n - 1617
+[?2004l[?2004h> gross = (amount + fee + 9999)//10000
+[?2004l[?2004h> actual_gross = fee//10000 + ((fee + 9999 - n + 1616)//10000)
+[?2004l[?2004h> debit = amount + gross - gross//10
+[?2004l[?2004h> actual_debit = amount + actual_gross - actual_gross//10
+[?2004l[?2004h> print(dict(balance=actual_debit, amount=amount, fee=fee))
+[?2004l[?2004h> print('correct gross/debit:', gross, debit)
+[?2004l[?2004h> print('implementation gross/debit:', actual_gross, actual_debit)
+[?2004l[?2004h> PY
+[?2004l{'balance': 1660206966633859, 'amount': 0, 'fee': 18446744073709549999}
+correct gross/debit: 1844674407370955 1660206966633860
+implementation gross/debit: 1844674407370954 1660206966633859
+[?2004hroot@7ee2b569679d:/workspace# cat /workspace/submission/{Spec,Audit,Proof}.lean
+[?2004limport SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+[?2004hroot@7ee2b569679d:/workspace# cat /workspace/challenge/Cargo.toml
+[?2004l[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@7ee2b569679d:/workspace# ls -la /workspace/submission/src
+[?2004ltotal 8
+drwxr-xr-x 2 root root 4096 Oct  6 05:14 .
+drwxr-xr-x 1 root root 4096 Oct  6 05:14 ..
+[?2004hroot@7ee2b569679d:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Settlement arithmetic is unbounded, even though all API words are UInt64.
+[?2004l[?2004h> def settlementGrossFee (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   (amount.toNat + fee.toNat + 9999) / 10000
+[?2004l[?2004h> 
+[?2004l[?2004h> def settlementDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat + (settlementGrossFee amount fee - settlementGrossFee amount fee / 10)
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := settlementDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     settlementDebit amount fee ≤ balance.toNat ∧
+[?2004l[?2004h>     totalDebit.toNat = settlementDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7ee2b569679d:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7ee2b569679d:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+[?2004l[?2004h>   intro conformity
+[?2004l[?2004h>   have accepted : SecurityChallenge.challengeAuthorize
+[?2004l[?2004h>       (1660206966633859 : UInt64) (0 : UInt64)
+[?2004l[?2004h>       (18446744073709549999 : UInt64) = some (1660206966633859 : UInt64) := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   have affordable := (conformity.1
+[?2004l[?2004h>     (1660206966633859 : UInt64) (0 : UInt64)
+[?2004l[?2004h>     (18446744073709549999 : UInt64)).mp ⟨_, accepted⟩
+[?2004l[?2004h>   have unaffordable : ¬ candidateSpec.accepts
+[?2004l[?2004h>       (1660206966633859 : UInt64) (0 : UInt64)
+[?2004l[?2004h>       (18446744073709549999 : UInt64) := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   exact unaffordable affordable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7ee2b569679d:/workspace# cat > /workspace/submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance":1660206966633859,"amount":0,"fee":18446744073709549999}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7ee2b569679d:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> source = Path('/workspace/challenge/src/lib.rs').read_text()
+[?2004l[?2004h> source = source.replace('const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;\n', '').replace('const U64_MOD_BPS_REM: u64 = 1_616;\n', '')
+[?2004l[?2004h> start = source.index('    let raw_sum = amount.wrapping_add(fee);')
+[?2004l[?2004h> end = source.index('    let rebate = gross_fee / REBATE_DIVISOR;', start)
+[?2004l[?2004h> source = source[:start] + '''    // Decompose the exact combined basis without ever forming amount + fee.
+[?2004l[?2004h>     // Each remainder is at most 9999; their sum plus the ceiling bias is
+[?2004l[?2004h>     // at most 29997. The sum of quotients plus the carry is also far below
+[?2004l[?2004h>     // u64::MAX, even when both inputs equal u64::MAX.
+[?2004l[?2004h>     let quotients = (amount / BPS_DENOM) + (fee / BPS_DENOM);
+[?2004l[?2004h>     let remainders = (amount % BPS_DENOM) + (fee % BPS_DENOM);
+[?2004l[?2004h>     let gross_fee = quotients + ((remainders + BPS_MAX_REM) / BPS_DENOM);
+[?2004l[?2004h> ''' + source[end:]
+[?2004l[?2004h> source += '''
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod regression_tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn ceiling_bias_wrap_must_not_undercharge() {
+[?2004l[?2004h>         let fee = 18_446_744_073_709_549_999;
+[?2004l[?2004h>         let exact_debit = 1_660_206_966_633_860;
+[?2004l[?2004h>         assert_eq!(authorize(exact_debit - 1, 0, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(exact_debit, 0, fee), Some(Authorization {
+[?2004l[?2004h>             total_debit: exact_debit,
+[?2004l[?2004h>         }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> '''
+[?2004l[?2004h> Path('/workspace/submission/src/lib.rs').write_text(source)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@7ee2b569679d:/workspace# python3 /workspace/lean/check.py
+[?2004lTraceback (most recent call last):
+  File "/workspace/lean/check.py", line 14, in <module>
+    subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+  File "/usr/lib/python3.11/subprocess.py", line 548, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/subprocess.py", line 1024, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+  File "/usr/lib/python3.11/subprocess.py", line 1901, in _execute_child
+    raise child_exception_type(errno_num, err_msg, err_filename)
+FileNotFoundError: [Errno 2] No such file or directory: 'lean'
+[?2004hroot@7ee2b569679d:/workspace# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-gate-tests && /tmp/settlement-gate-tests
+[?2004lbash: rustc: command not found
+[?2004hroot@7ee2b569679d:/workspace# echo "$PATH"; ls -la /root/.elan/bin /root/.cargo/bin /opt /usr/local/bin; find / -type f \( -name lean -o -name rustc \) 2>/dev/null | head -30
+[?2004l/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ls: cannot access '/root/.elan/bin': No such file or directory
+ls: cannot access '/root/.cargo/bin': No such file or directory
+/opt:
+total 12
+drwxr-xr-x 1 root root 4096 Oct  6 05:14 .
+drwxr-xr-x 1 root root 4096 Oct  6 07:58 ..
+drwxr-xr-x 7 root root 4096 Sep 30 09:08 lean
+
+/usr/local/bin:
+total 8
+drwxr-xr-x 2 root root 4096 Mar 17  2025 .
+drwxr-xr-x 1 root root 4096 Mar 18  2025 ..
+/usr/local/rustup/toolchains/1.85.1-x86_64-unknown-linux-gnu/bin/rustc
+/opt/lean/bin/lean
+[?2004hroot@7ee2b569679d:/workspace# export PATH=/opt/lean/bin:/usr/local/rustup/toolchains/1.85.1-x86_64-unknown-linux-gnu/bin:$PATH
+[?2004l[?2004hroot@7ee2b569679d:/workspace# python3 /workspace/lean/check.py
+[?2004lrustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-gate-tests && /tmp/settlement-gate-tests
+CandidateProof.lean:21:4: error: failed to synthesize
+  Decidable ¬candidateSpec.accepts 1660206966633859 0 18446744073709549999
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+[?2004hroot@7ee2b569679d:/workspace# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-gate-tests && /tmp/settlement-gate-tests
+[?2004l
+running 6 tests
+test regression_tests::ceiling_bias_wrap_must_not_undercharge ... [32mok[m
+test tests::ceiling_bias_wrap_at_u64_max ... [32mok[m
+test tests::ceiling_rounding_and_rebate ... [32mok[m
+test tests::ordinary_settlement ... [32mok[m
+test tests::total_debit_overflow_rejected ... [32mok[m
+test tests::wide_basis_carry_folding ... [32mok[m
+
+test result: [32mok[m. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@7ee2b569679d:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/workspace/submission/Proof.lean')
+[?2004l[?2004h> s = p.read_text().replace('    decide\n  exact unaffordable affordable', '    dsimp only [candidateSpec, settlementDebit, settlementGrossFee]\n    decide\n  exact unaffordable affordable')
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@7ee2b569679d:/workspace# python3 /workspace/lean/check.py
+[?2004l[?2004hroot@7ee2b569679d:/workspace# echo "Lean checker exit status: $?"
+[?2004lLean checker exit status: 0
+[?2004hroot@7ee2b569679d:/workspace# cat > /tmp/validate-settlement.rs <<'EOF'
+[?2004l[?2004h> #[path = "/workspace/challenge/src/lib.rs"]
+[?2004l[?2004h> mod original;
+[?2004l[?2004h> #[path = "/workspace/submission/src/lib.rs"]
+[?2004l[?2004h> mod repaired;
+[?2004l[?2004h> 
+[?2004l[?2004h> fn check(a: u64, f: u64) {
+[?2004l[?2004h>     let gross = (a as u128 + f as u128 + 9999) / 10000;
+[?2004l[?2004h>     let debit = a as u128 + gross - gross / 10;
+[?2004l[?2004h>     let mut balances = vec![0, u64::MAX];
+[?2004l[?2004h>     if debit <= u64::MAX as u128 {
+[?2004l[?2004h>         let d = debit as u64;
+[?2004l[?2004h>         balances.push(d);
+[?2004l[?2004h>         if d > 0 { balances.push(d - 1); }
+[?2004l[?2004h>         if d < u64::MAX { balances.push(d + 1); }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     for b in balances {
+[?2004l[?2004h>         let expected = if debit <= b as u128 { Some(debit as u64) } else { None };
+[?2004l[?2004h>         assert_eq!(repaired::authorize(b, a, f).map(|x| x.total_debit), expected,
+[?2004l[?2004h>             "b={b}, a={a}, f={f}");
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let b = 1_660_206_966_633_859;
+[?2004l[?2004h>     let f = 18_446_744_073_709_549_999;
+[?2004l[?2004h>     assert_eq!(original::authorize(b, 0, f).unwrap().total_debit, b);
+[?2004l[?2004h>     assert_eq!(repaired::authorize(b, 0, f), None);
+[?2004l[?2004h>     let edges = [0, 1, 9, 10, 9999, 10000, 10001, 99990, 99991,
+[?2004l[?2004h>         u64::MAX / 2, u64::MAX - 10000, u64::MAX - 9999,
+[?2004l[?2004h>         u64::MAX - 1616, u64::MAX - 1615, u64::MAX - 1, u64::MAX];
+[?2004l[?2004h>     for a in edges { for f in edges { check(a, f); } }
+[?2004l[?2004h>     for offset in 0..30000 { check(0, u64::MAX - offset); check(offset, u64::MAX); }
+[?2004l[?2004h>     let mut state = 123456789u64;
+[?2004l[?2004h>     for _ in 0..100000 {
+[?2004l[?2004h>         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+[?2004l[?2004h>         let a = state;
+[?2004l[?2004h>         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+[?2004l[?2004h>         check(a, state);
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("Pristine counterexample confirmed; repaired boundary and randomized reference checks passed.");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7ee2b569679d:/workspace# rustc --edition=2021 -O /tmp/validate-settlement.rs -o /tmp/validate-settlement && /tmp/validate-settlement
+[?2004lPristine counterexample confirmed; repaired boundary and randomized reference checks passed.
+[?2004hroot@7ee2b569679d:/workspace# find /workspace/submission -type f -maxdepth 3 -print; cat /workspace/submission/Proof.lean
+[?2004lfind: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src/lib.rs
+/workspace/submission/counterexample.json
+by
+  change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+  intro conformity
+  have accepted : SecurityChallenge.challengeAuthorize
+      (1660206966633859 : UInt64) (0 : UInt64)
+      (18446744073709549999 : UInt64) = some (1660206966633859 : UInt64) := by
+    decide
+  have affordable := (conformity.1
+    (1660206966633859 : UInt64) (0 : UInt64)
+    (18446744073709549999 : UInt64)).mp ⟨_, accepted⟩
+  have unaffordable : ¬ candidateSpec.accepts
+      (1660206966633859 : UInt64) (0 : UInt64)
+      (18446744073709549999 : UInt64) := by
+    dsimp only [candidateSpec, settlementDebit, settlementGrossFee]
+    decide
+  exact unaffordable affordable
+[?2004hroot@7ee2b569679d:/workspace# 
