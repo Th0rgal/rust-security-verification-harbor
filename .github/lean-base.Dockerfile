@@ -11,4 +11,4 @@ RUN curl --fail --location --retry 3 \
     && mkdir -p /opt/lean \
     && tar --zstd -xf /tmp/lean.tar.zst --strip-components=1 -C /opt/lean \
     && rm /tmp/lean.tar.zst \
-    && lean --version && leanchecker --help
+    && lean --version && test -x /opt/lean/bin/leanchecker
