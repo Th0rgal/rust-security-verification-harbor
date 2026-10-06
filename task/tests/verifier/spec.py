@@ -41,18 +41,26 @@ def expression(tree, variables):
             return z3.IntVal(v), 'nat'
         if set(n)!= {'op','args'}: raise ValueError('invalid trusted AST fields')
         op,args=n['op'],n['args']
-        arities={'true':0,'false':0,'add':2,'sub':2,'le':2,'lt':2,'eq':2,'and':2,'or':2,'not':1,'iff':2,'implies':2,'if':3}
+        arities={'true':0,'false':0,'add':2,'sub':2,'mul':2,'div':2,'mod':2,'le':2,'lt':2,'eq':2,'and':2,'or':2,'not':1,'iff':2,'implies':2,'if':3}
         if op not in arities or not isinstance(args,list) or len(args)!=arities[op]: raise Unsupported('unsupported operation')
         terms=[go(x,depth+1) for x in args]
         vals=[x[0] for x in terms]; kinds=[x[1] for x in terms]
         if op in ('true','false'): return z3.BoolVal(op=='true'),'prop'
-        if op in ('add','sub','le','lt') and kinds!=['nat','nat']: raise ValueError('invalid numeric AST type')
+        if op in ('add','sub','mul','div','mod','le','lt') and kinds!=['nat','nat']: raise ValueError('invalid numeric AST type')
         if op in ('and','or','iff','implies') and kinds!=['prop','prop']: raise ValueError('invalid logical AST type')
         if op=='not' and kinds!=['prop']: raise ValueError('invalid not AST type')
         if op=='eq' and (len(set(kinds))!=1): raise ValueError('invalid equality AST type')
         if op=='if' and (kinds[0]!='prop' or kinds[1]!=kinds[2]): raise ValueError('invalid conditional AST type')
         if op=='add': return vals[0]+vals[1],'nat'
         if op=='sub': return z3.If(vals[0]>=vals[1], vals[0]-vals[1], 0),'nat'
+        if op=='mul':
+            v0,v1=z3.simplify(vals[0]),z3.simplify(vals[1])
+            if not (z3.is_int_value(v0) or z3.is_int_value(v1)): raise Unsupported('nonlinear multiplication')
+            return vals[0]*vals[1],'nat'
+        if op in ('div','mod'):
+            d=z3.simplify(vals[1])
+            if not z3.is_int_value(d) or d.as_long()<=0: raise Unsupported('division/modulo requires positive constant divisor')
+            return (vals[0]/d if op=='div' else vals[0]%d),'nat'
         if op=='le': return vals[0]<=vals[1],'prop'
         if op=='lt': return vals[0]<vals[1],'prop'
         if op=='eq': return vals[0]==vals[1],'prop'
@@ -67,7 +75,25 @@ def expression(tree, variables):
     if kind!='prop': raise ValueError('spec component must have type Prop')
     return value
 
-def check(obj):
+def expected_debit_z3(amount, fee, problem='authorization'):
+    if problem=='authorization':
+        return amount+fee
+    if problem=='settlement' or problem.startswith('settlement-'):
+        gross_fee=(amount+fee+9999)/10000
+        rebate=gross_fee/10
+        return amount+(gross_fee-rebate)
+    raise ValueError(f'unknown problem: {problem}')
+
+def expected_debit_py(amount, fee, problem='authorization'):
+    if problem=='authorization':
+        return amount+fee
+    if problem=='settlement' or problem.startswith('settlement-'):
+        gross_fee=(amount+fee+9999)//10000
+        rebate=gross_fee//10
+        return amount+(gross_fee-rebate)
+    raise ValueError(f'unknown problem: {problem}')
+
+def check(obj, problem='authorization'):
     if 'unsupported' in obj:
         return {'status':'unsupported','credit_fraction':0,'kernel_valid':True,'reason':obj['unsupported']}
     v={k:z3.Int(k) for k in ('balance','amount','fee','total')}
@@ -78,13 +104,14 @@ def check(obj):
     except Unsupported as exc: accepts_error=str(exc); accepts=None
     try: output=expression(obj['output'],list(v.values())) if output_error is None else None
     except Unsupported as exc: output_error=str(exc); output=None
-    wanted=a+f <= b
+    expected_total=expected_debit_z3(a,f,problem)
+    wanted=expected_total <= b
     unsupported=lambda reason: {'status':'unsupported','reason':reason}
     safety=query(z3.And(accepts,z3.Not(wanted)),v) if accepts is not None else unsupported(accepts_error)
     complete=query(z3.And(wanted,z3.Not(accepts)),v) if accepts is not None else unsupported(accepts_error)
     ready=accepts is not None and output is not None
     reason=accepts_error or output_error
-    exact=query(z3.And(accepts,output,t!=a+f),v) if ready else unsupported(reason)
+    exact=query(z3.And(accepts,output,t!=expected_total),v) if ready else unsupported(reason)
     # Existence is quantified over *bounded* UInt64 results. No sampling.
     exists=z3.Exists([t],z3.And(t>=0,t<=MAX,output)) if ready else None
     existence=query(z3.And(accepts,z3.Not(exists)),{k:x for k,x in v.items() if k!='total'}) if ready else unsupported(reason)

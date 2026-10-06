@@ -41,19 +41,23 @@ acceptances, acceptance of all valid payments, exact/unique output on accepted
 inputs, and existence of an output for every accepted input. Lean compilation,
 independent kernel replay, type checks and a transitive axiom audit precede
 semantic analysis. Spec grading uses a bounded translator of elaborated Lean
-expressions to Z3: Nat constants, input UInt64.toNat, Nat + and truncated -, =,
-<, ≤, And/Or/Not/Iff/implication, and nondependent if. Auxiliary definitions are
-unfolded. Other expressions are reported unsupported, not semantically false.
+expressions to Z3: Nat constants, input UInt64.toNat, Nat +, truncated -,
+constant *, /, and %, =, <, ≤, And/Or/Not/Iff/implication, and nondependent if.
+Auxiliary definitions are unfolded. Other expressions are reported unsupported,
+not semantically false.
 Imports allowed: SecurityChallenge, Lean, Std, Lean.Elab.Tactic.Omega.
 Axioms allowed: propext, Classical.choice, Quot.sound. No sorry, added axioms,
 native_decide, unsafe/extern hooks or elaboration extensions.
 
 Rust repairs are analyzed universally on the full u64 input domain within the
 supported expression subset, then compiled and exercised concretely. Supported:
-immutable lets/shadowing, if/else, if-let, exhaustive Option matches, returns,
-?, casts, +/-, comparisons/booleans, checked/wrapping add/sub, saturating_add,
-then_some, Some/None and Authorization construction, built-in derives and
-#[cfg(test)] test modules. Other production code is reported unsupported.
+inline modules, integer constants, plain structs and non-recursive helper
+functions (in multi-module crates), immutable lets/shadowing, if/else, if-let,
+exhaustive Option matches, returns, ?, casts (when permitted by the crate
+contract), + / - / * / / / %, comparisons/booleans, div_ceil, checked/wrapping
+add/sub/mul, checked div/rem, saturating add/sub, then_some, Some/None and
+Authorization construction, built-in derives and #[cfg(test)] test modules.
+Other production code is reported unsupported.
 
 Scores: specification 25%, justified verdict 15%, Lean evidence 25%, response
 35%. A specification error does not lock the other scores. A proof certifies the

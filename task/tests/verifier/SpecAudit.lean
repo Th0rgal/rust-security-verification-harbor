@@ -51,6 +51,9 @@ partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 512) : MetaM Jso
   if name == some ``False then return node "false"
   if name == some ``Nat.add && args.size == 2 then return node "add" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.sub && args.size == 2 then return node "sub" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.mul && args.size == 2 then return node "mul" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.div && args.size == 2 then return node "div" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.mod && args.size == 2 then return node "mod" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.le && args.size == 2 then return node "le" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.lt && args.size == 2 then return node "lt" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Eq && args.size == 3 then

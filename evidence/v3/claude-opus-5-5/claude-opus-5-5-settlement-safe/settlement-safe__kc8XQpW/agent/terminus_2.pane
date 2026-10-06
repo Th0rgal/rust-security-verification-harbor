@@ -1,0 +1,694 @@
+[?2004hroot@cf21c8861e93:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@cf21c8861e93:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@cf21c8861e93:/workspace# cat /workspace/challenge/src/lib.rs; ls -R /workspace | head -50
+[?2004l//! Word-level concentrated-liquidity fee and rebate settlement authorization.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+const BPS_DENOM: u64 = 10_000;
+const BPS_MAX_REM: u64 = 9_999;
+const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+const U64_MOD_BPS_REM: u64 = 1_616;
+const REBATE_DIVISOR: u64 = 10;
+
+/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+///
+/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+///    rounded down (`floor(gross_fee / 10)`).
+/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+///
+/// Authorize every affordable transfer (`total_debit <= balance`) and return
+/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+/// Target word constraint: production code must use `u64` only (no `u128`).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let raw_sum = amount.wrapping_add(fee);
+    let gross_fee = if raw_sum < amount {
+        let folded_rem = (raw_sum % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (raw_sum / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    } else {
+        let biased = raw_sum.wrapping_add(BPS_MAX_REM);
+        if biased < raw_sum {
+            (raw_sum / BPS_DENOM) + (((raw_sum % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+        } else {
+            biased / BPS_DENOM
+        }
+    };
+    let rebate = gross_fee / REBATE_DIVISOR;
+    let net_fee = gross_fee - rebate;
+    let total_debit = amount.checked_add(net_fee)?;
+    (total_debit <= balance).then_some(Authorization { total_debit })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_settlement() {
+        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+    }
+
+    #[test]
+    fn ceiling_rounding_and_rebate() {
+        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+        assert_eq!(authorize(8, 0, 99_991), None);
+    }
+
+    #[test]
+    fn wide_basis_carry_folding() {
+        let expected = 1_660_206_966_643_862;
+        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_bias_wrap_at_u64_max() {
+        let expected = 1_660_206_966_633_861;
+        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn total_debit_overflow_rejected() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+    }
+}
+/workspace:
+challenge
+harness
+lean
+submission
+
+/workspace/challenge:
+Cargo.lock
+Cargo.toml
+src
+target
+
+/workspace/challenge/src:
+lib.rs
+
+/workspace/challenge/target:
+CACHEDIR.TAG
+release
+
+/workspace/challenge/target/release:
+build
+deps
+examples
+incremental
+
+/workspace/challenge/target/release/build:
+
+/workspace/challenge/target/release/deps:
+libsettlement_gate-0aba5e1fc59a671e.rlib
+libsettlement_gate-0aba5e1fc59a671e.rmeta
+settlement_gate-0aba5e1fc59a671e.d
+settlement_gate-ebd00f5d27994bc9
+settlement_gate-ebd00f5d27994bc9.d
+
+/workspace/challenge/target/release/examples:
+
+/workspace/challenge/target/release/incremental:
+
+/workspace/harness:
+checkpoint.py
+
+/workspace/lean:
+SecurityChallenge.lean
+SecurityChallenge.olean
+Signature.lean
+check.py
+lean-toolchain
+
+/workspace/submission:
+Audit.lean
+[?2004hroot@cf21c8861e93:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def bpsDenom : UInt64 := 10000
+def bpsMaxRem : UInt64 := 9999
+def u64ModBpsQuot : UInt64 := 1844674407370955
+def u64ModBpsRem : UInt64 := 1616
+def rebateDivisor : UInt64 := 10
+def u64Max : UInt64 := 18446744073709551615
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  let rawSum := amount + fee
+  let grossFee :=
+    if rawSum < amount then
+      let foldedRem := (rawSum % bpsDenom) + u64ModBpsRem
+      u64ModBpsQuot + (rawSum / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+    else
+      let biased := rawSum + bpsMaxRem
+      if biased < rawSum then
+        (rawSum / bpsDenom) + (((rawSum % bpsDenom) + bpsMaxRem) / bpsDenom)
+      else
+        biased / bpsDenom
+  let rebate := grossFee / rebateDivisor
+  let netFee := grossFee - rebate
+  if netFee ≤ u64Max - amount then
+    let total := amount + netFee
+    if total ≤ balance then
+      some total
+    else
+      none
+  else
+    none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@cf21c8861e93:/workspace# cat /workspace/lean/check.py; cat /workspace/lean/Signature.lean; cat /workspace/lean/lean-toolchain; cat /workspace/submission/Audit.lean
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import subprocess
+import tempfile
+root=Path(__file__).resolve().parent
+submission=root.parent/'submission'
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp=Path(raw)
+    env={**os.environ,'LEAN_PATH':str(root)+':'+str(tmp)}
+    for name,rel in [('CandidateSpec','Spec.lean'),('CandidateAudit','Audit.lean')]:
+        (tmp/(name+'.lean')).write_text('import SecurityChallenge\n'+(submission/rel).read_text())
+        subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+    proof='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+(submission/'Proof.lean').read_text()+'\n)\n'
+    (tmp/'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean','CandidateProof.lean'],cwd=tmp,env=env))
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+leanprover/lean4:v4.31.0
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+[?2004hroot@cf21c8861e93:/workspace# mkdir -p /tmp/t && cd /tmp/t && cat > T.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tail (b a g : UInt64) :
+[?2004l[?2004h>   (if g - g / 10 ≤ (18446744073709551615 : UInt64) - a then
+[?2004l[?2004h>      (if a + (g - g / 10) ≤ b then some (a + (g - g / 10)) else none) else none)
+[?2004l[?2004h>   = (if a.toNat + (g.toNat - g.toNat / 10) ≤ b.toNat then some (UInt64.ofNat (a.toNat + (g.toNat - g.toNat / 10))) else none) := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hb := b.toNat_lt
+[?2004l[?2004h>   have hg := g.toNat_lt
+[?2004l[?2004h>   have hd : (g / 10).toNat = g.toNat / 10 := UInt64.toNat_div g 10
+[?2004l[?2004h>   have hs : (g - g / 10).toNat = g.toNat - g.toNat / 10 := by
+[?2004l[?2004h>     rw [UInt64.toNat_sub_of_le]; · rw [hd]
+[?2004l[?2004h>     rw [UInt64.le_iff_toNat_le, hd]; omega
+[?2004l[?2004h>   by_cases c1 : g.toNat - g.toNat / 10 ≤ 18446744073709551615 - a.toNat
+[?2004l[?2004h>   · have e1 : g - g / 10 ≤ (18446744073709551615 : UInt64) - a := by
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hs, UInt64.toNat_sub_of_le] <;> simp <;> omega
+[?2004l[?2004h>     have ht : (a + (g - g / 10)).toNat = a.toNat + (g.toNat - g.toNat / 10) := by
+[?2004l[?2004h>       rw [UInt64.toNat_add, hs]; omega
+[?2004l[?2004h>     rw [if_pos e1]
+[?2004l[?2004h>     by_cases c2 : a.toNat + (g.toNat - g.toNat / 10) ≤ b.toNat
+[?2004l[?2004h>     · rw [if_pos (by rw [UInt64.le_iff_toNat_le, ht]; exact c2), if_pos c2]
+[?2004l[?2004h>       congr 1; apply UInt64.toNat_inj.mp; rw [ht, UInt64.toNat_ofNat]; omega
+[?2004l[?2004h>     · rw [if_neg (by rw [UInt64.le_iff_toNat_le, ht]; exact c2), if_neg c2]
+[?2004l[?2004h>   · have e1 : ¬ g - g / 10 ≤ (18446744073709551615 : UInt64) - a := by
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hs, UInt64.toNat_sub_of_le] <;> simp <;> omega
+[?2004l[?2004h>     rw [if_neg e1, if_neg (by omega)]
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/tmp/t# LEAN_PATH=/workspace/lean lean T.lean
+[?2004lbash: lean: command not found
+[?2004hroot@cf21c8861e93:/tmp/t# ls ~/.elan/bin 2>/dev/null; which elan lake 2>/dev/null; find / -name lean -type f -perm -u+x 2>/dev/null | head -20
+[?2004l/opt/lean/bin/lean
+[?2004hroot@cf21c8861e93:/tmp/t# export PATH=/opt/lean/bin:$PATH; lean --version
+[?2004lLean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[?2004hroot@cf21c8861e93:/tmp/t# cd /tmp/t && LEAN_PATH=/workspace/lean lean T.lean 2>&1 | head -60
+[?2004lT.lean:17:66: error: `simp` made no progress
+T.lean:23:50: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  (OfNat.ofNat ?m.321).toNat
+in the target expression
+  a.toNat + (g.toNat - g.toNat / 10) = (UInt64.ofNat (a.toNat + (g.toNat - g.toNat / 10))).toNat
+
+case pos
+b a g : UInt64
+ha : a.toNat < 2 ^ 64
+hb : b.toNat < 2 ^ 64
+hg : g.toNat < 2 ^ 64
+hd : (g / 10).toNat = g.toNat / 10
+hs : (g - g / 10).toNat = g.toNat - g.toNat / 10
+c1 : g.toNat - g.toNat / 10 ≤ 18446744073709551615 - a.toNat
+e1 : g - g / 10 ≤ 18446744073709551615 - a
+ht : (a + (g - g / 10)).toNat = a.toNat + (g.toNat - g.toNat / 10)
+c2 : a.toNat + (g.toNat - g.toNat / 10) ≤ b.toNat
+⊢ a.toNat + (g.toNat - g.toNat / 10) = (UInt64.ofNat (a.toNat + (g.toNat - g.toNat / 10))).toNat
+T.lean:26:66: error: `simp` made no progress
+[?2004hroot@cf21c8861e93:/tmp/t# cat > C.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> #check @UInt64.toNat_add
+[?2004l[?2004h> #check @UInt64.toNat_sub
+[?2004l[?2004h> #check @UInt64.toNat_sub_of_le
+[?2004l[?2004h> #check @UInt64.toNat_div
+[?2004l[?2004h> #check @UInt64.toNat_mod
+[?2004l[?2004h> #check @UInt64.le_iff_toNat_le
+[?2004l[?2004h> #check @UInt64.lt_iff_toNat_lt
+[?2004l[?2004h> #check @UInt64.toNat_inj
+[?2004l[?2004h> #check @UInt64.toNat_ofNat
+[?2004l[?2004h> #check @UInt64.toNat_ofNat'
+[?2004l[?2004h> #check @UInt64.toNat_ofNat_of_lt
+[?2004l[?2004h> #check @UInt64.ofNat_toNat
+[?2004l[?2004h> example (a b : UInt64) (h : a.toNat + b.toNat < 2^64) : (a + b).toNat = a.toNat + b.toNat := by bv_omega
+[?2004l[?2004h> example : ((18446744073709551615 : UInt64) - 5).toNat = 18446744073709551610 := by simp
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/tmp/t# LEAN_PATH=/workspace/lean lean C.lean 2>&1 | head -60
+[?2004lUInt64.toNat_add : ∀ (a b : UInt64), (a + b).toNat = (a.toNat + b.toNat) % 2 ^ 64
+UInt64.toNat_sub : ∀ (a b : UInt64), (a - b).toNat = (2 ^ 64 - b.toNat + a.toNat) % 2 ^ 64
+UInt64.toNat_sub_of_le : ∀ (a b : UInt64), b ≤ a → (a - b).toNat = a.toNat - b.toNat
+UInt64.toNat_div : ∀ (a b : UInt64), (a / b).toNat = a.toNat / b.toNat
+UInt64.toNat_mod : ∀ (a b : UInt64), (a % b).toNat = a.toNat % b.toNat
+@UInt64.le_iff_toNat_le : ∀ {a b : UInt64}, a ≤ b ↔ a.toNat ≤ b.toNat
+@UInt64.lt_iff_toNat_lt : ∀ {a b : UInt64}, a < b ↔ a.toNat < b.toNat
+@UInt64.toNat_inj : ∀ {a b : UInt64}, a.toNat = b.toNat ↔ a = b
+@UInt64.toNat_ofNat : ∀ {n : Nat}, (OfNat.ofNat n).toNat = n % 2 ^ 64
+@UInt64.toNat_ofNat' : ∀ {n : Nat}, (UInt64.ofNat n).toNat = n % 2 ^ 64
+@UInt64.toNat_ofNat_of_lt : ∀ {n : Nat}, n < UInt64.size → UInt64.toNat (OfNat.ofNat n) = n
+@UInt64.ofNat_toNat : ∀ {x : UInt64}, UInt64.ofNat x.toNat = x
+C.lean:14:96: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  e ≥ 0
+  d ≥ 0
+  c ≥ 0
+  c + d ≤ 18446744073709551615
+  c + d - e ≥ 1
+where
+ c := ↑a.toNat
+ d := ↑b.toNat
+ e := ↑(a + b).toNat
+[?2004hroot@cf21c8861e93:/tmp/t# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Intended gross fee: ceil((amount + fee) / 10000), exact over Nat. -/
+[?2004l[?2004h> def specGross (a f : Nat) : Nat := (a + f + 9999) / 10000
+[?2004l[?2004h> /-- Intended net debit: amount + (gross - floor(gross / 10)). -/
+[?2004l[?2004h> def specDebit (a f : Nat) : Nat := a + (specGross a f - specGross a f / 10)
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun b a f => specDebit a.toNat f.toNat ≤ b.toNat
+[?2004l[?2004h>   output := fun _b a f t => t.toNat = specDebit a.toNat f.toNat
+[?2004l[?2004h> 
+[?2004l[?2004h> namespace CandidateProofs
+[?2004l[?2004h> 
+[?2004l[?2004h> def gfee (amount fee : UInt64) : UInt64 :=
+[?2004l[?2004h>   let rawSum := amount + fee
+[?2004l[?2004h>   if rawSum < amount then
+[?2004l[?2004h>     let foldedRem := (rawSum % bpsDenom) + u64ModBpsRem
+[?2004l[?2004h>     u64ModBpsQuot + (rawSum / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+[?2004l[?2004h>   else
+[?2004l[?2004h>     let biased := rawSum + bpsMaxRem
+[?2004l[?2004h>     if biased < rawSum then
+[?2004l[?2004h>       (rawSum / bpsDenom) + (((rawSum % bpsDenom) + bpsMaxRem) / bpsDenom)
+[?2004l[?2004h>     else
+[?2004l[?2004h>       biased / bpsDenom
+[?2004l[?2004h> 
+[?2004l[?2004h> def tailFn (balance amount grossFee : UInt64) : Option UInt64 :=
+[?2004l[?2004h>   let rebate := grossFee / rebateDivisor
+[?2004l[?2004h>   let netFee := grossFee - rebate
+[?2004l[?2004h>   if netFee ≤ u64Max - amount then
+[?2004l[?2004h>     let total := amount + netFee
+[?2004l[?2004h>     if total ≤ balance then some total else none
+[?2004l[?2004h>   else none
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem model_eq (b a f : UInt64) :
+[?2004l[?2004h>     challengeAuthorize b a f = tailFn b a (gfee a f) := rfl
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem gfee_toNat (a f : UInt64) :
+[?2004l[?2004h>     (gfee a f).toNat = (a.toNat + f.toNat + 9999) / 10000 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l[?2004h>   have hD : bpsDenom.toNat = 10000 := rfl
+[?2004l[?2004h>   have hR : bpsMaxRem.toNat = 9999 := rfl
+[?2004l[?2004h>   have hQ : u64ModBpsQuot.toNat = 1844674407370955 := rfl
+[?2004l[?2004h>   have hM : u64ModBpsRem.toNat = 1616 := rfl
+[?2004l[?2004h>   unfold gfee
+[?2004l[?2004h>   split
+[?2004l[?2004h>   next h1 =>
+[?2004l[?2004h>     rw [UInt64.lt_iff_toNat_lt] at h1
+[?2004l[?2004h>     simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ, hM] at h1 ⊢
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   next h1 =>
+[?2004l[?2004h>     rw [UInt64.lt_iff_toNat_lt] at h1
+[?2004l[?2004h>     split
+[?2004l[?2004h>     next h2 =>
+[?2004l[?2004h>       rw [UInt64.lt_iff_toNat_lt] at h2
+[?2004l[?2004h>       simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ, hM] at h1 h2 ⊢
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     next h2 =>
+[?2004l[?2004h>       rw [UInt64.lt_iff_toNat_lt] at h2
+[?2004l[?2004h>       simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ, hM] at h1 h2 ⊢
+[?2004l[?2004h>       omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tail_iff (b a g t : UInt64) :
+[?2004l[?2004h>     tailFn b a g = some t ↔
+[?2004l[?2004h>       (a.toNat + (g.toNat - g.toNat / 10) ≤ b.toNat ∧
+[?2004l[?2004h>         t.toNat = a.toNat + (g.toNat - g.toNat / 10)) := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hb := b.toNat_lt
+[?2004l[?2004h>   have hg := g.toNat_lt
+[?2004l[?2004h>   have ht := t.toNat_lt
+[?2004l[?2004h>   have h10 : (g / rebateDivisor).toNat = g.toNat / 10 := by
+[?2004l[?2004h>     rw [UInt64.toNat_div]; rfl
+[?2004l[?2004h>   have hs : (g - g / rebateDivisor).toNat = g.toNat - g.toNat / 10 := by
+[?2004l[?2004h>     rw [UInt64.toNat_sub, h10]; omega
+[?2004l[?2004h>   have hmx : u64Max.toNat = 18446744073709551615 := rfl
+[?2004l[?2004h>   have hm : (u64Max - a).toNat = 18446744073709551615 - a.toNat := by
+[?2004l[?2004h>     rw [UInt64.toNat_sub, hmx]; omega
+[?2004l[?2004h>   have hsum : (a + (g - g / rebateDivisor)).toNat =
+[?2004l[?2004h>       (a.toNat + (g.toNat - g.toNat / 10)) % 2 ^ 64 := by
+[?2004l[?2004h>     rw [UInt64.toNat_add, hs]
+[?2004l[?2004h>   unfold tailFn
+[?2004l[?2004h>   split
+[?2004l[?2004h>   next h1 =>
+[?2004l[?2004h>     rw [UInt64.le_iff_toNat_le, hs, hm] at h1
+[?2004l[?2004h>     split
+[?2004l[?2004h>     next h2 =>
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at h2
+[?2004l[?2004h>       constructor
+[?2004l[?2004h>       · intro h
+[?2004l[?2004h>         cases h
+[?2004l[?2004h>         exact ⟨by omega, by rw [hsum]; omega⟩
+[?2004l[?2004h>       · intro h
+[?2004l[?2004h>         congr 1
+[?2004l[?2004h>         apply UInt64.toNat_inj.mp
+[?2004l[?2004h>         rw [hsum]; omega
+[?2004l[?2004h>     next h2 =>
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at h2
+[?2004l[?2004h>       constructor
+[?2004l[?2004h>       · intro h; cases h
+[?2004l[?2004h>       · intro h; exfalso; omega
+[?2004l[?2004h>   next h1 =>
+[?2004l[?2004h>     rw [UInt64.le_iff_toNat_le, hs, hm] at h1
+[?2004l[?2004h>     constructor
+[?2004l[?2004h>     · intro h; cases h
+[?2004l[?2004h>     · intro h; exfalso; omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem auth_iff (b a f t : UInt64) :
+[?2004l[?2004h>     challengeAuthorize b a f = some t ↔
+[?2004l[?2004h>       (specDebit a.toNat f.toNat ≤ b.toNat ∧ t.toNat = specDebit a.toNat f.toNat) := by
+[?2004l[?2004h>   rw [model_eq, tail_iff, gfee_toNat]
+[?2004l[?2004h>   rfl
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem conforms : Conforms candidateSpec challengeAuthorize := by
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     show (∃ total, challengeAuthorize b a f = some total) ↔ specDebit a.toNat f.toNat ≤ b.toNat
+[?2004l[?2004h>     constructor
+[?2004l[?2004h>     · rintro ⟨t, h⟩
+[?2004l[?2004h>       exact ((auth_iff b a f t).mp h).1
+[?2004l[?2004h>     · intro h
+[?2004l[?2004h>       have hb := b.toNat_lt
+[?2004l[?2004h>       refine ⟨UInt64.ofNat (specDebit a.toNat f.toNat), (auth_iff _ _ _ _).mpr ⟨h, ?_⟩⟩
+[?2004l[?2004h>       rw [UInt64.toNat_ofNat']
+[?2004l[?2004h>       omega
+[?2004l[?2004h>   · intro b a f t h
+[?2004l[?2004h>     exact ((auth_iff b a f t).mp h).2
+[?2004l[?2004h> 
+[?2004l[?2004h> end CandidateProofs
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/tmp/t# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/tmp/t# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   show SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+[?2004l[?2004h>   exact CandidateProofs.conforms
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/tmp/t# rm -f /workspace/submission/counterexample.json /workspace/submission/lib.rs; ls /workspace/submission
+[?2004lAudit.lean  Proof.lean	Spec.lean  src
+[?2004hroot@cf21c8861e93:/tmp/t# cd /workspace && python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:48:2: error: Tactic `split` failed: Could not split an `if` or `match` expression in the goal
+
+Hint: Use `set_option trace.split.failure true` to display additional diagnostic information
+
+a f : UInt64
+ha : a.toNat < 2 ^ 64
+hf : f.toNat < 2 ^ 64
+hD : bpsDenom.toNat = 10000
+hR : bpsMaxRem.toNat = 9999
+hQ : u64ModBpsQuot.toNat = 1844674407370955
+hM : u64ModBpsRem.toNat = 1616
+⊢ (have rawSum := a + f;
+      if rawSum < a then
+        have foldedRem := rawSum % bpsDenom + u64ModBpsRem;
+        u64ModBpsQuot + rawSum / bpsDenom + (foldedRem + bpsMaxRem) / bpsDenom
+      else
+        have biased := rawSum + bpsMaxRem;
+        if biased < rawSum then rawSum / bpsDenom + (rawSum % bpsDenom + bpsMaxRem) / bpsDenom
+        else biased / bpsDenom).toNat =
+    (a.toNat + f.toNat + 9999) / 10000
+CandidateSpec.lean:84:2: error: Tactic `split` failed: Could not split an `if` or `match` expression in the goal
+
+Hint: Use `set_option trace.split.failure true` to display additional diagnostic information
+
+b a g t : UInt64
+ha : a.toNat < 2 ^ 64
+hb : b.toNat < 2 ^ 64
+hg : g.toNat < 2 ^ 64
+ht : t.toNat < 2 ^ 64
+h10 : (g / rebateDivisor).toNat = g.toNat / 10
+hs : (g - g / rebateDivisor).toNat = g.toNat - g.toNat / 10
+hmx : u64Max.toNat = 18446744073709551615
+hm : (u64Max - a).toNat = 18446744073709551615 - a.toNat
+hsum : (a + (g - g / rebateDivisor)).toNat = (a.toNat + (g.toNat - g.toNat / 10)) % 2 ^ 64
+⊢ (have rebate := g / rebateDivisor;
+      have netFee := g - rebate;
+      if netFee ≤ u64Max - a then
+        have total := a + netFee;
+        if total ≤ b then some total else none
+      else none) =
+      some t ↔
+    a.toNat + (g.toNat - g.toNat / 10) ≤ b.toNat ∧ t.toNat = a.toNat + (g.toNat - g.toNat / 10)
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 14, in <module>
+    subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+  File "/usr/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+EXIT=1
+[?2004hroot@cf21c8861e93:/workspace# sed -i 's/^  unfold gfee$/  dsimp only [gfee]/; s/^  unfold tailFn$/  dsimp only [tailFn]/' /workspace/submission/Spec.lean && grep -n 'dsimp only' /workspace/submission/Spec.lean; ls -laR /workspace/submission/src
+[?2004l46:  dsimp only [gfee]
+82:  dsimp only [tailFn]
+/workspace/submission/src:
+total 12
+drwxr-xr-x 2 root root 4096 Oct  6 07:46 .
+drwxr-xr-x 1 root root 4096 Oct  6 08:06 ..
+[?2004hroot@cf21c8861e93:/workspace# cd /workspace && python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:58:79: warning: This simp argument is unused:
+  hQ
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ̵,̵ ̵h̵M] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:58:83: warning: This simp argument is unused:
+  hM
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ,̵ ̵h̵M̵] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:62:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵ ̵hD, hR, hQ, hM] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:62:79: warning: This simp argument is unused:
+  hQ
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ̵,̵ ̵h̵M] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:62:83: warning: This simp argument is unused:
+  hM
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ,̵ ̵h̵M̵] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:95:8: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 14, in <module>
+    subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+  File "/usr/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+EXIT=1
+[?2004hroot@cf21c8861e93:/workspace# sed -n 88,110p /workspace/submission/Spec.lean
+[?2004l      rw [UInt64.le_iff_toNat_le, hsum] at h2
+      constructor
+      · intro h
+        cases h
+        exact ⟨by omega, by rw [hsum]; omega⟩
+      · intro h
+        congr 1
+        apply UInt64.toNat_inj.mp
+        rw [hsum]; omega
+    next h2 =>
+      rw [UInt64.le_iff_toNat_le, hsum] at h2
+      constructor
+      · intro h; cases h
+      · intro h; exfalso; omega
+  next h1 =>
+    rw [UInt64.le_iff_toNat_le, hs, hm] at h1
+    constructor
+    · intro h; cases h
+    · intro h; exfalso; omega
+
+theorem auth_iff (b a f t : UInt64) :
+    challengeAuthorize b a f = some t ↔
+      (specDebit a.toNat f.toNat ≤ b.toNat ∧ t.toNat = specDebit a.toNat f.toNat) := by
+[?2004hroot@cf21c8861e93:/workspace# python3 - <<'EOF'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=s.replace("""      · intro h
+[?2004l[?2004h>         cases h
+[?2004l[?2004h>         exact ⟨by omega, by rw [hsum]; omega⟩""","""      · intro h
+[?2004l[?2004h>         have h' := Option.some.inj h
+[?2004l[?2004h>         subst h'
+[?2004l[?2004h>         exact ⟨by omega, by rw [hsum]; omega⟩""")
+[?2004l[?2004h> s=s.replace("· intro h; cases h","· intro h; exact Option.noConfusion h")
+[?2004l[?2004h> s=s.replace("simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR, hQ, hM] at h1 h2 ⊢","simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hD, hR] at h1 h2 ⊢")
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/workspace# cd /workspace && python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:62:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵ ̵hD, hR] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:96:8: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateSpec.lean:102:42: error: Application type mismatch: The argument
+  h
+has type
+  Eq.{1} none (some t)
+but is expected to have type
+  Eq.{?u.114 + 2} ?m.302 ?m.304
+in the application
+  Option.noConfusion h
+CandidateSpec.lean:107:40: error: Application type mismatch: The argument
+  h
+has type
+  Eq.{1} none (some t)
+but is expected to have type
+  Eq.{?u.117 + 2} ?m.334 ?m.336
+in the application
+  Option.noConfusion h
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 14, in <module>
+    subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+  File "/usr/lib/python3.11/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+EXIT=1
+[?2004hroot@cf21c8861e93:/workspace# python3 - <<'EOF'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=s.replace("· intro h; exact Option.noConfusion h","· intro h; cases h")
+[?2004l[?2004h> old="""      · intro h
+[?2004l[?2004h>         congr 1
+[?2004l[?2004h>         apply UInt64.toNat_inj.mp
+[?2004l[?2004h>         rw [hsum]; omega"""
+[?2004l[?2004h> new="""      · intro h
+[?2004l[?2004h>         have key : a + (g - g / rebateDivisor) = t :=
+[?2004l[?2004h>           UInt64.toNat_inj.mp (by rw [hsum]; omega)
+[?2004l[?2004h>         rw [key]"""
+[?2004l[?2004h> assert old in s
+[?2004l[?2004h> s=s.replace(old,new)
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cf21c8861e93:/workspace# cd /workspace && python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:62:53: warning: This simp argument is unused:
+  UInt64.toNat_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_div, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵m̵o̵d̵,̵ ̵hD, hR] at h1 h2 ⊢
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+EXIT=0
+[?2004hroot@cf21c8861e93:/workspace# mkdir -p /tmp/ax && cd /tmp/ax && (echo 'import SecurityChallenge'; cat /workspace/submission/Spec.lean) > CandidateSpec.lean && (echo 'import SecurityChallenge'; cat /workspace/submission/Audit.lean) > CandidateAudit.lean && export LEAN_PATH=/workspace/lean:/tmp/ax && lean -o CandidateSpec.olean CandidateSpec.lean >/dev/null && lean -o CandidateAudit.olean CandidateAudit.lean && printf 'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n%s\n)\n#print axioms auditEvidence\n' "$(cat /workspace/submission/Proof.lean)" > P.lean && lean P.lean; echo EXIT=$?
+[?2004l'auditEvidence' depends on axioms: [propext, Quot.sound]
+EXIT=0
+[?2004hroot@cf21c8861e93:/tmp/ax# cd /workspace/challenge && cargo test --offline 2>&1 | tail -15; git -C /workspace/challenge status --short 2>/dev/null; ls -la /workspace/submission
+[?2004lbash: cargo: command not found
+total 36
+drwxr-xr-x 1 root root 4096 Oct  6 08:06 .
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root  103 Oct  6 08:05 Audit.lean
+-rw-r--r-- 1 root root  121 Oct  6 08:05 Proof.lean
+-rw-r--r-- 1 root root 4480 Oct  6 08:09 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  6 07:46 src
+[?2004hroot@cf21c8861e93:/workspace/challenge# rmdir /workspace/submission/src; ls -la /workspace/submission; C=$(ls ~/.cargo/bin/cargo /usr/local/cargo/bin/cargo /opt/*/bin/cargo 2>/dev/null | head -1); echo CARGO=$C; [ -n "$C" ] && (cd /workspace/challenge && $C test --offline 2>&1 | tail -12)
+[?2004ltotal 32
+drwxr-xr-x 1 root root 4096 Oct  6 08:12 .
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root  103 Oct  6 08:05 Audit.lean
+-rw-r--r-- 1 root root  121 Oct  6 08:05 Proof.lean
+-rw-r--r-- 1 root root 4480 Oct  6 08:09 Spec.lean
+CARGO=/usr/local/cargo/bin/cargo
+test tests::ordinary_settlement ... ok
+test tests::total_debit_overflow_rejected ... ok
+test tests::wide_basis_carry_folding ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@cf21c8861e93:/workspace/challenge# cd /workspace && python3 /workspace/lean/check.py >/dev/null 2>&1; echo CHECK_EXIT=$?
+[?2004lCHECK_EXIT=0
+[?2004hroot@cf21c8861e93:/workspace# 

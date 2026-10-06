@@ -3,9 +3,15 @@
 ## Reference policy and independent obligations
 
 For inputs balance, amount, fee in [0, 2^64-1], let S be the unbounded
-mathematical amount + fee. The hidden business contract accepts iff S <= balance,
-and returns S on acceptance. Because balance is a u64, S <= balance also implies
-S fits u64; no separate overflow point is double-counted.
+mathematical debit defined by the task family (`problem.txt`):
+- In `authorization`, `S = amount + fee`.
+- In `settlement`, `settlement-modular`, and `settlement-engine`,
+  `gross_fee = ceil((amount + fee) / 10_000)`, `rebate = floor(gross_fee / 10)`,
+  and `S = amount + (gross_fee - rebate)`.
+
+The hidden business contract accepts iff S <= balance, and returns S on
+acceptance. Because balance is a u64, S <= balance also implies S fits u64; no
+separate overflow point is double-counted.
 
 The four spec facets are:
 1. accepts -> S <= balance.
@@ -38,9 +44,10 @@ SpecAudit lowers elaborated Lean Exprs. It dispatches primitive heads, beta/let
 reductions, structure projections and one-layer definition unfolding, preserving
 conditional heads. It never reads the user's expression as JSON. Accepted
 operations: Nat constants, input UInt64.toNat, Nat.add, Nat.sub (truncated at zero),
-Nat.le/Nat.lt, Nat/Prop equality, And, Or, Not, Iff, nondependent implication and
-nondependent ite. UInt64 arithmetic in specs, quantified binders, unsupported
-recursors, nonlinear input arithmetic and unknown heads are unsupported.
+Nat.mul by a constant, Nat.div/Nat.mod by a positive constant, Nat.le/Nat.lt,
+Nat/Prop equality, And, Or, Not, Iff, nondependent implication and nondependent ite.
+UInt64 arithmetic in specs, quantified binders, unsupported recursors, nonlinear
+input arithmetic and unknown heads are unsupported.
 Closed UInt64.toNat literals can reduce to constants. Expression bounds and
 normalization fuel are finite; solver, process, memory and output limits apply.
 
@@ -68,11 +75,14 @@ compilation/execution. The original Rust is pristine inside the verifier. Compil
 optimized Rust probes compare boundaries, reproducible random cases and every SMT
 counterexample; sampling never substitutes for the universal SMT result.
 
-Supported production code consists of Authorization and authorize, immutable
-lets/shadowing, if/else, if-let, exhaustive Option matches, returns, ?, casts,
-arithmetic/comparisons/booleans, checked/wrapping add/sub, saturating_add, then_some,
+Supported production code consists of Authorization and authorize, module-level
+integer constants, inline modules/structs/non-recursive helpers (in settlement*
+tasks), immutable lets/shadowing, if/else, if-let, exhaustive Option matches,
+returns, ?, casts (when permitted by the crate contract; u128 is forbidden in
+pure-u64 settlement* tasks), arithmetic/comparisons/booleans, div_ceil,
+checked/wrapping add/sub/mul, checked div/rem, saturating add/sub, then_some,
 Some/None and Authorization construction. Built-in derives and cfg(test) modules
-are accepted. Loops, macros, helpers and extra dependencies are outside the
+are accepted. Loops, macros, unsafe and extra dependencies are outside the
 accepted production subset. The soundness claim is scoped to this subset and to
 the functional authorization properties above. Rust/model semantic alignment is
 reviewed and regression-tested; it is not a Lean theorem.
@@ -101,3 +111,13 @@ v3 uses real Lean specs and two symmetric tasks with byte-identical instruction.
 Only the supplied original program/model and the trusted variant/configuration
 differ. v1/v2 JSON fixtures and results are historical; the old GLM score cannot
 be transferred to this new interface. Both variants require a fresh model run.
+
+The module subset requires globally unique production item names and rejects
+renamed imports (`use ... as ...`), external imports, and qualified struct
+constructors. Qualified function/constant paths must resolve exactly. Its short-name resolver cannot represent
+Rust lexical collisions or import aliases, so these forms receive no credit.
+
+GitHub CI builds a public Lean base from the pinned Ubuntu amd64 manifest and
+the SHA-256-verified official Lean 4.31.0 release (`.github/lean-base.Dockerfile`),
+then runs the same offline selftest as the benchmark verifier. This avoids
+requiring access to the benchmark registry image on clean runners.

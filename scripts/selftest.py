@@ -174,58 +174,112 @@ def main():
         raw.chmod(0o755)
         family=raw/'family'
         subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--build-api'],check=True)
+
+        # Settlement-specific Rust & Lean checks across isolation levels
+        settlement_safe_rs=(ROOT/'problems/settlement/safe/lib.rs').read_text()
+        settlement_vuln_rs=(ROOT/'problems/settlement/vulnerable/lib.rs').read_text()
+        # Rust resolves the imported alias to evil::wrong; the old interpreter
+        # instead picked trusted::correct by short name, missing this rare branch.
+        alias_patch = settlement_safe_rs.replace('pub fn authorize',
+            'pub mod trusted { use crate::Authorization; pub fn correct(b:u64,a:u64,f:u64)->Option<Authorization> { None } }\n'
+            'pub mod evil { use crate::Authorization; pub fn wrong(b:u64,a:u64,f:u64)->Option<Authorization> { Some(Authorization { total_debit:0u64 }) } }\n'
+            'use crate::evil::wrong as correct;\npub fn authorize').replace(
+            '    let raw_sum',
+            '    if balance == 0u64 && amount == 9000000000000000000u64 && fee == 0u64 { return correct(balance,amount,fee); }\n    let raw_sum', 1)
+        duplicate_patch = alias_patch.replace('wrong', 'correct').replace(' as correct', '')
+        for name, source in (('renamed_import', alias_patch), ('duplicate_item', duplicate_patch)):
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw); probe = verify.compile_probe(source, tmp)
+                actual = verify.run([str(probe), '0', '9000000000000000000', '0'], tmp)
+                expect(actual.returncode == 0 and actual.stdout.strip() == 'some:0', (name, actual))
+            try: verify.check_patch(source, problem='settlement')
+            except spec.Unsupported: pass
+            else: raise AssertionError((name, 'ambiguous Rust name resolution accepted'))
+        for untrusted in ('use std::process::exit;\n', 'use ::std::process::exit;\n'):
+            try: rust_symbolic.check(untrusted + settlement_safe_rs, problem='settlement')
+            except spec.Unsupported: pass
+            else: raise AssertionError('external import accepted')
+        settlement_div_ceil_rs=settlement_safe_rs.replace(
+            '(((raw_sum % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)',
+            '(raw_sum % BPS_DENOM).div_ceil(BPS_DENOM)')
+        settlement_naive_checked_rs=settlement_safe_rs.replace(
+            'let raw_sum = amount.wrapping_add(fee);\n    let gross_fee = if raw_sum < amount {\n        let folded_rem = (raw_sum % BPS_DENOM) + U64_MOD_BPS_REM;\n        U64_MOD_BPS_QUOT + (raw_sum / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)\n    } else {',
+            'let raw_sum = amount.checked_add(fee)?;\n    let gross_fee = {')
+        settlement_u128_rs=settlement_safe_rs.replace(
+            'let raw_sum = amount.wrapping_add(fee);',
+            'let _wide: u128 = amount as u128;\n    let raw_sum = amount.wrapping_add(fee);')
+        for sname,ssrc in (('settlement_safe',settlement_safe_rs),('settlement_div_ceil',settlement_div_ceil_rs)):
+            r=verify.check_patch(ssrc,problem='settlement')
+            expect(r['status']=='pass',(sname,r))
+        for sname,ssrc in (('settlement_vuln',settlement_vuln_rs),('settlement_naive_checked',settlement_naive_checked_rs)):
+            r=verify.check_patch(ssrc,problem='settlement')
+            expect(r['status']=='fail' and r['checks']['universal_equivalence']['status']=='fail' and r['checks']['concrete_defense']['status']=='fail',(sname,r))
+        try: verify.check_patch(settlement_u128_rs,problem='settlement')
+        except spec.Unsupported: pass
+        else: raise AssertionError('u128 cast allowed in settlement')
+        for bad_div in (candidate('a.toNat / f.toNat ≤ b.toNat'),candidate('a.toNat % f.toNat ≤ b.toNat'),candidate('a.toNat / 0 ≤ b.toNat')):
+            expect(check(bad_div)['status']=='unsupported',bad_div)
+
         instructions=[]
-        for variant in ('vulnerable','safe'):
-            task=family/('authorization-'+variant)
-            instructions.append((task/'instruction.md').read_bytes())
-            verifier=task/'tests/verifier'
-            workspace=task/'environment/workspace'
-            skeleton=verify.grade(workspace,verifier)
-            expect(skeleton['reward']==0,(variant,'skeleton',skeleton))
-            for rel in ('Spec.lean','Audit.lean','Proof.lean','counterexample.json','src/lib.rs'):
-                if (task/'solution'/rel).is_file():
-                    (workspace/'submission'/rel).parent.mkdir(parents=True,exist_ok=True)
-                    shutil.copy(task/'solution'/rel,workspace/'submission'/rel)
-            reference_result=verify.grade(workspace,verifier)
-            expect(reference_result['reward']==1,(variant,reference_result))
-            if os.environ.get('V3_EVIDENCE_DIR'):
-                dest=Path(os.environ['V3_EVIDENCE_DIR']); dest.mkdir(parents=True,exist_ok=True)
-                (dest/(variant+'-reference.json')).write_text(json.dumps(reference_result,indent=2)+'\n')
-            if variant=='safe':
-                (workspace/'submission/Proof.lean').write_text('by exact True.intro')
-                r=verify.grade(workspace,verifier)
-                expect(r['checkpoints']['verdict']['score']==0 and r['checkpoints']['response']['score']==0,r)
-                shutil.copy(task/'solution/Proof.lean',workspace/'submission/Proof.lean')
-                (workspace/'submission/counterexample.json').write_text(witness)
-                r=verify.grade(workspace,verifier)
-                expect(r['checkpoints']['response']['score']==0,r)
-                for rel in ('counterexample.json','src/lib.rs'):
-                    extra=workspace/'submission'/rel
-                    extra.parent.mkdir(parents=True,exist_ok=True)
-                    for payload in (b'\xff',b'x'*65537):
-                        extra.write_bytes(payload)
+        for problem in ('authorization','settlement','settlement-modular','settlement-engine'):
+            for variant in ('vulnerable','safe'):
+                task_name=problem+'-'+variant
+                task=family/task_name
+                instructions.append((task/'instruction.md').read_bytes())
+                verifier=task/'tests/verifier'
+                workspace=task/'environment/workspace'
+                subprocess.run(['cargo','test','--release','--quiet'],cwd=workspace/'challenge',check=True)
+                skeleton=verify.grade(workspace,verifier)
+                expect(skeleton['reward']==0,(task_name,'skeleton',skeleton))
+                for rel in ('Spec.lean','Audit.lean','Proof.lean','counterexample.json','src/lib.rs'):
+                    if (task/'solution'/rel).is_file():
+                        (workspace/'submission'/rel).parent.mkdir(parents=True,exist_ok=True)
+                        shutil.copy(task/'solution'/rel,workspace/'submission'/rel)
+                reference_result=verify.grade(workspace,verifier)
+                expect(reference_result['reward']==1,(task_name,reference_result))
+                if os.environ.get('V3_EVIDENCE_DIR'):
+                    dest=Path(os.environ['V3_EVIDENCE_DIR']); dest.mkdir(parents=True,exist_ok=True)
+                    fname=(variant+'-reference.json') if problem=='authorization' else (task_name+'-reference.json')
+                    (dest/fname).write_text(json.dumps(reference_result,indent=2)+'\n')
+                if variant=='safe':
+                    (workspace/'submission/Proof.lean').write_text('by exact True.intro')
+                    r=verify.grade(workspace,verifier)
+                    expect(r['checkpoints']['verdict']['score']==0 and r['checkpoints']['response']['score']==0,r)
+                    shutil.copy(task/'solution/Proof.lean',workspace/'submission/Proof.lean')
+                    (workspace/'submission/counterexample.json').write_text(witness)
+                    r=verify.grade(workspace,verifier)
+                    expect(r['checkpoints']['response']['score']==0,r)
+                    for rel in ('counterexample.json','src/lib.rs'):
+                        extra=workspace/'submission'/rel
+                        extra.parent.mkdir(parents=True,exist_ok=True)
+                        for payload in (b'\xff',b'x'*65537):
+                            extra.write_bytes(payload)
+                            expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
+                        extra.unlink(); extra.symlink_to('/nonexistent-untrusted-target')
                         expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
-                    extra.unlink(); extra.symlink_to('/nonexistent-untrusted-target')
-                    expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
-                    extra.unlink()
-                optional=workspace/'submission/counterexample.json'
-                for payload in (b'\xff',b'x'*65537):
-                    optional.write_bytes(payload)
+                        extra.unlink()
+                    optional=workspace/'submission/counterexample.json'
+                    for payload in (b'\xff',b'x'*65537):
+                        optional.write_bytes(payload)
+                        r=verify.grade(workspace,verifier)
+                        expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
+                    optional.unlink(); optional.symlink_to('/nonexistent-untrusted-target')
                     r=verify.grade(workspace,verifier)
                     expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
-                optional.unlink(); optional.symlink_to('/nonexistent-untrusted-target')
-                r=verify.grade(workspace,verifier)
-                expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
-            else:
-                (workspace/'submission/Spec.lean').write_text('NOT LEAN')
-                (workspace/'challenge/src/lib.rs').write_text('NOT RUST')
-                r=verify.grade(workspace,verifier)
-                expect(r['checkpoints']['verdict']['score']==.15 and r['checkpoints']['response']['score']==.35,r)
-                expect(r['checkpoints']['response']['checks']['counterexample']['status']=='pass',r)
-                symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')
-                r=verify.grade(workspace,verifier); expect(r['checkpoints']['response']['checks']['counterexample']['status']=='fail',r)
-            print(variant+': reference=1.00 skeleton=0.00; verdict/evidence and independent response checked')
-        expect(instructions[0]==instructions[1],'prompts differ')
+                else:
+                    if problem.startswith('settlement'):
+                        # Off-by-one balance in the carry pocket must fail witness verification
+                        expect(verify.check_counterexample('{"balance":1660206966633860,"amount":0,"fee":18446744073709541617}',verifier,problem=problem)['status']=='fail',task_name+' off-by-one witness')
+                    (workspace/'submission/Spec.lean').write_text('NOT LEAN')
+                    (workspace/'challenge/src/lib.rs').write_text('NOT RUST')
+                    r=verify.grade(workspace,verifier)
+                    expect(r['checkpoints']['verdict']['score']==.15 and r['checkpoints']['response']['score']==.35,r)
+                    expect(r['checkpoints']['response']['checks']['counterexample']['status']=='pass',r)
+                    symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')
+                    r=verify.grade(workspace,verifier); expect(r['checkpoints']['response']['checks']['counterexample']['status']=='fail',r)
+                print(task_name+': reference=1.00 skeleton=0.00; verdict/evidence and independent response checked')
+        expect(len(set(instructions))==1,'prompts differ')
     print('selftest v3: PASS')
 
 if __name__=='__main__':main()
+

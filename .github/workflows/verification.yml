@@ -1,0 +1,31 @@
+name: Verification gates
+on:
+  pull_request:
+  push:
+    branches: [main, feat/settlement-isolation-variants]
+permissions:
+  contents: read
+jobs:
+  verification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build pinned Rust and Lean verifier
+        run: |
+          docker build -t security-lean:ci -f .github/lean-base.Dockerfile .github
+          docker build --build-arg LEAN_BASE=security-lean:ci \
+            -t security-verifier:ci -f task/tests/Dockerfile task/tests
+      - name: Rust tests, Lean kernel proofs, semantic and adversarial gates
+        run: |
+          set -o pipefail
+          docker run --rm --network none \
+            -v "$PWD:/repo:ro" \
+            -e PYTHONUNBUFFERED=1 -e VERIFIER_ROOT=/opt/security-verifier \
+            security-verifier:ci python3 /repo/scripts/selftest.py | tee verification.log
+      - name: Preserve verification receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verification-${{ github.sha }}
+          path: verification.log

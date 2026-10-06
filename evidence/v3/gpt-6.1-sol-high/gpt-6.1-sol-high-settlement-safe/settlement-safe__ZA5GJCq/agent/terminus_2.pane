@@ -1,0 +1,589 @@
+[?2004hroot@a8a1dacfd494:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a8a1dacfd494:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@a8a1dacfd494:/workspace# pwd; ls -la /workspace; cat /workspace/challenge/src/lib.rs; cat /workspace/lean/SecurityChallenge.lean; cat /workspace/lean/check.py
+[?2004l/workspace
+total 24
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 .
+drwxr-xr-x 1 root root 4096 Oct  6 07:47 ..
+drwxr-xr-x 1 root root 4096 Oct  6 07:46 challenge
+drwxr-xr-x 2 root root 4096 Oct  6 05:03 harness
+drwxr-xr-x 1 root root 4096 Oct  6 07:46 lean
+drwxr-xr-x 1 root root 4096 Oct  6 07:46 submission
+//! Word-level concentrated-liquidity fee and rebate settlement authorization.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+const BPS_DENOM: u64 = 10_000;
+const BPS_MAX_REM: u64 = 9_999;
+const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+const U64_MOD_BPS_REM: u64 = 1_616;
+const REBATE_DIVISOR: u64 = 10;
+
+/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+///
+/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+///    rounded down (`floor(gross_fee / 10)`).
+/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+///
+/// Authorize every affordable transfer (`total_debit <= balance`) and return
+/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+/// Target word constraint: production code must use `u64` only (no `u128`).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let raw_sum = amount.wrapping_add(fee);
+    let gross_fee = if raw_sum < amount {
+        let folded_rem = (raw_sum % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (raw_sum / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    } else {
+        let biased = raw_sum.wrapping_add(BPS_MAX_REM);
+        if biased < raw_sum {
+            (raw_sum / BPS_DENOM) + (((raw_sum % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+        } else {
+            biased / BPS_DENOM
+        }
+    };
+    let rebate = gross_fee / REBATE_DIVISOR;
+    let net_fee = gross_fee - rebate;
+    let total_debit = amount.checked_add(net_fee)?;
+    (total_debit <= balance).then_some(Authorization { total_debit })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_settlement() {
+        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+    }
+
+    #[test]
+    fn ceiling_rounding_and_rebate() {
+        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+        assert_eq!(authorize(8, 0, 99_991), None);
+    }
+
+    #[test]
+    fn wide_basis_carry_folding() {
+        let expected = 1_660_206_966_643_862;
+        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_bias_wrap_at_u64_max() {
+        let expected = 1_660_206_966_633_861;
+        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn total_debit_overflow_rejected() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+    }
+}
+import Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def bpsDenom : UInt64 := 10000
+def bpsMaxRem : UInt64 := 9999
+def u64ModBpsQuot : UInt64 := 1844674407370955
+def u64ModBpsRem : UInt64 := 1616
+def rebateDivisor : UInt64 := 10
+def u64Max : UInt64 := 18446744073709551615
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  let rawSum := amount + fee
+  let grossFee :=
+    if rawSum < amount then
+      let foldedRem := (rawSum % bpsDenom) + u64ModBpsRem
+      u64ModBpsQuot + (rawSum / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+    else
+      let biased := rawSum + bpsMaxRem
+      if biased < rawSum then
+        (rawSum / bpsDenom) + (((rawSum % bpsDenom) + bpsMaxRem) / bpsDenom)
+      else
+        biased / bpsDenom
+  let rebate := grossFee / rebateDivisor
+  let netFee := grossFee - rebate
+  if netFee ≤ u64Max - amount then
+    let total := amount + netFee
+    if total ≤ balance then
+      some total
+    else
+      none
+  else
+    none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import subprocess
+import tempfile
+root=Path(__file__).resolve().parent
+submission=root.parent/'submission'
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp=Path(raw)
+    env={**os.environ,'LEAN_PATH':str(root)+':'+str(tmp)}
+    for name,rel in [('CandidateSpec','Spec.lean'),('CandidateAudit','Audit.lean')]:
+        (tmp/(name+'.lean')).write_text('import SecurityChallenge\n'+(submission/rel).read_text())
+        subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=tmp,env=env,check=True)
+    proof='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+(submission/'Proof.lean').read_text()+'\n)\n'
+    (tmp/'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean','CandidateProof.lean'],cwd=tmp,env=env))
+[?2004hroot@a8a1dacfd494:/workspace# ls -la /workspace/submission /workspace/lean; which lean; lean --version; cat /workspace/challenge/Cargo.toml; printenv | grep -E 'LEAN|PATH'; grep -nE 'toNat_(add|sub|div|mod)|lt_iff|le_iff|toNat_lt|toNat_le' $(lean --print-prefix)/src/lean/Init/Data/UInt/Lemmas.lean | head -100
+[?2004l/workspace/lean:
+total 144
+drwxr-xr-x 1 root root   4096 Oct  6 07:46 .
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root   1763 Oct  6 05:03 SecurityChallenge.lean
+-rw-r--r-- 1 root root 120456 Oct  6 07:46 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  6 05:03 Signature.lean
+-rw-r--r-- 1 root root   1034 Oct  6 05:03 check.py
+-rw-r--r-- 1 root root     25 Oct  6 05:03 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  6 07:46 .
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 ..
+-rw-r--r-- 1 root root  126 Oct  6 05:03 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  6 05:03 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  6 05:03 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  6 07:46 src
+bash: lean: command not found
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+LEAN_PATH=/workspace/lean
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+bash: lean: command not found
+grep: /src/lean/Init/Data/UInt/Lemmas.lean: No such file or directory
+[?2004hroot@a8a1dacfd494:/workspace# ls -la /root/.elan/bin /opt /root/.cargo/bin; find / -name lean -type f 2>/dev/null | head; cat /workspace/submission/*.lean; find /workspace/submission/src -type f -maxdepth 2
+[?2004lls: cannot access '/root/.elan/bin': No such file or directory
+ls: cannot access '/root/.cargo/bin': No such file or directory
+/opt:
+total 12
+drwxr-xr-x 1 root root 4096 Oct  6 05:14 .
+drwxr-xr-x 1 root root 4096 Oct  6 07:47 ..
+drwxr-xr-x 7 root root 4096 Sep 30 09:08 lean
+/opt/lean/bin/lean
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+[?2004hroot@a8a1dacfd494:/workspace# export PATH=/opt/lean/bin:$PATH
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# lean --version; grep -nE 'toNat_(add|sub|div|mod)|lt_iff|le_iff|toNat_lt|toNat_le|toNat_inj' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -120; ls /opt/lean/src/lean/Init/Data/UInt
+[?2004lLean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+65:  @[int_toBitVec] theorem le_iff_toBitVec_le {a b : $typeName} : a ≤ b ↔ a.toBitVec ≤ b.toBitVec := .rfl
+67:  @[int_toBitVec] theorem lt_iff_toBitVec_lt {a b : $typeName} : a < b ↔ a.toBitVec < b.toBitVec := .rfl
+69:  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+71:  theorem lt_iff_toNat_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+74:    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+77:    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+79:  @[simp] protected theorem le_refl (a : $typeName) : a ≤ a := by simp [le_iff_toBitVec_le]
+134:    simpa [lt_iff_toBitVec_lt] using h
+138:  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+140:  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+144:  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+146:  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+148:  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+150:  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+152:  open $typeName (toNat_mod toNat_lt_size) in
+153:  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+156:    · rw [toNat_mod, toNat_ofNat_of_lt' h2]
+159:      · apply toNat_lt_size
+163:    simp only [lt_iff_toBitVec_lt, mod_def]
+169:  protected theorem toNat_inj : ∀ {a b : $typeName}, a.toNat = b.toNat ↔ a = b :=
+172:  open $typeName (toNat_inj) in
+174:    toNat_inj.symm.trans Nat.le_antisymm_iff
+190:  lt_iff _ _ := by
+197:    simp [Nat.mod_eq_of_lt x.toNat_lt_size]
+279:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+280:theorem UInt8.ofNat_lt_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+281:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+283:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+284:theorem UInt8.ofNat_le_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+285:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+288:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+289:theorem UInt16.ofNat_lt_iff {n : UInt16} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+290:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+292:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+293:theorem UInt16.ofNat_le_iff {n : UInt16} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+294:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+297:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+298:theorem UInt32.ofNat_lt_iff {n : UInt32} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+299:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+301:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+302:theorem UInt32.ofNat_le_iff {n : UInt32} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+303:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+306:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+307:theorem UInt64.ofNat_lt_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+308:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+310:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+311:theorem UInt64.ofNat_le_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+312:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+315:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+316:theorem USize.ofNat_lt_iff {n : USize} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+317:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+319:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+320:theorem USize.ofNat_le_iff {n : USize} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+321:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+323:protected theorem UInt8.mod_eq_of_lt {a b : UInt8} (h : a < b) : a % b = a := UInt8.toNat_inj.1 (Nat.mod_eq_of_lt h)
+324:protected theorem UInt16.mod_eq_of_lt {a b : UInt16} (h : a < b) : a % b = a := UInt16.toNat_inj.1 (Nat.mod_eq_of_lt h)
+325:protected theorem UInt32.mod_eq_of_lt {a b : UInt32} (h : a < b) : a % b = a := UInt32.toNat_inj.1 (Nat.mod_eq_of_lt h)
+326:protected theorem UInt64.mod_eq_of_lt {a b : UInt64} (h : a < b) : a % b = a := UInt64.toNat_inj.1 (Nat.mod_eq_of_lt h)
+327:protected theorem USize.mod_eq_of_lt {a b : USize} (h : a < b) : a % b = a := USize.toNat_inj.1 (Nat.mod_eq_of_lt h)
+329:@[simp] theorem UInt8.toNat_lt (n : UInt8) : n.toNat < 2 ^ 8 := n.toFin.isLt
+330:@[simp] theorem UInt16.toNat_lt (n : UInt16) : n.toNat < 2 ^ 16 := n.toFin.isLt
+331:@[simp] theorem UInt32.toNat_lt (n : UInt32) : n.toNat < 2 ^ 32 := n.toFin.isLt
+332:@[simp] theorem UInt64.toNat_lt (n : UInt64) : n.toNat < 2 ^ 64 := n.toFin.isLt
+345:theorem USize.toNat_lt_two_pow_numBits (n : USize) : n.toNat < 2 ^ System.Platform.numBits := n.toFin.isLt
+346:@[simp] theorem USize.toNat_lt (n : USize) : n.toNat < 2 ^ 64 := Nat.lt_of_lt_of_le n.toFin.isLt size_le
+350:theorem UInt8.toNat_lt_usizeSize (n : UInt8) : n.toNat < USize.size :=
+351:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+352:theorem UInt16.toNat_lt_usizeSize (n : UInt16) : n.toNat < USize.size :=
+353:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+354:theorem UInt32.toNat_lt_usizeSize (n : UInt32) : n.toNat < USize.size :=
+355:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+380:@[simp] theorem UInt8.toNat_mod_size (n : UInt8) : n.toNat % UInt8.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+381:@[simp] theorem UInt8.toNat_mod_uInt16Size (n : UInt8) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+382:@[simp] theorem UInt8.toNat_mod_uInt32Size (n : UInt8) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+383:@[simp] theorem UInt8.toNat_mod_uInt64Size (n : UInt8) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+384:@[simp] theorem UInt8.toNat_mod_uSizeSize (n : UInt8) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+386:@[simp] theorem UInt16.toNat_mod_size (n : UInt16) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+387:@[simp] theorem UInt16.toNat_mod_uInt32Size (n : UInt16) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+388:@[simp] theorem UInt16.toNat_mod_uInt64Size (n : UInt16) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+389:@[simp] theorem UInt16.toNat_mod_uSizeSize (n : UInt16) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+391:@[simp] theorem UInt32.toNat_mod_size (n : UInt32) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+392:@[simp] theorem UInt32.toNat_mod_uInt64Size (n : UInt32) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+393:@[simp] theorem UInt32.toNat_mod_uSizeSize (n : UInt32) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+395:@[simp] theorem UInt64.toNat_mod_size (n : UInt64) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+397:@[simp] theorem USize.toNat_mod_size (n : USize) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_size
+398:@[simp] theorem USize.toNat_mod_uInt64Size (n : USize) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+476:@[simp] theorem UInt8.ofNatLT_toNat (n : UInt8) : UInt8.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+477:@[simp] theorem UInt16.ofNatLT_uInt8ToNat (n : UInt8) : UInt16.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt16 := (rfl)
+478:@[simp] theorem UInt32.ofNatLT_uInt8ToNat (n : UInt8) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt32 := (rfl)
+479:@[simp] theorem UInt64.ofNatLT_uInt8ToNat (n : UInt8) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+480:@[simp] theorem USize.ofNatLT_uInt8ToNat (n : UInt8) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+482:@[simp] theorem UInt16.ofNatLT_toNat (n : UInt16) : UInt16.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+483:@[simp] theorem UInt32.ofNatLT_uInt16ToNat (n : UInt16) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt32 := (rfl)
+484:@[simp] theorem UInt64.ofNatLT_uInt16ToNat (n : UInt16) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+485:@[simp] theorem USize.ofNatLT_uInt16ToNat (n : UInt16) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+487:@[simp] theorem UInt32.ofNatLT_toNat (n : UInt32) : UInt32.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+488:@[simp] theorem UInt64.ofNatLT_uInt32ToNat (n : UInt32) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+489:@[simp] theorem USize.ofNatLT_uInt32ToNat (n : UInt32) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+491:@[simp] theorem UInt64.ofNatLT_toNat (n : UInt64) : UInt64.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+493:@[simp] theorem USize.ofNatLT_toNat (n : USize) : USize.ofNatLT n.toNat n.toNat_lt_size = n := (rfl)
+494:@[simp] theorem UInt64.ofNatLT_uSizeToNat (n : USize) : UInt64.ofNatLT n.toNat n.toNat_lt = n.toUInt64 := (rfl)
+663:  rw [UInt8.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+667:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+669:  rw [UInt16.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+673:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+676:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+678:  rw [UInt32.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+682:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+685:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+688:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+690:  rw [UInt64.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+693:  exact n.toNat_lt
+697:  exact n.toNat_lt_usizeSize
+700:  exact n.toNat_lt_usizeSize
+703:  exact n.toNat_lt_usizeSize
+705:  rw [USize.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt_size]
+856:  simp only [UInt32.toNat_toUSize, toNat_toUInt32, Nat.reducePow, USize.toNat_mod]
+858:  next h => rw [Nat.mod_eq_of_lt (h ▸ n.toNat_lt_size), USize.toNat_ofNat,
+1922:theorem UInt64.toUSize_div_of_toNat_lt (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) :
+1966:  simp only [toNat_toUInt32, USize.toNat_mod, Nat.reducePow, UInt32.toNat_mod]
+Basic.lean  BasicAux.lean  Bitwise.lean  Lemmas.lean  Log2.lean
+[?2004hroot@a8a1dacfd494:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Lean.Elab.Tactic.Omega
+[?2004l[?2004h> 
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact gross fee, rounded up, without word-sized intermediate arithmetic. -/
+[?2004l[?2004h> def policyGross (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   (amount.toNat + fee.toNat + 9999) / 10000
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact principal plus the gross fee less its ten-percent tier rebate. -/
+[?2004l[?2004h> def policyDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat + (policyGross amount fee - policyGross amount fee / 10)
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := policyDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     policyDebit amount fee ≤ balance.toNat ∧ totalDebit.toNat = policyDebit amount fee
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Word-level helper used only in the correctness proof, not in the policy.
+[?2004l[?2004h> def wordGross (amount fee : UInt64) : UInt64 :=
+[?2004l[?2004h>   let rawSum := amount + fee
+[?2004l[?2004h>   if rawSum < amount then
+[?2004l[?2004h>     let foldedRem := (rawSum % bpsDenom) + u64ModBpsRem
+[?2004l[?2004h>     u64ModBpsQuot + (rawSum / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+[?2004l[?2004h>   else
+[?2004l[?2004h>     let biased := rawSum + bpsMaxRem
+[?2004l[?2004h>     if biased < rawSum then
+[?2004l[?2004h>       (rawSum / bpsDenom) + (((rawSum % bpsDenom) + bpsMaxRem) / bpsDenom)
+[?2004l[?2004h>     else
+[?2004l[?2004h>       biased / bpsDenom
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem gross_correct (amount fee : UInt64) :
+[?2004l[?2004h>     (wordGross amount fee).toNat = policyGross amount fee := by
+[?2004l[?2004h>   have ha := amount.toNat_lt
+[?2004l[?2004h>   have hf := fee.toNat_lt
+[?2004l[?2004h>   simp only [UInt64.size] at ha hf
+[?2004l[?2004h>   unfold wordGross policyGross
+[?2004l[?2004h>   split
+[?2004l[?2004h>   · rename_i h
+[?2004l[?2004h>     simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_add] at h
+[?2004l[?2004h>     simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>       bpsDenom, bpsMaxRem, u64ModBpsQuot, u64ModBpsRem]
+[?2004l[?2004h>     simp only [UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod] at *
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · rename_i h
+[?2004l[?2004h>     split
+[?2004l[?2004h>     · rename_i hb
+[?2004l[?2004h>       simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_add, bpsMaxRem,
+[?2004l[?2004h>         UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod] at h hb
+[?2004l[?2004h>       simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>         bpsDenom, bpsMaxRem, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     · rename_i hb
+[?2004l[?2004h>       simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_add, bpsMaxRem,
+[?2004l[?2004h>         UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod] at h hb
+[?2004l[?2004h>       simp only [UInt64.toNat_add, UInt64.toNat_div,
+[?2004l[?2004h>         bpsDenom, bpsMaxRem, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>       omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Carry folding and overflow rejection implement the exact settlement policy. -/
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# lean /workspace/submission/Spec.lean
+[?2004l/workspace/submission/Spec.lean:36:2: error: `simp` made no progress
+[?2004hroot@a8a1dacfd494:/workspace# sed -i '/simp only \[UInt64.size\] at ha hf/d' /workspace/submission/Spec.lean
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# lean /workspace/submission/Spec.lean
+[?2004l/workspace/submission/Spec.lean:37:2: error: Tactic `split` failed: Could not split an `if` or `match` expression in the goal
+
+Hint: Use `set_option trace.split.failure true` to display additional diagnostic information
+
+amount fee : UInt64
+ha : amount.toNat < 2 ^ 64
+hf : fee.toNat < 2 ^ 64
+⊢ (have rawSum := amount + fee;
+      if rawSum < amount then
+        have foldedRem := rawSum % bpsDenom + u64ModBpsRem;
+        u64ModBpsQuot + rawSum / bpsDenom + (foldedRem + bpsMaxRem) / bpsDenom
+      else
+        have biased := rawSum + bpsMaxRem;
+        if biased < rawSum then rawSum / bpsDenom + (rawSum % bpsDenom + bpsMaxRem) / bpsDenom
+        else biased / bpsDenom).toNat =
+    (amount.toNat + fee.toNat + 9999) / 10000
+[?2004hroot@a8a1dacfd494:/workspace# sed -i '/unfold wordGross policyGross/a\  dsimp only' /workspace/submission/Spec.lean
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# lean /workspace/submission/Spec.lean
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# cat >> /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h>  def wordNet (amount fee : UInt64) : UInt64 :=
+[?2004l[?2004h>   wordGross amount fee - wordGross amount fee / rebateDivisor
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem net_correct (amount fee : UInt64) :
+[?2004l[?2004h>     (wordNet amount fee).toNat = policyGross amount fee - policyGross amount fee / 10 := by
+[?2004l[?2004h>   have h : wordGross amount fee / rebateDivisor ≤ wordGross amount fee := by
+[?2004l[?2004h>     rw [UInt64.le_iff_toNat_le, UInt64.toNat_div]
+[?2004l[?2004h>     exact Nat.div_le_self _ _
+[?2004l[?2004h>   unfold wordNet
+[?2004l[?2004h>   rw [UInt64.toNat_sub_of_le _ _ h, UInt64.toNat_div, gross_correct]
+[?2004l[?2004h>   rfl
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem guard_correct (balance amount fee : UInt64) :
+[?2004l[?2004h>     wordNet amount fee ≤ u64Max - amount ↔
+[?2004l[?2004h>       amount.toNat + (wordNet amount fee).toNat < 18446744073709551616 := by
+[?2004l[?2004h>   have ha := amount.toNat_lt
+[?2004l[?2004h>   have hamax : amount ≤ u64Max := by
+[?2004l[?2004h>     rw [UInt64.le_iff_toNat_le]
+[?2004l[?2004h>     change amount.toNat ≤ 18446744073709551615
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   rw [UInt64.le_iff_toNat_le, UInt64.toNat_sub_of_le _ _ hamax]
+[?2004l[?2004h>   change (wordNet amount fee).toNat ≤ 18446744073709551615 - amount.toNat ↔ _
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem debit_correct (amount fee : UInt64)
+[?2004l[?2004h>     (h : wordNet amount fee ≤ u64Max - amount) :
+[?2004l[?2004h>     (amount + wordNet amount fee).toNat = policyDebit amount fee := by
+[?2004l[?2004h>   have hg := (guard_correct 0 amount fee).mp h
+[?2004l[?2004h>   rw [UInt64.toNat_add, Nat.mod_eq_of_lt hg]
+[?2004l[?2004h>   unfold policyDebit
+[?2004l[?2004h>   rw [net_correct]
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   change Conforms candidateSpec challengeAuthorize
+[?2004l[?2004h>   have model (b a f : UInt64) : challengeAuthorize b a f =
+[?2004l[?2004h>       (if wordNet a f ≤ u64Max - a then
+[?2004l[?2004h>         if a + wordNet a f ≤ b then some (a + wordNet a f) else none
+[?2004l[?2004h>       else none) := by rfl
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     rw [model]
+[?2004l[?2004h>     change (∃ t, (if wordNet a f ≤ u64Max - a then
+[?2004l[?2004h>       if a + wordNet a f ≤ b then some (a + wordNet a f) else none
+[?2004l[?2004h>       else none) = some t) ↔ policyDebit a f ≤ b.toNat
+[?2004l[?2004h>     by_cases h : wordNet a f ≤ u64Max - a
+[?2004l[?2004h>     · have ht := debit_correct a f h
+[?2004l[?2004h>       simp only [h, if_true]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, ht]
+[?2004l[?2004h>       by_cases hb : policyDebit a f ≤ b.toNat <;> simp [hb]
+[?2004l[?2004h>     · have hg := (guard_correct b a f).not.mp h
+[?2004l[?2004h>       have hn := net_correct a f
+[?2004l[?2004h>       have hb := b.toNat_lt
+[?2004l[?2004h>       have bad : ¬ policyDebit a f ≤ b.toNat := by
+[?2004l[?2004h>         unfold policyDebit
+[?2004l[?2004h>         omega
+[?2004l[?2004h>       simp [h, bad]
+[?2004l[?2004h>   · intro b a f t ht
+[?2004l[?2004h>     rw [model] at ht
+[?2004l[?2004h>     change policyDebit a f ≤ b.toNat ∧ t.toNat = policyDebit a f
+[?2004l[?2004h>     by_cases h : wordNet a f ≤ u64Max - a
+[?2004l[?2004h>     · simp only [h, if_true] at ht
+[?2004l[?2004h>       by_cases hb : a + wordNet a f ≤ b
+[?2004l[?2004h>       · simp only [hb, if_true, Option.some.injEq] at ht
+[?2004l[?2004h>         have hd := debit_correct a f h
+[?2004l[?2004h>         have hbn := UInt64.le_iff_toNat_le.mp hb
+[?2004l[?2004h>         constructor
+[?2004l[?2004h>         · omega
+[?2004l[?2004h>         · rw [← ht, hd]
+[?2004l[?2004h>       · simp [hb] at ht
+[?2004l[?2004h>     · simp [h] at ht
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:73:24: warning: Variable name `balance` is not explicitly referenced.
+
+The binding can be removed (if unused) or named `_` (if used implicitly).
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+CandidateProof.lean:23:10: error: Tactic `rewrite` failed: motive is not type correct:
+  fun _a => (∃ t, (if _a then some (a + wordNet a f) else none) = some t) ↔ policyDebit a f ≤ b.toNat
+Error: Application type mismatch: The argument
+  (a + wordNet a f).decLe b
+has type
+  Decidable (a + wordNet a f ≤ b)
+but is expected to have type
+  Decidable _a
+in the application
+  @ite (Option UInt64) _a ((a + wordNet a f).decLe b)
+
+Explanation: The rewrite tactic rewrites an expression 'e' using an equality 'a = b' by the following process. First, it looks for all 'a' in 'e'. Second, it tries to abstract these occurrences of 'a' to create a function 'm := fun _a => ...', called the *motive*, with the property that 'm a' is definitionally equal to 'e'. Third, we observe that 'congrArg' implies that 'm a = m b', which can be used with lemmas such as 'Eq.mpr' to change the goal. However, if 'e' depends on specific properties of 'a', then the motive 'm' might not typecheck.
+
+Possible solutions: use rewrite's 'occs' configuration option to limit which occurrences are rewritten, or use 'simp' or 'conv' mode, which have strategies for certain kinds of dependencies (these tactics can handle proofs and 'Decidable' instances whose types depend on the rewritten term, and 'simp' can apply user-defined '@[congr]' theorems as well).
+
+case pos
+model :
+  ∀ (b a f : UInt64),
+    challengeAuthorize b a f =
+      if wordNet a f ≤ u64Max - a then if a + wordNet a f ≤ b then some (a + wordNet a f) else none else none
+b a f : UInt64
+h : wordNet a f ≤ u64Max - a
+ht : (a + wordNet a f).toNat = policyDebit a f
+⊢ (∃ t, (if a + wordNet a f ≤ b then some (a + wordNet a f) else none) = some t) ↔ policyDebit a f ≤ b.toNat
+CandidateProof.lean:25:39: error(lean.invalidField): Invalid field `not`: The environment does not contain `Iff.not`, so it is not possible to project the field `not` from an expression
+  guard_correct b a f
+of type
+  wordNet a f ≤ u64Max - a ↔ a.toNat + (wordNet a f).toNat < 18446744073709551616
+[?2004hroot@a8a1dacfd494:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'
+[?2004l[?2004h> s=open(p).read().replace('rw [UInt64.le_iff_toNat_le, ht]', 'simp only [UInt64.le_iff_toNat_le, ht]').replace('have hg := (guard_correct b a f).not.mp h', 'have hg : ¬ a.toNat + (wordNet a f).toNat < 18446744073709551616 :=\n        fun hn => h ((guard_correct b a f).mpr hn)')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:73:24: warning: Variable name `balance` is not explicitly referenced.
+
+The binding can be removed (if unused) or named `_` (if used implicitly).
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+[?2004hroot@a8a1dacfd494:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean'
+[?2004l[?2004h> s=open(p).read().replace('\n theorem ', '\ntheorem ').replace('\n def ', '\ndef ').replace('guard_correct (balance amount fee : UInt64)', 'guard_correct (_balance amount fee : UInt64)')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# rmdir /workspace/submission/src
+[?2004l[?2004hroot@a8a1dacfd494:/workspace# python3 /workspace/lean/check.py
+[?2004lpython3 - <<'PY'
+from pathlib import Path
+import os, subprocess, tempfile
+s=Path('/workspace/submission')
+with tempfile.TemporaryDirectory(prefix='audit-axioms-') as d:
+    p=Path(d)
+    env={**os.environ,'LEAN_PATH':'/workspace/lean:'+d}
+    for name,file in [('CandidateSpec','Spec.lean'),('CandidateAudit','Audit.lean')]:
+        (p/(name+'.lean')).write_text((s/file).read_text())
+        subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=d,env=env,check=True)
+    (p/'Axioms.lean').write_text('import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+(s/'Proof.lean').read_text()+'\n)\n#print axioms auditEvidence\n')
+    subprocess.run(['lean','Axioms.lean'],cwd=d,env=env,check=True)
+PY
+find /workspace/submission -maxdepth 2 -type f -printf '%P\n'
+[?2004hroot@a8a1dacfd494:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> import os, subprocess, tempfile
+[?2004l[?2004h> s=Path('/workspace/submission')
+[?2004l[?2004h> with tempfile.TemporaryDirectory(prefix='audit-axioms-') as d:
+[?2004l[?2004h>     p=Path(d)
+[?2004l[?2004h>     env={**os.environ,'LEAN_PATH':'/workspace/lean:'+d}
+[?2004l[?2004h>     for name,file in [('CandidateSpec','Spec.lean'),('CandidateAudit','Audit.lean')]:
+[?2004l[?2004h>         (p/(name+'.lean')).write_text((s/file).read_text())
+[?2004l[?2004h>         subprocess.run(['lean','-o',name+'.olean',name+'.lean'],cwd=d,env=env,check=True)
+[?2004l[?2004h>     (p/'Axioms.lean').write_text('import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+(s/'Proof.lean').read_text()+'\n)\n#print axioms auditEvidence\n')
+[?2004l[?2004h>     subprocess.run(['lean','Axioms.lean'],cwd=d,env=env,check=True)
+[?2004l[?2004h> PY
+[?2004l'auditEvidence' depends on axioms: [propext, Classical.choice, Quot.sound]
+[?2004hroot@a8a1dacfd494:/workspace# find /workspace/submission -maxdepth 2 -type f -printf '%P\n'
+[?2004lProof.lean
+Spec.lean
+Audit.lean
+[?2004hroot@a8a1dacfd494:/workspace# 
