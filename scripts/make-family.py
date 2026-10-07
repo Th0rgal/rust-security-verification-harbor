@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 ROOT=Path(__file__).resolve().parents[1]
-PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine')
+PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3')
 p=argparse.ArgumentParser()
 p.add_argument('output',type=Path)
 p.add_argument('--problem',choices=('all',)+PROBLEMS,default='all',help='which task family to generate')
@@ -36,7 +36,7 @@ for problem in selected:
                 shutil.copy(ROOT/'scripts/references/safe-Proof.lean',task/'solution/Proof.lean')
                 (task/'solution/counterexample.json').unlink()
                 (task/'solution/src/lib.rs').unlink()
-        elif problem.startswith('settlement'):
+        else:
             pdir=ROOT/'problems'/problem
             for path in (task/'environment/workspace/challenge/src/lib.rs',verifier/'pristine/lib.rs'):
                 shutil.copy(pdir/variant/'lib.rs',path)

@@ -36,3 +36,21 @@ arbitrary Lean is unsupported with no automated fallback. Lean evidence concerns
 the original visible model and submitted spec; repaired Rust and original/model
 correspondence are separate trusted SMT/backend obligations, not a Lean compiler
 correctness proof.
+
+## Mathlib + RVB `too_complex` expansion (2026-10-07)
+
+Three additional symmetric task pairs (`goldilocks`, `whirlpool`, `plonky3`) were
+added from functions in the `rust-verification-benchmark` upstream repositories
+(`Winterfell`, `Orca Whirlpools`, `Plonky3`) that had been excluded from RVB as
+`too_complex`. Both agent and verifier images now include precompiled `Mathlib`,
+`Batteries`, `Aesop`, `Qq`, `Std`, and `Init` (`paloma/lean4-31-rvb-deps:latest`),
+and the verifier supports recursive Lean definition unfolding, general `Nat.mul`,
+variable-divisor `Nat.div`/`Nat.mod`, Euclidean Z3 purification for large/variable
+divisors, and bitwise/shift/tuple-destructuring Rust symbolic semantics.
+
+All 14 reference solutions and skeletons pass `scripts/selftest.py` (`selftest v3: PASS`,
+recorded in `evidence/v3/*-reference.json`). Full Harbor 0.9.0 evaluations across
+all 12 tasks (`24` trials total) were completed for `claude-opus-5-5` (12/12 at `1.00`)
+and `gpt-6.1-sol-high` (11/12 at `1.00`, scoring `0.25` on `plonky3-safe` after
+exhausting 25 turns on the 64-bit BabyBear Montgomery reduction Lean proof).
+

@@ -1,0 +1,1300 @@
+[?2004hroot@7728df8dd2a4:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@7728df8dd2a4:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@7728df8dd2a4:/workspace# cat /workspace/challenge/src/lib.rs; ls -la /workspace /workspace/challenge /workspace/lean /workspace/submission
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod monty31 {
+    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+
+    #[inline]
+    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+        let low: u64 = amount & LIMB_MASK;
+        let high: u64 = fee % BABY_BEAR_P;
+        low + high * LIMB_BASE
+    }
+
+    #[inline]
+    pub fn monty_quotient(x: u64) -> u64 {
+        let x_lo: u64 = x & LIMB_MASK;
+        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    }
+
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            hi + BABY_BEAR_P - LIMB_BASE
+        } else {
+            hi
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::monty31;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PlonkyQuote {
+        pub principal: u64,
+        pub monty_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+        let transcript: u64 = monty31::pack_transcript(amount, fee);
+        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+        Some(PlonkyQuote {
+            principal: amount,
+            monty_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Plonky3 BabyBear Montgomery settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2013265921` (BabyBear prime), `R = 2^32 = 4294967296`, `R_INV = 943718400` (`R * R_INV == 1 mod P`)
+/// - `transcript = (amount mod 2^32) + (fee mod P) * 2^32`
+/// - `monty_surcharge = (transcript * R_INV) mod P`
+/// - `total_debit = amount + monty_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::PlonkyQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn montgomery_identity_element() {
+        // transcript = R = 2^32 (amount = 0, fee = 1):
+        // monty_surcharge = (R * R_INV) mod P = 1
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 4294967296 (low = 0), fee = 5:
+        // transcript = 5 * 2^32 -> monty_surcharge = 5
+        // total_debit = 4294967301
+        assert_eq!(
+            authorize(4_294_967_301, 4_294_967_296, 5),
+            Some(Authorization {
+                total_debit: 4_294_967_301
+            })
+        );
+    }
+}
+/workspace:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:11 [01;34m..[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [01;34mchallenge[0m
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34mharness[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [01;34mlean[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [01;34msubmission[0m
+
+/workspace/challenge:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  159 Oct  5 19:59 Cargo.lock
+-rw-r--r-- 1 root root   97 Oct  5 19:59 Cargo.toml
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34msrc[0m
+drwxr-xr-x 3 root root 4096 Oct  7 07:03 [01;34mtarget[0m
+
+/workspace/lean:
+total 172
+drwxr-xr-x 1 root root   4096 Oct  7 07:03 [01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2255 Oct  7 06:59 SecurityChallenge.lean
+-rw-r--r-- 1 root root 149272 Oct  7 07:03 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  6 11:24 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  7 07:03 [01;34msrc[0m
+[?2004hroot@7728df8dd2a4:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def babyBearP : UInt64 := 2013265921
+def babyBearMu : UInt64 := 2281701377
+def limbBase : UInt64 := 4294967296
+def limbMask : UInt64 := 4294967295
+def u64Max : UInt64 := 18446744073709551615
+
+structure PlonkyQuote where
+  principal : UInt64
+  montySurcharge : UInt64
+  totalDebit : UInt64
+
+def packTranscript (amount fee : UInt64) : UInt64 :=
+  let low := amount % limbBase
+  let high := fee % babyBearP
+  limbBase * high + low
+
+def montyQuotient (x : UInt64) : UInt64 :=
+  let xLo := x % limbBase
+  (babyBearMu * xLo) % limbBase
+
+def montyReduce (x : UInt64) : UInt64 :=
+  let t := montyQuotient x
+  let u := babyBearP * t
+  let diff := x - u
+  let hi := diff / limbBase
+  if x < u then
+    babyBearP + hi - limbBase
+  else
+    hi
+
+def buildQuote (amount fee : UInt64) : Option PlonkyQuote :=
+  let transcript := packTranscript amount fee
+  let montySurcharge := montyReduce transcript
+  if montySurcharge ≤ u64Max - amount then
+    some {
+      principal := amount,
+      montySurcharge := montySurcharge,
+      totalDebit := amount + montySurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : PlonkyQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@7728df8dd2a4:/workspace# cat /workspace/lean/check.py /workspace/lean/Signature.lean /workspace/lean/lean-toolchain; cat /workspace/submission/*.lean; ls -la /workspace/submission/src /workspace/harness
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+leanprover/lean4:v4.31.0
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+/workspace/harness:
+total 12
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rwxr-xr-x 1 root root  481 Oct  5 19:59 [01;32mcheckpoint.py[0m
+
+/workspace/submission/src:
+total 8
+drwxr-xr-x 2 root root 4096 Oct  7 07:03 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [01;34m..[0m
+[?2004hroot@7728df8dd2a4:/workspace# python3 -c "P=2013265921;R=2**32;print(R*943718400%P, P*2281701377%R, P*2281701377//R, R*943718400//P)"
+[?2004l1 1 1069547521 2013265919
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/chk.py <<'EOF'
+[?2004l[?2004h> import random
+[?2004l[?2004h> P=2013265921;MU=2281701377;R=2**32;M=2**64
+[?2004l[?2004h> def rust(b,a,f):
+[?2004l[?2004h>     x=(a&(R-1))+(f%P)*R
+[?2004l[?2004h>     assert x<M
+[?2004l[?2004h>     t=((x&(R-1))*MU)&(R-1)
+[?2004l[?2004h>     u=t*P; assert u<M
+[?2004l[?2004h>     diff=(x-u)%M; borrow=x<u
+[?2004l[?2004h>     hi=diff>>32
+[?2004l[?2004h>     s=hi+P-R if borrow else hi
+[?2004l[?2004h>     assert 0<=s<M
+[?2004l[?2004h>     tot=a+s
+[?2004l[?2004h>     if tot>=M: return None
+[?2004l[?2004h>     return tot if tot<=b else None
+[?2004l[?2004h> def spec(b,a,f):
+[?2004l[?2004h>     s=(((a%R)+(f%P)*R)*943718400)%P
+[?2004l[?2004h>     return a+s if a+s<=b else None
+[?2004l[?2004h> vals=[0,1,2,P-1,P,P+1,R-1,R,R+1,M-1,M-2,M-P,2*P,P*R-1]
+[?2004l[?2004h> for i in range(300000):
+[?2004l[?2004h>     b=random.choice([random.randrange(M),M-1,random.choice(vals)])
+[?2004l[?2004h>     a=random.choice([random.randrange(M),random.choice(vals),M-1-random.randrange(P)])
+[?2004l[?2004h>     f=random.choice([random.randrange(M),random.choice(vals)])
+[?2004l[?2004h>     if random.random()<0.3: b=a+(((a%R)+(f%P)*R)*943718400)%P - random.choice([0,1]) ; b=min(max(b,0),M-1)
+[?2004l[?2004h>     assert rust(b,a,f)==spec(b,a,f),(b,a,f)
+[?2004l[?2004h> print('ok')
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# python3 /tmp/chk.py
+[?2004lok
+[?2004hroot@7728df8dd2a4:/workspace# which lean lake cargo; ls /opt/rvb-deps /opt/rvb-deps/packages 2>/dev/null | head; cat /workspace/harness/checkpoint.py
+[?2004l/opt/lean/bin/lean
+/opt/lean/bin/lake
+/usr/local/cargo/bin/cargo
+/opt/rvb-deps:
+packages
+requirements-verifier.txt
+
+/opt/rvb-deps/packages:
+Cli
+LeanSearchClient
+Qq
+aeneas
+aesop
+#!/usr/bin/env python3
+"""Show submitted files; this convenience helper does not grade semantics."""
+from pathlib import Path
+import argparse
+p=argparse.ArgumentParser(); p.add_argument('--workspace',type=Path,default=Path('/workspace')); a=p.parse_args()
+for rel in ('Spec.lean','Audit.lean','Proof.lean','counterexample.json','src/lib.rs'):
+    path=a.workspace/'submission'/rel
+    print(rel+': '+('present' if path.is_file() and path.read_text().strip() else 'missing/empty'))
+[?2004hroot@7728df8dd2a4:/workspace# cd /workspace/challenge && cargo test 2>&1 | tail -5; cd /workspace
+[?2004l
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@7728df8dd2a4:/workspace# ls /opt/rvb-deps/packages; mkdir -p /tmp/exp
+[?2004l[0m[01;34mCli[0m  [01;34mLeanSearchClient[0m  [01;34mQq[0m  [01;34maeneas[0m  [01;34maesop[0m  [01;34mbatteries[0m  [01;34mhax[0m  [01;34mimportGraph[0m  [01;34mmathlib[0m  [01;34mplausible[0m  [01;34mproofwidgets[0m
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> example (a f : UInt64) : (packTranscript a f).toNat = a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l[?2004h>   simp only [packTranscript, limbBase, babyBearP, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod]
+[?2004l[?2004h>   simp
+[?2004l[?2004h>   omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && LEAN_PATH=/workspace/lean lean T.lean; cd /workspace
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T2.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem natMonty (lo h : Nat) (hlo : lo < 4294967296) (hh : h < 2013265921) :
+[?2004l[?2004h>     (if lo + h * 4294967296 < 2013265921 * ((2281701377 * lo) % 4294967296) then
+[?2004l[?2004h>       (2013265921 + ((lo + h * 4294967296 + 18446744073709551616 - 2013265921 * ((2281701377 * lo) % 4294967296)) % 18446744073709551616) / 4294967296 - 4294967296)
+[?2004l[?2004h>     else (lo + h * 4294967296 - 2013265921 * ((2281701377 * lo) % 4294967296)) / 4294967296)
+[?2004l[?2004h>     = ((lo + h * 4294967296) * 943718400) % 2013265921 := by
+[?2004l[?2004h>   split <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && time LEAN_PATH=/workspace/lean lean T2.lean; cd /workspace
+[?2004lT2.lean:9:12: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  d ≥ 2281701375
+  0 ≤ d ≤ 4294967295
+  0 ≤ d + 4294967296*e ≤ 4294967295
+  0 ≤ a ≤ 4294967295
+  4294967296 ≤ 1069547521*a - 2013265921*b + d + 4294967296*e ≤ 6308233216
+  0 ≤ 2281701377*a - 4294967296*b ≤ 4294967295
+  4593671624212873217*a - 8646911288846319616*b + 4294967296*d + 18446744073709551616*e ≥ 18446744073709551616
+  4335132435327573971750092800*a - 8160249286451986593900134400*b - 2013265921*c + 4053239664633446399*d + 17408531802450660115768934400*e ≥ 17408531802450660113487233026
+  17408531802450660115768934400 ≤ 4335132435327573971750092800*a - 8160249286451986593900134400*b - 2013265921*c + 4053239664633446400*d + 17408531802450660115768934400*e ≤ 17408531802450660117782200320
+where
+ a := ↑lo
+ b := ↑(2281701377 * lo) / 4294967296
+ c := ↑((lo + h * 4294967296) * 943718400) / 2013265921
+ d := ↑((lo + h * 4294967296 + 18446744073709551616 - 2013265921 * (2281701377 * lo % 4294967296)) %
+      18446744073709551616) /
+  4294967296
+ e := ↑(lo + h * 4294967296 + 18446744073709551616 - 2013265921 * (2281701377 * lo % 4294967296)) / 18446744073709551616
+
+real	0m1.231s
+user	0m0.739s
+sys	0m0.486s
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T3.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> example (x : UInt64) : (montyReduce x).toNat = 0 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div] 
+[?2004l[?2004h>   simp
+[?2004l[?2004h>   trace_state
+[?2004l[?2004h>   sorry
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && LEAN_PATH=/workspace/lean lean T3.lean; cd /workspace
+[?2004lT3.lean:8:2: error: No goals to be solved
+x t : UInt64
+h1 : t.toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296
+⊢ (if x.toNat < 2013265921 * t.toNat % 18446744073709551616 then
+        2013265921 + (x - 2013265921 * t) / 4294967296 - 4294967296
+      else (x - 2013265921 * t) / 4294967296).toNat =
+    0
+T3.lean:10:0: warning: declaration uses `sorry`
+T3.lean:14:58: warning: This simp argument is unused:
+  UInt64.toNat_sub
+
+Hint: Omit it from the simp argument list.
+  simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_s̵u̵b̵,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵at̵_̵a̵dd, UInt64.toNat_mul,
+  ̲  ̲ ̲ ̲UInt64.toNat_div]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+T3.lean:14:76: warning: This simp argument is unused:
+  UInt64.toNat_add
+
+Hint: Omit it from the simp argument list.
+  simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵a̵d̵d̵,̵ ̵UInt64.toNat_mul,
+  ̲  ̲ ̲ ̲UInt64.toNat_div]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+T3.lean:14:112: warning: This simp argument is unused:
+  UInt64.toNat_div
+
+Hint: Omit it from the simp argument list.
+  simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add,
+  ̲  ̲ ̲ ̲UInt64.toNat_mul,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵d̵i̵v̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T4.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mr (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   have ht := t.toNat_lt
+[?2004l[?2004h>   have e1 : x.toNat = x.toNat % 4294967296 + 4294967296 * (x.toNat / 4294967296) := by omega
+[?2004l[?2004h>   have e2 : 2281701377 * (x.toNat % 4294967296) = 4294967296 * (2281701377 * (x.toNat % 4294967296) / 4294967296) + t.toNat := by omega
+[?2004l[?2004h>   generalize x.toNat % 4294967296 = lo at *
+[?2004l[?2004h>   generalize x.toNat / 4294967296 = h at *
+[?2004l[?2004h>   generalize 2281701377 * lo / 4294967296 = s at *
+[?2004l[?2004h>   have hlo : lo < 4294967296 := by omega
+[?2004l[?2004h>   clear h1
+[?2004l[?2004h>   split <;> rename_i hc <;>
+[?2004l[?2004h>     simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_ofNat] at hc ⊢ <;>
+[?2004l[?2004h>     simp at hc ⊢ <;> trace_state <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && time LEAN_PATH=/workspace/lean lean T4.lean 2>&1 | head -80; cd /workspace
+[?2004lT4.lean:20:35: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  c ≥ 0
+  b ≥ 0
+  a ≥ 4294967296
+  0 ≤ a + 4294967296*b ≤ 8646911288846319615
+  0 ≤ 2281701377*a - 4294967296*c ≤ 4294967295
+where
+ a := ↑lo
+ b := ↑h
+ c := ↑s
+T4.lean:22:2: error: Tactic `split` failed: Could not split an `if` or `match` expression in the goal
+
+Hint: Use `set_option trace.split.failure true` to display additional diagnostic information
+
+x : UInt64
+hx : x.toNat < 2013265921 * 4294967296
+t : UInt64
+ht : t.toNat < 2 ^ 64
+lo h : Nat
+e1 : x.toNat = lo + 4294967296 * h
+s : Nat
+e2 : 2281701377 * lo = 4294967296 * s + t.toNat
+hlo : lo < 4294967296
+⊢ (have t := t;
+      have u := babyBearP * t;
+      have diff := x - u;
+      have hi := diff / limbBase;
+      if x < u then babyBearP + hi - limbBase else hi).toNat =
+    x.toNat * 943718400 % 2013265921
+
+real	0m1.051s
+user	0m0.607s
+sys	0m0.478s
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T5.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mr (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by omega
+[?2004l[?2004h>   have e1 : x.toNat = x.toNat % 4294967296 + 4294967296 * (x.toNat / 4294967296) := by omega
+[?2004l[?2004h>   have hlo : x.toNat % 4294967296 < 4294967296 := by omega
+[?2004l[?2004h>   have e2 : 2281701377 * (x.toNat % 4294967296) = 4294967296 * (2281701377 * (x.toNat % 4294967296) / 4294967296) + t.toNat := by omega
+[?2004l[?2004h>   generalize x.toNat % 4294967296 = lo at *
+[?2004l[?2004h>   generalize x.toNat / 4294967296 = h at *
+[?2004l[?2004h>   generalize 2281701377 * lo / 4294967296 = s at *
+[?2004l[?2004h>   clear h1
+[?2004l[?2004h>   have hint : (lo + 4294967296 * h) * 943718400 + 2013265921 * 2013265919 * 1069547521 * lo + 1069547521 * lo
+[?2004l[?2004h>       = (h + 2013265921 * s) * (1 + 2013265921 * 2013265919) + 2013265921 * 943718400 * t.toNat := by omega
+[?2004l[?2004h>   split <;> rename_i hc <;>
+[?2004l[?2004h>     simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_ofNat] at hc ⊢ <;>
+[?2004l[?2004h>     simp at hc ⊢ <;> trace_state <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && time LEAN_PATH=/workspace/lean lean T5.lean 2>&1 | head -80; cd /workspace
+[?2004lT5.lean:27:37: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  -18446744071427850241 ≤ e - 18446744073709551616*f ≤ 2281701374
+  0 ≤ e ≤ 4294967295
+  e + 4294967296*g ≤ 4294967295
+  b ≥ 0
+  0 ≤ a ≤ 4294967295
+  1069547521*a - 2013265921*b - 4294967296*c + e + 4294967296*g ≥ 4294967296
+  1069547521*a - 4294967296*c + e + 4294967296*g ≥ 4294967296
+  0 ≤ 2281701377*a - 4294967296*b ≤ 4294967295
+  0 ≤ 4593671624212873217*a - 8646911288846319616*b - 18446744073709551616*c ≤ 18446744073709551615
+  4593671624212873217*a - 8646911288846319616*b - 18446744073709551616*c ≤ 18446744073709551616
+  18446744073709551616 ≤ 4593671624212873217*a - 8646911288846319616*b - 18446744073709551616*c + 4294967296*e + 18446744073709551616*g ≤ 27093655362555871231
+  4335132435327573971750092800*a - 8160249286451986593900134400*b - 17408531802450660115768934400*c - 2013265921*d + 4053239664633446399*e + 18446744073709551616*f + 17408531802450660115768934400*g ≥ 17408531820897404187196784642
+  17408531802450660115768934400 ≤ 4335132435327573971750092800*a - 8160249286451986593900134400*b - 17408531802450660115768934400*c - 2013265921*d + 4053239664633446400*e + 17408531802450660115768934400*g ≤ 17408531802450660117782200320
+where
+ a := ↑lo
+ b := ↑s
+ c := ↑(2013265921 * t.toNat) / 18446744073709551616
+ d := ↑(x.toNat * 943718400) / 2013265921
+ e := ↑((18446744073709551616 - 2013265921 * t.toNat % 18446744073709551616 + x.toNat) % 18446744073709551616) /
+  4294967296
+ f := ↑(18446744069414584320 +
+      (2013265921 +
+        (18446744073709551616 - 2013265921 * t.toNat % 18446744073709551616 + x.toNat) % 18446744073709551616 /
+          4294967296)) /
+  18446744073709551616
+ g := ↑(18446744073709551616 - 2013265921 * t.toNat % 18446744073709551616 + x.toNat) / 18446744073709551616
+T5.lean:27:37: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ e ≤ 4294967295
+  e + 4294967296*f ≥ 4294967296
+  b ≥ 0
+  0 ≤ a ≤ 4294967295
+  1069547521*a - 2013265921*b - 4294967296*c + e + 4294967296*f ≥ 4294967296
+  1069547521*a - 4294967296*c + e + 4294967296*f ≥ 4294967296
+  0 ≤ 2281701377*a - 4294967296*b ≤ 4294967295
+  0 ≤ 4593671624212873217*a - 8646911288846319616*b - 18446744073709551616*c ≤ 18446744073709551615
+  4593671624212873217*a - 8646911288846319616*b - 18446744073709551616*c ≤ 18446744073709551616
+  18446744073709551616 ≤ 4593671624212873217*a - 8646911288846319616*b - 18446744073709551616*c + 4294967296*e + 18446744073709551616*f ≤ 27093655362555871231
+  4335132435327573971750092800*a - 8160249286451986593900134400*b - 17408531802450660115768934400*c - 2013265921*d + 4053239664633446399*e + 17408531802450660115768934400*f ≥ 17408531802450660115768934401
+  17408531802450660115768934400 ≤ 4335132435327573971750092800*a - 8160249286451986593900134400*b - 17408531802450660115768934400*c - 2013265921*d + 4053239664633446400*e + 17408531802450660115768934400*f ≤ 17408531802450660117782200320
+where
+ a := ↑lo
+ b := ↑s
+ c := ↑(2013265921 * t.toNat) / 18446744073709551616
+ d := ↑(x.toNat * 943718400) / 2013265921
+ e := ↑((18446744073709551616 - 2013265921 * t.toNat % 18446744073709551616 + x.toNat) % 18446744073709551616) /
+  4294967296
+ f := ↑(18446744073709551616 - 2013265921 * t.toNat % 18446744073709551616 + x.toNat) / 18446744073709551616
+case isTrue
+x : UInt64
+hx : x.toNat < 2013265921 * 4294967296
+t : UInt64
+htl : t.toNat < 4294967296
+lo : Nat
+hlo : lo < 4294967296
+h : Nat
+e1 : x.toNat = lo + 4294967296 * h
+s : Nat
+e2 : 2281701377 * lo = 4294967296 * s + t.toNat
+hint :
+  (lo + 4294967296 * h) * 943718400 + 2013265921 * 2013265919 * 1069547521 * lo + 1069547521 * lo =
+    (h + 2013265921 * s) * (1 + 2013265921 * 2013265919) + 2013265921 * 943718400 * t.toNat
+hc : x.toNat < 2013265921 * t.toNat % 18446744073709551616
+⊢ (18446744069414584320 +
+        (2013265921 +
+          (18446744073709551616 - 2013265921 * t.toNat % 18446744073709551616 + x.toNat) % 18446744073709551616 /
+            4294967296)) %
+      18446744073709551616 =
+    x.toNat * 943718400 % 2013265921
+case isFalse
+x : UInt64
+hx : x.toNat < 2013265921 * 4294967296
+t : UInt64
+htl : t.toNat < 4294967296
+lo : Nat
+hlo : lo < 4294967296
+h : Nat
+e1 : x.toNat = lo + 4294967296 * h
+
+real	0m1.065s
+user	0m0.794s
+sys	0m0.401s
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T6.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem modP (Y q K : Nat) (h : Y = q + 2013265921 * K) (hq : q < 2013265921) : Y % 2013265921 = q := by
+[?2004l[?2004h>   subst h; rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hq]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mr (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by omega
+[?2004l[?2004h>   have e1 : x.toNat = x.toNat % 4294967296 + 4294967296 * (x.toNat / 4294967296) := by omega
+[?2004l[?2004h>   have hlo : x.toNat % 4294967296 < 4294967296 := by omega
+[?2004l[?2004h>   have e2 : 2281701377 * (x.toNat % 4294967296) = 4294967296 * (2281701377 * (x.toNat % 4294967296) / 4294967296) + t.toNat := by omega
+[?2004l[?2004h>   generalize x.toNat % 4294967296 = lo at *
+[?2004l[?2004h>   generalize x.toNat / 4294967296 = h at *
+[?2004l[?2004h>   generalize 2281701377 * lo / 4294967296 = s at *
+[?2004l[?2004h>   clear h1
+[?2004l[?2004h>   have hPT : 2013265921 * t.toNat % 18446744073709551616 = 2013265921 * t.toNat := Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   split <;> rename_i hc <;>
+[?2004l[?2004h>     simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_ofNat] at hc ⊢ <;>
+[?2004l[?2004h>     simp at hc ⊢ <;> rw [hPT] at hc ⊢
+[?2004l[?2004h>   · -- borrow
+[?2004l[?2004h>     have hm : 2013265921 * t.toNat - x.toNat = 4294967296 * (1069547521 * lo - h - 2013265921 * s) := by omega
+[?2004l[?2004h>     generalize 1069547521 * lo - h - 2013265921 * s = m at hm
+[?2004l[?2004h>     have hm0 : 0 < m := by omega
+[?2004l[?2004h>     have hmP : m < 2013265921 := by omega
+[?2004l[?2004h>     have hd : (18446744073709551616 - 2013265921 * t.toNat + x.toNat) % 18446744073709551616 = 18446744073709551616 - 4294967296 * m := by omega
+[?2004l[?2004h>     have hK : x.toNat * 943718400 = (2013265921 - m) + 2013265921 * (943718400 * t.toNat - 2013265919 * m - 1) := by omega
+[?2004l[?2004h>     rw [modP _ _ _ hK (by omega), hd]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · -- no borrow
+[?2004l[?2004h>     have hq : x.toNat - 2013265921 * t.toNat = 4294967296 * (h + 2013265921 * s - 1069547521 * lo) := by omega
+[?2004l[?2004h>     generalize h + 2013265921 * s - 1069547521 * lo = q at hq
+[?2004l[?2004h>     have hqP : q < 2013265921 := by omega
+[?2004l[?2004h>     have hd : (18446744073709551616 - 2013265921 * t.toNat + x.toNat) % 18446744073709551616 = 4294967296 * q := by omega
+[?2004l[?2004h>     have hK : x.toNat * 943718400 = q + 2013265921 * (943718400 * t.toNat + 2013265919 * q) := by omega
+[?2004l[?2004h>     rw [modP _ _ _ hK hqP, hd]
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && time LEAN_PATH=/workspace/lean lean T6.lean 2>&1 | head -60; cd /workspace
+[?2004lT6.lean:36:117: error: (deterministic) timeout at `whnf`, maximum number of heartbeats (200000) has been reached
+
+Note: Use `set_option maxHeartbeats <num>` to set the limit.
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+T6.lean:38:4: error: (deterministic) timeout at `«tactic execution»`, maximum number of heartbeats (200000) has been reached
+
+Note: Use `set_option maxHeartbeats <num>` to set the limit.
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+T6.lean:12:0: error: (deterministic) timeout at `whnf`, maximum number of heartbeats (200000) has been reached
+
+Note: Use `set_option maxHeartbeats <num>` to set the limit.
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+
+real	0m9.814s
+user	0m9.697s
+sys	0m0.465s
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T7.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem modP (Y q K : Nat) (h : Y = q + 2013265921 * K) (hq : q < 2013265921) : Y % 2013265921 = q := by
+[?2004l[?2004h>   subst h; rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hq]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem keyAB (X T lo h s : Nat) (e1 : X = lo + 4294967296 * h)
+[?2004l[?2004h>     (e2 : 2281701377 * lo = 4294967296 * s + T) :
+[?2004l[?2004h>     X + 4294967296 * (1069547521 * lo) = 2013265921 * T + 4294967296 * (2013265921 * s + h) := by
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem borrowM (X T A B : Nat) (hAB : X + 4294967296 * A = 2013265921 * T + 4294967296 * B)
+[?2004l[?2004h>     (hc : X < 2013265921 * T) : X + 4294967296 * (A - B) = 2013265921 * T := by omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nbQ (X T A B : Nat) (hAB : X + 4294967296 * A = 2013265921 * T + 4294967296 * B)
+[?2004l[?2004h>     (hc : ¬ X < 2013265921 * T) : X = 2013265921 * T + 4294967296 * (B - A) := by omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem borrowRes (X T m : Nat) (h : X + 4294967296 * m = 2013265921 * T) (hc : X < 2013265921 * T)
+[?2004l[?2004h>     (hT : T < 4294967296) :
+[?2004l[?2004h>     (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 18446744073709551616 - 4294967296 * m ∧
+[?2004l[?2004h>     0 < m ∧ m < 2013265921 ∧ X * 943718400 % 2013265921 = 2013265921 - m := by
+[?2004l[?2004h>   have hm0 : 0 < m := by omega
+[?2004l[?2004h>   have hmP : m < 2013265921 := by omega
+[?2004l[?2004h>   have hK : X * 943718400 + m + 2013265921 * 2013265919 * m = 2013265921 * 943718400 * T := by omega
+[?2004l[?2004h>   have hK2 : X * 943718400 = (2013265921 - m) + 2013265921 * (943718400 * T - 2013265919 * m - 1) := by omega
+[?2004l[?2004h>   refine ⟨by omega, hm0, hmP, modP _ _ _ hK2 (by omega)⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nbRes (X T q : Nat) (h : X = 2013265921 * T + 4294967296 * q) (hX : X < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 4294967296 * q ∧
+[?2004l[?2004h>     q < 2013265921 ∧ X * 943718400 % 2013265921 = q := by
+[?2004l[?2004h>   have hqP : q < 2013265921 := by omega
+[?2004l[?2004h>   have hK : X * 943718400 = q + 2013265921 * (943718400 * T + 2013265919 * q) := by omega
+[?2004l[?2004h>   refine ⟨by omega, hqP, modP _ _ _ hK hqP⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mr (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by omega
+[?2004l[?2004h>   have hPT : 2013265921 * t.toNat % 18446744073709551616 = 2013265921 * t.toNat := Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   have hAB := keyAB x.toNat t.toNat (x.toNat % 4294967296) (x.toNat / 4294967296) (2281701377 * (x.toNat % 4294967296) / 4294967296) (by omega) (by omega)
+[?2004l[?2004h>   generalize 1069547521 * (x.toNat % 4294967296) = A at hAB
+[?2004l[?2004h>   generalize 2013265921 * (2281701377 * (x.toNat % 4294967296) / 4294967296) + x.toNat / 4294967296 = B at hAB
+[?2004l[?2004h>   clear h1
+[?2004l[?2004h>   split <;> rename_i hc <;>
+[?2004l[?2004h>     simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_ofNat] at hc ⊢ <;>
+[?2004l[?2004h>     simp at hc ⊢ <;> rw [hPT] at hc ⊢
+[?2004l[?2004h>   · obtain ⟨hd, hm0, hmP, hr⟩ := borrowRes _ _ _ (borrowM _ _ _ _ hAB hc) hc htl
+[?2004l[?2004h>     rw [hd, hr]
+[?2004l[?2004h>     generalize A - B = m at *
+[?2004l[?2004h>     clear hAB hd hr hPT hx hc htl
+[?2004l[?2004h>     trace_state
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · obtain ⟨hd, hqP, hr⟩ := nbRes _ _ _ (nbQ _ _ _ _ hAB hc) hx
+[?2004l[?2004h>     rw [hd, hr]
+[?2004l[?2004h>     generalize B - A = q at *
+[?2004l[?2004h>     clear hAB hd hr hPT hx hc htl
+[?2004l[?2004h>     trace_state
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && time LEAN_PATH=/workspace/lean lean T7.lean 2>&1 | head -60; cd /workspace
+[?2004lT7.lean:30:104: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+T7.lean:61:57: error: Application type mismatch: The argument
+  hc
+has type
+  2013265921 * t.toNat ≤ x.toNat
+but is expected to have type
+  ¬x.toNat < 2013265921 * t.toNat
+in the application
+  nbQ x.toNat t.toNat A B hAB hc
+case isTrue
+x t : UInt64
+A B m : Nat
+hm0 : 0 < m
+hmP : m < 2013265921
+⊢ (18446744069414584320 + (2013265921 + (18446744073709551616 - 4294967296 * m) / 4294967296)) % 18446744073709551616 =
+    2013265921 - m
+case isFalse
+x t : UInt64
+A B q : Nat
+hqP : q < 2013265921
+⊢ 4294967296 * q / 4294967296 = q
+
+real	0m1.685s
+user	0m1.683s
+sys	0m0.442s
+[?2004hroot@7728df8dd2a4:/workspace# cat > /tmp/exp/T8.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tp (a f : UInt64) : (packTranscript a f).toNat = a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l[?2004h>   simp only [packTranscript, limbBase, babyBearP, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod]
+[?2004l[?2004h>   simp
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem modP (Y q K : Nat) (h : Y = q + 2013265921 * K) (hq : q < 2013265921) : Y % 2013265921 = q := by
+[?2004l[?2004h>   subst h; rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hq]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem modP2 (Y m K : Nat) (h : Y + m = 2013265921 * K) (h0 : 0 < m) (h1 : m < 2013265921) :
+[?2004l[?2004h>     Y % 2013265921 = 2013265921 - m := by
+[?2004l[?2004h>   have hY : Y = (2013265921 - m) + 2013265921 * (K - 1) := by omega
+[?2004l[?2004h>   exact modP _ _ _ hY (by omega)
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem keyAB (X T lo h s : Nat) (e1 : X = lo + 4294967296 * h)
+[?2004l[?2004h>     (e2 : 2281701377 * lo = 4294967296 * s + T) :
+[?2004l[?2004h>     X + 4294967296 * (1069547521 * lo) = 2013265921 * T + 4294967296 * (2013265921 * s + h) := by
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004lv[?2004h> theorem borrowM (X T A B : Nat) (hAB : X + 4294967296 * A = 2013265921 * T + 4294967296 * B)
+[?2004l[?2004h>     (hc : X < 2013265921 * T) : X + 4294967296 * (A - B) = 2013265921 * T := by omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nbQ (X T A B : Nat) (hAB : X + 4294967296 * A = 2013265921 * T + 4294967296 * B)
+[?2004l[?2004h>     (hc : 2013265921 * T ≤ X) : X = 2013265921 * T + 4294967296 * (B - A) := by omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem borrowRes (X T m : Nat) (h : X + 4294967296 * m = 2013265921 * T) (hc : X < 2013265921 * T)
+[?2004lub[?2004h>     (hT : T < 4294967296) :
+[?2004l[?2004h>     (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 18446744073709551616 - 4294967296 * m ∧
+[?2004l[?2004h>     0 < m ∧ m < 2013265921 ∧ X * 943718400 % 2013265921 = 2013265921 - m := by
+[?2004l[?2004h>   have hm0 : 0 < m := by omega
+[?2004l[?2004h>   have hmP : m < 2013265921 := by omega
+[?2004l[?2004h>   have hK : X * 943718400 + 2013265921 * (2013265919 * m) + m = 2013265921 * (943718400 * T) := by omega
+[?2004l[?2004h>   have hr : (X * 943718400 + 2013265921 * (2013265919 * m)) % 2013265921 = 2013265921 - m := modP2 _ _ _ hK hm0 hmP
+[?2004l[?2004h>   rw [Nat.add_mul_mod_self_left] at hr
+[?2004l[?2004h>   have hd : (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 18446744073709551616 - 4294967296 * m := by omega
+[?2004l[?2004h>   exact ⟨hd, hm0, hmP, hr⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nbRes (X T q : Nat) (h : X = 2013265921 * T + 4294967296 * q) (hX : X < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 4294967296 * q ∧
+[?2004l[?2004h>     q < 2013265921 ∧ X * 943718400 % 2013265921 = q := by
+[?2004l[?2004h>   have hqP : q < 2013265921 := by omega
+[?2004l[?2004h>   have hK : X * 943718400 = q + 2013265921 * (943718400 * T + 2013265919 * q) := by omega
+[?2004l[?2004h>   have hd : (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 4294967296 * q := by omega
+[?2004l[?2004h>   exact ⟨hd, hqP, modP _ _ _ hK hqP⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mr (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by omega
+[?2004l[?2004h>   have hPT : 2013265921 * t.toNat % 18446744073709551616 = 2013265921 * t.toNat := Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   have hAB := keyAB x.toNat t.toNat (x.toNat % 4294967296) (x.toNat / 4294967296) (2281701377 * (x.toNat % 4294967296) / 4294967296) (by omega) (by omega)
+[?2004l[?2004h>   generalize 1069547521 * (x.toNat % 4294967296) = A at hAB
+[?2004l[?2004h>   generalize 2013265921 * (2281701377 * (x.toNat % 4294967296) / 4294967296) + x.toNat / 4294967296 = B at hAB
+[?2004l[?2004h>   clear h1
+[?2004l[?2004h>   split <;> rename_i hc <;>
+[?2004l[?2004h>     simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_ofNat] at hc ⊢ <;>
+[?2004l[?2004h>     simp at hc ⊢ <;> rw [hPT] at hc ⊢
+[?2004l[?2004h>   · obtain ⟨hd, hm0, hmP, hr⟩ := borrowRes _ _ _ (borrowM _ _ _ _ hAB hc) hc htl
+[?2004l[?2004h>     rw [hd, hr]
+[?2004l[?2004h>     generalize A - B = m at *
+[?2004l[?2004h>     clear hAB hd hr hPT hx hc htl
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · obtain ⟨hd, hqP, hr⟩ := nbRes _ _ _ (nbQ _ _ _ _ hAB hc) hx
+[?2004l[?2004h>     rw [hd, hr]
+[?2004l[?2004h>     generalize B - A = q at *
+[?2004l[?2004h>     clear hAB hd hr hPT hx hc htl
+[?2004l[?2004h>     omega
+[?2004l[?2004h> 
+[?2004l[?2004h> def surcharge (a f : UInt64) : Nat :=
+[?2004l[?2004h>   ((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem surcharge_lt (a f : UInt64) : surcharge a f < 2013265921 := Nat.mod_lt _ (by decide)
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem auth_iff (b a f t : UInt64) : challengeAuthorize b a f = some t ↔
+[?2004l[?2004h>     (a.toNat + surcharge a f ≤ b.toNat ∧ t.toNat = a.toNat + surcharge a f) := by
+[?2004l[?2004h>   have hx : (packTranscript a f).toNat < 2013265921 * 4294967296 := by
+[?2004l[?2004h>     rw [tp]; have := f.toNat_lt; omega
+[?2004l[?2004h>   have hm := mr _ hx
+[?2004l[?2004h>   rw [tp] at hm
+[?2004l[?2004h>   have hs := surcharge_lt a f
+[?2004l[?2004h>   unfold surcharge at *
+[?2004l[?2004h>   unfold challengeAuthorize buildQuote verifyAffordability
+[?2004l[?2004h>   generalize montyReduce (packTranscript a f) = s at *
+[?2004l[?2004h>   generalize ((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921 = S at *
+[?2004l[?2004h>   subst hm
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hb := b.toNat_lt
+[?2004l[?2004h>   have ht := t.toNat_lt
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   by_cases h1 : s ≤ u64Max - a
+[?2004l[?2004h>   · rw [if_pos h1]
+[?2004l[?2004h>     dsimp only
+[?2004l[?2004h>     have h1' := h1
+[?2004l[?2004h>     simp only [UInt64.le_iff_toNat_le, UInt64.toNat_sub, u64Max] at h1'
+[?2004l[?2004h>     simp at h1'
+[?2004l[?2004h>     have hsum : (a + s).toNat = a.toNat + s.toNat := by simp; omega
+[?2004l[?2004h>     by_cases h2 : a + s ≤ b
+[?2004l[?2004h>     · rw [if_pos h2]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at h2
+[?2004l[?2004h>       simp only [Option.some.injEq]
+[?2004l[?2004h>       constructor
+[?2004l[?2004h>       · intro h; subst h; omega
+[?2004l[?2004h>       · intro h; apply UInt64.toNat_inj.mp; omega
+[?2004l[?2004h>     · rw [if_neg h2]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at h2
+[?2004l[?2004h>       simp; omega
+[?2004l[?2004h>   · rw [if_neg h1]
+[?2004l[?2004h>     simp only [UInt64.le_iff_toNat_le, UInt64.toNat_sub, u64Max] at h1
+[?2004l[?2004h>     simp at h1
+[?2004l[?2004h>     simp
+[?2004l[?2004h>     omega
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts b a f := a.toNat + surcharge a f ≤ b.toNat
+[?2004l[?2004h>   output b a f total := total.toNat = a.toNat + surcharge a f
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem conforms : Conforms candidateSpec challengeAuthorize := by
+[?2004l[?2004h>   refine ⟨fun b a f => ⟨?_, ?_⟩, fun b a f t h => ((auth_iff b a f t).mp h).2⟩
+[?2004l[?2004h>   · rintro ⟨t, h⟩; exact ((auth_iff b a f t).mp h).1
+[?2004l[?2004h>   · intro h
+[?2004l[?2004h>     have hb := b.toNat_lt
+[?2004l[?2004h>     refine ⟨UInt64.ofNat (a.toNat + surcharge a f), (auth_iff _ _ _ _).mpr ⟨h, ?_⟩⟩
+[?2004l[?2004h>     simp only [UInt64.toNat_ofNat]
+[?2004l[?2004h>     show (a.toNat + surcharge a f) % 2 ^ 64 = _
+[?2004l[?2004h>     exact Nat.mod_eq_of_lt (by simp only [candidateSpec] at h; omega)
+[?2004l[?2004h> 
+[?2004l[?2004h> example : AuditClaim candidateSpec .safe := conforms
+[?2004l[?2004h> 
+[?2004l[?2004h> #print axioms conforms
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /tmp/exp && time LEAN_PATH=/workspace/lean lean T8.lean 2>&1 | head -80; cd /workspace
+[?2004lT8.lean:103:8: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  if s ≤ u64Max - a then ?m.140 else ?m.141
+in the target expression
+  (match
+        if montyReduce (packTranscript a f) ≤ u64Max - a then
+          some
+            { principal := a, montySurcharge := montyReduce (packTranscript a f),
+              totalDebit := a + montyReduce (packTranscript a f) }
+        else none with
+      | some quote => if quote.totalDebit ≤ b then some quote.totalDebit else none
+      | none => none) =
+      some t ↔
+    a.toNat + s.toNat ≤ b.toNat ∧ t.toNat = a.toNat + s.toNat
+
+case pos
+b a f t : UInt64
+hx : (packTranscript a f).toNat < 2013265921 * 4294967296
+s : UInt64
+hs : s.toNat < 2013265921
+ha : a.toNat < 2 ^ 64
+hb : b.toNat < 2 ^ 64
+ht : t.toNat < 2 ^ 64
+h1 : s ≤ u64Max - a
+⊢ (match
+        if montyReduce (packTranscript a f) ≤ u64Max - a then
+          some
+            { principal := a, montySurcharge := montyReduce (packTranscript a f),
+              totalDebit := a + montyReduce (packTranscript a f) }
+        else none with
+      | some quote => if quote.totalDebit ≤ b then some quote.totalDebit else none
+      | none => none) =
+      some t ↔
+    a.toNat + s.toNat ≤ b.toNat ∧ t.toNat = a.toNat + s.toNat
+T8.lean:119:8: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  if s ≤ u64Max - a then ?m.145 else ?m.146
+in the target expression
+  (match
+        if montyReduce (packTranscript a f) ≤ u64Max - a then
+          some
+            { principal := a, montySurcharge := montyReduce (packTranscript a f),
+              totalDebit := a + montyReduce (packTranscript a f) }
+        else none with
+      | some quote => if quote.totalDebit ≤ b then some quote.totalDebit else none
+      | none => none) =
+      some t ↔
+    a.toNat + s.toNat ≤ b.toNat ∧ t.toNat = a.toNat + s.toNat
+
+case neg
+b a f t : UInt64
+hx : (packTranscript a f).toNat < 2013265921 * 4294967296
+s : UInt64
+hs : s.toNat < 2013265921
+ha : a.toNat < 2 ^ 64
+hb : b.toNat < 2 ^ 64
+ht : t.toNat < 2 ^ 64
+h1 : ¬s ≤ u64Max - a
+⊢ (match
+        if montyReduce (packTranscript a f) ≤ u64Max - a then
+          some
+            { principal := a, montySurcharge := montyReduce (packTranscript a f),
+              totalDebit := a + montyReduce (packTranscript a f) }
+        else none with
+      | some quote => if quote.totalDebit ≤ b then some quote.totalDebit else none
+      | none => none) =
+      some t ↔
+    a.toNat + s.toNat ≤ b.toNat ∧ t.toNat = a.toNat + s.toNat
+T8.lean:127:9: warning: Variable name `b` is not explicitly referenced.
+
+The binding can be removed (if unused) or named `_` (if used implicitly).
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+T8.lean:135:4: error: `simp` made no progress
+'conforms' depends on axioms: [propext, sorryAx, Quot.sound]
+
+real	0m2.504s
+user	0m2.403s
+sys	0m0.615s
+[?2004hroot@7728df8dd2a4:/workspace# rmdir /workspace/submission/src; rm -f /workspace/submission/counterexample.json
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-!
+[?2004l[?2004h> Intended policy (from the documented contract of `authorize`), in exact integer arithmetic:
+[?2004l[?2004h>   P = 2013265921, R = 2^32, R_INV = 943718400 (R * R_INV = 1 mod P)
+[?2004l013265921 * t.toNat % 18446744073709551616 = 2013265921 * t.toNat := Nat.mod_eq_of_lt (by omega)
+  have hAB := keyAB x.toNat t.[?2004h>   transcript      = (amount mod 2^32) + (fee mod P) * 2^32
+[?2004l[?2004h>   monty_surcharge = (transcript * R_INV) mod P
+[?2004l[?2004h>   total_debit     = amount + monty_surcharge          (exact, unbounded)
+[?2004l[?2004h> The payment is authorized iff total_debit <= balance, and the reported debit is exactly
+[?2004l[?2004h> total_debit.
+[?2004l[?2004h> -/
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Documented Montgomery surcharge, computed in exact Nat arithmetic. -/
+[?2004l[?2004h> def surcharge (a f : UInt64) : Nat :=
+[?2004l[?2004h>   ((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts b a f := a.toNat + surcharge a f ≤ b.toNat
+[?2004l[?2004h>   output b a f total := total.toNat = a.toNat + surcharge a f
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem surcharge_lt (a f : UInt64) : surcharge a f < 2013265921 := Nat.mod_lt _ (by decide)
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem tq (x : UInt64) : (montyQuotient x).toNat = 2281701377 * (x.toNat % 4294967296) % 4294967296 := by
+[?2004l[?2004h>   unfold montyQuotient babyBearMu limbBase
+[?2004l[?2004h>   simp only [UInt64.toNat_mod, UInt64.toNat_mul]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004lt[?2004h> theorem tp (a f : UInt64) : (packTranscript a f).toNat = a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l4967296 := by
+    rw [[?2004h>   simp only [packTranscript, limbBase, babyBearP, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod]
+[?2004l[?2004h>   simp
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem modP (Y q K : Nat) (h : Y = q + 2013265921 * K) (hq : q < 2013265921) : Y % 2013265921 = q := by
+[?2004l[?2004h>   subst h; rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hq]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem modP2 (Y m K : Nat) (h : Y + m = 2013265921 * K) (h0 : 0 < m) (h1 : m < 2013265921) :
+[?2004l[?2004h>     Y % 2013265921 = 2013265921 - m := by
+[?2004l[?2004h>   have hY : Y = (2013265921 - m) + 2013265921 * (K - 1) := by omega
+[?2004l[?2004h>   exact modP _ _ _ hY (by omega)
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem keyAB (X T lo h s : Nat) (e1 : X = lo + 4294967296 * h)
+[?2004l[?2004h>     (e2 : 2281701377 * lo = 4294967296 * s + T) :
+[?2004l[?2004h>     X + 4294967296 * (1069547521 * lo) = 2013265921 * T + 4294967296 * (2013265921 * s + h) := by
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem borrowM (X T A B : Nat) (hAB : X + 4294967296 * A = 2013265921 * T + 4294967296 * B)
+[?2004l[?2004h>     (hc : X < 2013265921 * T) : X + 4294967296 * (A - B) = 2013265921 * T := by omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nbQ (X T A B : Nat) (hAB : X + 4294967296 * A = 2013265921 * T + 4294967296 * B)
+[?2004l[?2004h>     (hc : 2013265921 * T ≤ X) : X = 2013265921 * T + 4294967296 * (B - A) := by omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem borrowRes (X T m : Nat) (h : X + 4294967296 * m = 2013265921 * T) (hc : X < 2013265921 * T)
+[?2004l[?2004h>     (hT : T < 4294967296) :
+[?2004l[?2004h>     (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 18446744073709551616 - 4294967296 * m ∧
+[?2004l[?2004h>     0 < m ∧ m < 2013265921 ∧ X * 943718400 % 2013265921 = 2013265921 - m := by
+[?2004l[?2004h>   have hm0 : 0 < m := by omega
+[?2004l[?2004h>   have hmP : m < 2013265921 := by omega
+[?2004l[?2004h>   have hK : X * 943718400 + 2013265921 * (2013265919 * m) + m = 2013265921 * (943718400 * T) := by omega
+[?2004l[?2004h>   have hr : (X * 943718400 + 2013265921 * (2013265919 * m)) % 2013265921 = 2013265921 - m := modP2 _ _ _ hK hm0 hmP
+[?2004l[?2004h>   rw [Nat.add_mul_mod_self_left] at hr
+[?2004l[?2004h>   have hd : (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 18446744073709551616 - 4294967296 * m := by omega
+[?2004l[?2004h>   exact ⟨hd, hm0, hmP, hr⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nbRes (X T q : Nat) (h : X = 2013265921 * T + 4294967296 * q) (hX : X < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 4294967296 * q ∧
+[?2004l[?2004h>     q < 2013265921 ∧ X * 943718400 % 2013265921 = q := by
+[?2004l[?2004h>   have hqP : q < 2013265921 := by omega
+[?2004l[?2004h>   have hK : X * 943718400 = q + 2013265921 * (943718400 * T + 2013265919 * q) := by omega
+[?2004l[?2004h>   have hd : (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 = 4294967296 * q := by omega
+[?2004l[?2004h>   exact ⟨hd, hqP, modP _ _ _ hK hqP⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Montgomery reduction is correct (canonical, exact) on its documented domain `x < P * 2^32`. -/
+[?2004l[?2004h> theorem mr (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   have h1 := tq x
+[?2004l[?2004h>   generalize montyQuotient x = t at *
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by omega
+[?2004l[?2004h>   have hPT : 2013265921 * t.toNat % 18446744073709551616 = 2013265921 * t.toNat := Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   have hAB := keyAB x.toNat t.toNat (x.toNat % 4294967296) (x.toNat / 4294967296) (2281701377 * (x.toNat % 4294967296) / 4294967296) (by omega) (by omega)
+[?2004l[?2004h>   generalize 1069547521 * (x.toNat % 4294967296) = A at hAB
+[?2004l[?2004h>   generalize 2013265921 * (2281701377 * (x.toNat % 4294967296) / 4294967296) + x.toNat / 4294967296 = B at hAB
+[?2004l[?2004h>   clear h1
+[?2004l[?2004h>   split <;> rename_i hc <;>
+[?2004l[?2004h>     simp only [babyBearP, limbBase, UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_ofNat] at hc ⊢ <;>
+[?2004l[?2004h>     simp at hc ⊢ <;> rw [hPT] at hc ⊢
+[?2004l[?2004h>   · obtain ⟨hd, hm0, hmP, hr⟩ := borrowRes _ _ _ (borrowM _ _ _ _ hAB hc) hc htl
+[?2004l[?2004h>     rw [hd, hr]
+[?2004l[?2004h>     generalize A - B = m at *
+[?2004l[?2004h>     clear hAB hd hr hPT hx hc htl
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · obtain ⟨hd, hqP, hr⟩ := nbRes _ _ _ (nbQ _ _ _ _ hAB hc) hx
+[?2004l[?2004h>     rw [hd, hr]
+[?2004l[?2004h>     generalize B - A = q at *
+[?2004l[?2004h>     clear hAB hd hr hPT hx hc htl
+[?2004l[?2004h>     omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem auth_iff (b a f t : UInt64) : challengeAuthorize b a f = some t ↔
+[?2004l[?2004h>     (a.toNat + surcharge a f ≤ b.toNat ∧ t.toNat = a.toNat + surcharge a f) := by
+[?2004l[?2004h>   have hx : (packTranscript a f).toNat < 2013265921 * 4294967296 := by
+[?2004l[?2004h>     rw [tp]; have := f.toNat_lt; omega
+[?2004l[?2004h>   have hm := mr _ hx
+[?2004l[?2004h>   rw [tp] at hm
+[?2004l[?2004h>   have hs := surcharge_lt a f
+[?2004l[?2004h>   unfold surcharge at *
+[?2004l[?2004h>   unfold challengeAuthorize buildQuote verifyAffordability
+[?2004l[?2004h>   try dsimp only
+[?2004l[?2004h>   generalize montyReduce (packTranscript a f) = s at *
+[?2004l[?2004h>   generalize ((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921 = S at *
+[?2004l[?2004h>   subst hm
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hb := b.toNat_lt
+[?2004l[?2004h>   have ht := t.toNat_lt
+[?2004l[?2004h>   by_cases h1 : s ≤ u64Max - a
+[?2004l[?2004h>   · rw [if_pos h1]
+[?2004l[?2004h>     try dsimp only
+[?2004l[?2004h>     have h1' := h1
+[?2004l[?2004h>     simp only [UInt64.le_iff_toNat_le, UInt64.toNat_sub, u64Max] at h1'
+[?2004l[?2004h>     simp at h1'
+[?2004l[?2004h>     have hsum : (a + s).toNat = a.toNat + s.toNat := by simp; omega
+[?2004l[?2004h>     by_cases h2 : a + s ≤ b
+[?2004l[?2004h>     · rw [if_pos h2]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at h2
+[?2004l[?2004h>       simp only [Option.some.injEq]
+[?2004l[?2004h>       constructor
+[?2004l[?2004h>       · intro h; subst h; omega
+[?2004l[?2004h>       · intro h; apply UInt64.toNat_inj.mp; omega
+[?2004l[?2004h>     · rw [if_neg h2]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at h2
+[?2004l[?2004h>       simp; omega
+[?2004l[?2004h>   · rw [if_neg h1]
+[?2004l[?2004h>     simp only [UInt64.le_iff_toNat_le, UInt64.toNat_sub, u64Max] at h1
+[?2004l[?2004h>     simp at h1
+[?2004l[?2004h>     simp
+[?2004l[?2004h>     omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem candidateSpec_conforms : Conforms candidateSpec challengeAuthorize := by
+[?2004l[?2004h>   refine ⟨fun b a f => ⟨?_, ?_⟩, fun b a f t h => ((auth_iff b a f t).mp h).2⟩
+[?2004l[?2004h>   · rintro ⟨t, h⟩; exact ((auth_iff b a f t).mp h).1
+[?2004l[?2004h>   · intro h
+[?2004l[?2004h>     change a.toNat + surcharge a f ≤ b.toNat at h
+[?2004l[?2004h>     have hb := b.toNat_lt
+[?2004l[?2004h>     have hn : a.toNat + surcharge a f < 2 ^ 64 := by omega
+[?2004l[?2004h>     refine ⟨UInt64.ofNat (a.toNat + surcharge a f), (auth_iff _ _ _ _).mpr ⟨h, ?_⟩⟩
+[?2004l[?2004h>     first
+[?2004l[?2004h>       | exact UInt64.toNat_ofNat_of_lt' hn
+[?2004l[?2004h>       | (simp <;> omega)
+[?2004l[?2004h>       | (rw [UInt64.toNat_ofNat']; exact Nat.mod_eq_of_lt hn)
+[?2004l[?2004h>       | simp [Nat.mod_eq_of_lt hn]
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# printf 'import SecurityChallenge\nopen SecurityChallenge\n\ndef verdict : AuditVerdict := .safe\n' > /workspace/submission/Audit.lean
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# printf 'candidateSpec_conforms\n' > /workspace/submission/Proof.lean
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# cd /workspace/lean && time python3 check.py; echo EXIT=$?; cd /workspace
+[?2004lCandidateSpec.lean:7:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:13:9: warning: Variable name `b` is not explicitly referenced.
+
+The binding can be removed (if unused) or named `_` (if used implicitly).
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+CandidateSpec.lean:68:1: error: unexpected token 'theorem'; expected term
+CandidateSpec.lean:66:8: error: Invalid `⟨...⟩` notation: The expected type of this term could not be determined
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+
+real	0m2.350s
+user	0m2.194s
+sys	0m0.682s
+EXIT=1
+[?2004hroot@7728df8dd2a4:/workspace# python3 - <<'EOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> p='/workspace/submission/Spec.lean'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=re.sub(r'/--\s*(.*?)\s*-/', r'-- \1', s)
+[?2004l[?2004h> def blk(m):
+[?2004l[?2004h>     return '\n'.join('-- '+l for l in m.group(1).strip().splitlines())
+[?2004l[?2004h> s=re.sub(r'/-!(.*?)-/', blk, s, flags=re.S)
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@7728df8dd2a4:/workspace# grep -n '/-\|-/' /workspace/submission/Spec.lean; head -20 /workspace/submission/Spec.lean
+[?2004limport SecurityChallenge
+open SecurityChallenge
+
+-- Intended policy (from the documented contract of `authorize`), in exact integer arithmetic:
+--   P = 2013265921, R = 2^32, R_INV = 943718400 (R * R_INV = 1 mod P)
+--   transcript      = (amount mod 2^32) + (fee mod P) * 2^32
+--   monty_surcharge = (transcript * R_INV) mod P
+--   total_debit     = amount + monty_surcharge          (exact, unbounded)
+-- The payment is authorized iff total_debit <= balance, and the reported debit is exactly
+-- total_debit.
+
+-- Documented Montgomery surcharge, computed in exact Nat arithmetic.
+def surcharge (a f : UInt64) : Nat :=
+  ((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921
+
+def candidateSpec : AuthorizationSpec where
+  accepts b a f := a.toNat + surcharge a f ≤ b.toNat
+  output b a f total := total.toNat = a.toNat + surcharge a f
+
+theorem surcharge_lt (a f : UInt64) : surcharge a f < 2013265921 := Nat.mod_lt _ (by decide)
+[?2004hroot@7728df8dd2a4:/workspace# cd /workspace/lean && python3 check.py; echo EXIT=$?; cd /workspace
+[?2004lCandidateSpec.lean:19:9: warning: Variable name `b` is not explicitly referenced.
+
+The binding can be removed (if unused) or named `_` (if used implicitly).
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+EXIT=0
+[?2004hroot@7728df8dd2a4:/workspace# mkdir -p /tmp/ax && cd /tmp/ax && (echo 'import SecurityChallenge'; tail -n +3 /workspace/submission/Spec.lean; echo; echo 'def verdict : AuditVerdict := .safe'; echo 'theorem auditEvidence : AuditClaim candidateSpec verdict := candidateSpec_conforms'; echo '#print axioms auditEvidence') | sed '2i open SecurityChallenge' > A.lean && LEAN_PATH=/workspace/lean lean A.lean 2>&1 | grep -v 'linter\|binding\|^$\|Variable name'; cd /workspace
+[?2004l'auditEvidence' depends on axioms: [propext, Classical.choice, Quot.sound]
+[?2004hroot@7728df8dd2a4:/workspace# cd /workspace/challenge && cargo test 2>&1 | grep -E 'test |result'; cd /workspace; python3 /workspace/harness/checkpoint.py; ls -la /workspace/submission
+[?2004l[01;31m[Ktest [m[Ktests::montgomery_identity_element ... ok
+[01;31m[Ktest [m[Ktests::small_transcript_reduction_matches_policy ... ok
+[01;31m[Ktest [m[Ktests::zero_payment_is_authorized ... ok
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Spec.lean: present
+Audit.lean: present
+Proof.lean: present
+counterexample.json: missing/empty
+src/lib.rs: missing/empty
+total 32
+drwxr-xr-x 1 root root 4096 Oct  7 07:28 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   85 Oct  7 07:28 Audit.lean
+-rw-r--r-- 1 root root   23 Oct  7 07:28 Proof.lean
+-rw-r--r-- 1 root root 7218 Oct  7 07:29 Spec.lean
+[?2004hroot@7728df8dd2a4:/workspace# 

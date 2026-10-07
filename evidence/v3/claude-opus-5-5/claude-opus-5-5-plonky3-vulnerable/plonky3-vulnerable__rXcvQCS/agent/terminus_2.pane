@@ -1,0 +1,528 @@
+[?2004hroot@714fbc9bbc0e:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@714fbc9bbc0e:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@714fbc9bbc0e:/workspace# find /workspace -maxdepth 3 -not -path '*/.lake/*' -not -path '*/target/*' | head -50
+[?2004l/workspace
+/workspace/lean
+/workspace/lean/lean-toolchain
+/workspace/lean/Signature.lean
+/workspace/lean/SecurityChallenge.olean
+/workspace/lean/SecurityChallenge.lean
+/workspace/lean/check.py
+/workspace/challenge
+/workspace/challenge/src
+/workspace/challenge/src/lib.rs
+/workspace/challenge/Cargo.toml
+/workspace/challenge/Cargo.lock
+/workspace/challenge/target
+/workspace/harness
+/workspace/harness/checkpoint.py
+/workspace/submission
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src
+[?2004hroot@714fbc9bbc0e:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod monty31 {
+    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+
+    #[inline]
+    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+        let low: u64 = amount & LIMB_MASK;
+        let high: u64 = fee % BABY_BEAR_P;
+        low + high * LIMB_BASE
+    }
+
+    #[inline]
+    pub fn monty_quotient(x: u64) -> u64 {
+        let x_lo: u64 = x & LIMB_MASK;
+        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    }
+
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            if hi == LIMB_MASK {
+                0u64
+            } else {
+                hi + BABY_BEAR_P - LIMB_BASE
+            }
+        } else {
+            hi
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::monty31;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PlonkyQuote {
+        pub principal: u64,
+        pub monty_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+        let transcript: u64 = monty31::pack_transcript(amount, fee);
+        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+        Some(PlonkyQuote {
+            principal: amount,
+            monty_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Plonky3 BabyBear Montgomery settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2013265921` (BabyBear prime), `R = 2^32 = 4294967296`, `R_INV = 943718400` (`R * R_INV == 1 mod P`)
+/// - `transcript = (amount mod 2^32) + (fee mod P) * 2^32`
+/// - `monty_surcharge = (transcript * R_INV) mod P`
+/// - `total_debit = amount + monty_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::PlonkyQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn montgomery_identity_element() {
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        assert_eq!(
+            authorize(4_294_967_301, 4_294_967_296, 5),
+            Some(Authorization {
+                total_debit: 4_294_967_301
+            })
+        );
+    }
+}
+[?2004hroot@714fbc9bbc0e:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def babyBearP : UInt64 := 2013265921
+def babyBearMu : UInt64 := 2281701377
+def limbBase : UInt64 := 4294967296
+def limbMask : UInt64 := 4294967295
+def u64Max : UInt64 := 18446744073709551615
+
+structure PlonkyQuote where
+  principal : UInt64
+  montySurcharge : UInt64
+  totalDebit : UInt64
+
+def packTranscript (amount fee : UInt64) : UInt64 :=
+  let low := amount % limbBase
+  let high := fee % babyBearP
+  limbBase * high + low
+
+def montyQuotient (x : UInt64) : UInt64 :=
+  let xLo := x % limbBase
+  (babyBearMu * xLo) % limbBase
+
+def montyReduce (x : UInt64) : UInt64 :=
+  let t := montyQuotient x
+  let u := babyBearP * t
+  let diff := x - u
+  let hi := diff / limbBase
+  if x < u then
+    if hi = limbMask then
+      0
+    else
+      babyBearP + hi - limbBase
+  else
+    hi
+
+def buildQuote (amount fee : UInt64) : Option PlonkyQuote :=
+  let transcript := packTranscript amount fee
+  let montySurcharge := montyReduce transcript
+  if montySurcharge ≤ u64Max - amount then
+    some {
+      principal := amount,
+      montySurcharge := montySurcharge,
+      totalDebit := amount + montySurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : PlonkyQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@714fbc9bbc0e:/workspace# python3 -c "P=2013265921;R=2**32;a=1744830467;f=0;x=a%R+(f%P)*R;print(x*943718400%P, (R*943718400)%P);t=((x&(R-1))*2281701377)&(R-1);u=t*P;d=(x-u)%2**64;hi=d>>32;print(t,x<u,hi==R-1)"
+[?2004l2013265920 1
+3 True True
+[?2004hroot@714fbc9bbc0e:/workspace# cat /workspace/lean/check.py; cat /workspace/submission/*.lean; ls -la /workspace/submission/src
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+total 8
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34m..[0m
+[?2004hroot@714fbc9bbc0e:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- BabyBear prime P. -/
+[?2004l[?2004h> def specP : Nat := 2013265921
+[?2004l[?2004h> /-- Montgomery radix R = 2^32. -/
+[?2004l[?2004h> def specR : Nat := 4294967296
+[?2004l[?2004h> /-- R^-1 mod P. -/
+[?2004l[?2004h> def specRInv : Nat := 943718400
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- transcript = (amount mod 2^32) + (fee mod P) * 2^32, exact integers. -/
+[?2004l[?2004h> def specTranscript (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat % specR + (fee.toNat % specP) * specR
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- monty_surcharge = (transcript * R_INV) mod P. -/
+[?2004l[?2004h> def specSurcharge (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   (specTranscript amount fee * specRInv) % specP
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact debit = principal + fee surcharge (unbounded). -/
+[?2004l[?2004h> def specTotal (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat + specSurcharge amount fee
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => specTotal amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee total => total.toNat = specTotal amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@714fbc9bbc0e:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@714fbc9bbc0e:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have h1 : challengeAuthorize 1744830467 1744830467 0 = some 1744830467 := by decide
+[?2004l[?2004h>   have h2 := (h.1 1744830467 1744830467 0).mp ⟨_, h1⟩
+[?2004l[?2004h>   change specTotal 1744830467 0 ≤ (1744830467 : UInt64).toNat at h2
+[?2004l[?2004h>   exact absurd h2 (by decide)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@714fbc9bbc0e:/workspace# printf '{"balance": 1744830467, "amount": 1744830467, "fee": 0}\n' > /workspace/submission/counterexample.json
+[?2004l[?2004hroot@714fbc9bbc0e:/workspace# cd /workspace/lean && time python3 check.py; echo EXIT=$?; cd /workspace
+[?2004lCandidateSpec.lean:5:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:7:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:9:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:12:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:16:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:20:1: error: unexpected token 'def'; expected term
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+
+real	0m1.347s
+user	0m0.628s
+sys	0m0.734s
+EXIT=1
+[?2004hroot@714fbc9bbc0e:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- BabyBear prime P
+[?2004l[?2004h> def specP : Nat := 2013265921
+[?2004l[?2004h> -- Montgomery radix R = 2^32
+[?2004l[?2004h> def specR : Nat := 4294967296
+[?2004l[?2004h> -- R^-1 mod P
+[?2004l[?2004h> def specRInv : Nat := 943718400
+[?2004l[?2004h> 
+[?2004l[?2004h> -- transcript = (amount mod 2^32) + (fee mod P) * 2^32, exact integers
+[?2004l[?2004h> def specTranscript (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat % specR + (fee.toNat % specP) * specR
+[?2004l[?2004h> 
+[?2004l[?2004h> -- monty_surcharge = (transcript * R_INV) mod P
+[?2004l[?2004h> def specSurcharge (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   (specTranscript amount fee * specRInv) % specP
+[?2004l[?2004h> 
+[?2004l[?2004h> -- exact debit = principal + surcharge, unbounded (settlement uses wider arithmetic)
+[?2004l[?2004h> def specTotal (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat + specSurcharge amount fee
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => specTotal amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee total => total.toNat = specTotal amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@714fbc9bbc0e:/workspace# mkdir -p /workspace/submission/src && python3 - <<'EOF'
+[?2004l[?2004h> src = open('/workspace/challenge/src/lib.rs').read()
+[?2004l[?2004h> old = '''        if borrow {
+[?2004l[?2004h>             if hi == LIMB_MASK {
+[?2004l[?2004h>                 0u64
+[?2004l[?2004h>             } else {
+[?2004l[?2004h>                 hi + BABY_BEAR_P - LIMB_BASE
+[?2004l[?2004h>             }
+[?2004l[?2004h>         } else {'''
+[?2004l[?2004h> new = '''        if borrow {
+[?2004l[?2004h>             // diff wrapped: hi = 2^32 + q with -P < q < 0, so hi + P - 2^32 = q + P in (0, P).
+[?2004l[?2004h>             hi + BABY_BEAR_P - LIMB_BASE
+[?2004l[?2004h>         } else {'''
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> test_anchor = '''    fn small_transcript_reduction_matches_policy() {'''
+[?2004l[?2004h> reg = '''    fn borrow_with_all_ones_high_limb_is_p_minus_one() {
+[?2004l[?2004h>         // transcript = 3P - 2^32, quotient t = 3, q = -1 -> surcharge must be P - 1.
+[?2004l[?2004h>         assert_eq!(monty31::monty_reduce(1_744_830_467), 2_013_265_920);
+[?2004l[?2004h>         assert_eq!(authorize(1_744_830_467, 1_744_830_467, 0), None);
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(3_758_096_387, 1_744_830_467, 0),
+[?2004l[?2004h>             Some(Authorization { total_debit: 3_758_096_387 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h> '''
+[?2004l[?2004h> assert test_anchor in src
+[?2004l[?2004h> src = src.replace(test_anchor, reg + test_anchor, 1)
+[?2004l[?2004h> open('/workspace/submission/src/lib.rs','w').write(src)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@714fbc9bbc0e:/workspace# sed -n '/pub fn monty_reduce/,/^    }/p' /workspace/submission/src/lib.rs
+[?2004l    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            // diff wrapped: hi = 2^32 + q with -P < q < 0, so hi + P - 2^32 = q + P in (0, P).
+            hi + BABY_BEAR_P - LIMB_BASE
+        } else {
+            hi
+        }
+    }
+[?2004hroot@714fbc9bbc0e:/workspace# cd /workspace/lean && python3 check.py; echo EXIT=$?; cd /workspace
+[?2004lEXIT=0
+[?2004hroot@714fbc9bbc0e:/workspace# rm -rf /tmp/fixcrate && cp -r /workspace/challenge /tmp/fixcrate && cp /workspace/submission/src/lib.rs /tmp/fixcrate/src/lib.rs && cd /tmp/fixcrate && cargo test --offline 2>&1 | tail -15; cd /workspace
+[?2004l
+running 4 tests
+test tests::borrow_with_all_ones_high_limb_is_p_minus_one ... ok
+test tests::montgomery_identity_element ... ok
+test tests::small_transcript_reduction_matches_policy ... ok
+test tests::zero_payment_is_authorized ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@714fbc9bbc0e:/workspace# python3 - <<'EOF'
+[?2004l[?2004h> import random
+[?2004l[?2004h> P=2013265921;R=2**32;M=2**64;MU=2281701377;RINV=943718400
+[?2004l[?2004h> def fixed(x):
+[?2004l[?2004h>     t=((x&(R-1))*MU)&(R-1); u=t*P; assert u<M
+[?2004l[?2004h>     d=(x-u)%M; hi=d>>32
+[?2004l[?2004h>     if x<u:
+[?2004l[?2004h>         v=hi+P-R; assert 0<=v<M and hi+P<M
+[?2004l[?2004h>         return v
+[?2004l[?2004h>     return hi
+[?2004l[?2004h> def auth(b,a,f):
+[?2004l[?2004h>     x=(a&(R-1))+(f%P)*R; assert x<M
+[?2004l[?2004h>     s=fixed(x); tot=a+s
+[?2004l[?2004h>     if tot>=M: return None
+[?2004l[?2004h>     return tot if tot<=b else None
+[?2004l[?2004h> def spec(b,a,f):
+[?2004l[?2004h>     x=(a%R)+(f%P)*R; tot=a+(x*RINV)%P
+[?2004l[?2004h>     return tot if tot<=b else None
+[?2004l[?2004h> bad=0
+[?2004l[?2004h> for _ in range(300000):
+[?2004l[?2004h>     x=random.randrange(0,P*R)
+[?2004l[?2004h>     if fixed(x)!=(x*RINV)%P: bad+=1
+[?2004l[?2004h> for t in range(0,R,4099):
+[?2004l[?2004h>     for x in (t*P-R, t*P-1, t*P, t*P+1):
+[?2004l[?2004h>         if 0<=x<P*R and fixed(x)!=(x*RINV)%P: bad+=1
+[?2004l[?2004h> edges=[0,1,2,P-1,P,P+1,R-1,R,R+1,M-1,M-2,M-P,1744830467,3758096387]
+[?2004l[?2004h> for b in edges:
+[?2004l[?2004h>     for a in edges:
+[?2004l[?2004h>         for f in edges:
+[?2004l[?2004h>             if auth(b,a,f)!=spec(b,a,f): bad+=1
+[?2004l[?2004h> for _ in range(200000):
+[?2004l[?2004h>     a=random.choice([random.randrange(M),random.randrange(R),M-1-random.randrange(P)]); f=random.randrange(M)
+[?2004l[?2004h>     b=random.choice([random.randrange(M),M-1])
+[?2004l[?2004h>     if auth(b,a,f)!=spec(b,a,f): bad+=1
+[?2004l[?2004h> print('mismatches:',bad)
+[?2004l[?2004h> print('cex spec:',spec(1744830467,1744830467,0),'fixed:',auth(1744830467,1744830467,0))
+[?2004l[?2004h> EOF
+[?2004lmismatches: 0
+cex spec: None fixed: None
+[?2004hroot@714fbc9bbc0e:/workspace# cd /tmp && mkdir -p axchk && cd axchk && { echo 'import SecurityChallenge'; grep -v '^import' /workspace/submission/Spec.lean; grep -v '^import' /workspace/submission/Audit.lean; echo 'theorem auditEvidence : AuditClaim candidateSpec verdict := ('; cat /workspace/submission/Proof.lean; echo ')'; echo '#print axioms auditEvidence'; } > Ax.lean && LEAN_PATH=/workspace/lean lean Ax.lean; cd /workspace
+[?2004l'auditEvidence' depends on axioms: [propext]
+[?2004hroot@714fbc9bbc0e:/workspace# ls -la /workspace/submission /workspace/submission/src && cat /workspace/submission/counterexample.json
+[?2004l/workspace/submission:
+total 36
+drwxr-xr-x 1 root root 4096 Oct  7 07:04 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   91 Oct  7 07:04 Audit.lean
+-rw-r--r-- 1 root root  257 Oct  7 07:04 Proof.lean
+-rw-r--r-- 1 root root  902 Oct  7 07:05 Spec.lean
+-rw-r--r-- 1 root root   56 Oct  7 07:04 counterexample.json
+drwxr-xr-x 1 root root 4096 Oct  7 07:05 [01;34msrc[0m
+
+/workspace/submission/src:
+total 16
+drwxr-xr-x 1 root root 4096 Oct  7 07:05 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:04 [01;34m..[0m
+-rw-r--r-- 1 root root 4016 Oct  7 07:05 lib.rs
+{"balance": 1744830467, "amount": 1744830467, "fee": 0}
+[?2004hroot@714fbc9bbc0e:/workspace# 

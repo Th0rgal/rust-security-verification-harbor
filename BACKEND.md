@@ -8,10 +8,16 @@ mathematical debit defined by the task family (`problem.txt`):
 - In `settlement`, `settlement-modular`, and `settlement-engine`,
   `gross_fee = ceil((amount + fee) / 10_000)`, `rebate = floor(gross_fee / 10)`,
   and `S = amount + (gross_fee - rebate)`.
+- In `goldilocks` (Goldilocks prime `P = 2^64 - 2^32 + 1`),
+  `fee = ((amount mod P) * (feeRate mod P)) mod P`, and `S = amount + fee`.
+- In `whirlpool` (fee rate denominator `1_000_000`, accepts only when `feeRate < 1_000_000`),
+  `fee = ceil(amount * feeRate / (1_000_000 - feeRate))`, and `S = amount + fee`.
+- In `plonky3` (BabyBear prime `P = 2013265921`),
+  `fee = ((amount mod P) * (feeRate mod P)) mod P`, and `S = amount + fee`.
 
-The hidden business contract accepts iff S <= balance, and returns S on
-acceptance. Because balance is a u64, S <= balance also implies S fits u64; no
-separate overflow point is double-counted.
+The hidden business contract accepts iff S <= balance (and `feeRate < 1_000_000`
+in `whirlpool`), and returns S on acceptance. Because balance is a u64, S <= balance
+also implies S fits u64; no separate overflow point is double-counted.
 
 The four spec facets are:
 1. accepts -> S <= balance.
@@ -28,8 +34,9 @@ only safety (one quarter of the spec checkpoint).
 ## Lean-native specification pipeline
 
 The agent writes complete Lean Spec.lean/Audit.lean files; helper definitions and
-lemmas are supported. candidateSpec must have type AuthorizationSpec and verdict
-type AuditVerdict. Proof.lean is a term for the fixed AuditClaim candidateSpec
+lemmas are supported, and precompiled `Mathlib`, `Batteries`, `Aesop`, `Qq`, `Std`,
+and `Init` are available on `LEAN_PATH`. candidateSpec must have type AuthorizationSpec
+and verdict type AuditVerdict. Proof.lean is a term for the fixed AuditClaim candidateSpec
 verdict, wrapped in a trusted theorem declaration. No proof tactic is required.
 
 Each stage elaborates in a fresh OS sandbox. Only bounded regular source files
@@ -41,21 +48,27 @@ transitive dependency axioms (propext, Classical.choice, Quot.sound only), rejec
 unsafe dependencies. It unfolds the verdict to an enumerated constructor.
 
 SpecAudit lowers elaborated Lean Exprs. It dispatches primitive heads, beta/let
-reductions, structure projections and one-layer definition unfolding, preserving
+reductions, structure projections and recursive definition unfolding, preserving
 conditional heads. It never reads the user's expression as JSON. Accepted
 operations: Nat constants, input UInt64.toNat, Nat.add, Nat.sub (truncated at zero),
-Nat.mul by a constant, Nat.div/Nat.mod by a positive constant, Nat.le/Nat.lt,
-Nat/Prop equality, And, Or, Not, Iff, nondependent implication and nondependent ite.
-UInt64 arithmetic in specs, quantified binders, unsupported recursors, nonlinear
-input arithmetic and unknown heads are unsupported.
+Nat.mul (including general non-linear input products), Nat.div/Nat.mod by a positive
+constant or strictly positive expression, Nat.le/Nat.lt, Nat/Prop equality, And, Or,
+Not, Iff, nondependent implication and nondependent ite.
+UInt64 arithmetic in specs, quantified binders, unsupported recursors and unknown
+heads are unsupported.
 Closed UInt64.toNat literals can reduce to constants. Expression bounds and
 normalization fuel are finite; solver, process, memory and output limits apply.
 
 The typed intermediate tree is converted to Z3 integer/Boolean expressions with
-exact bounded domains. The output-existence obligation quantifies over bounded
-integer totalDebit. A SAT query returns concrete failing inputs; UNSAT establishes
-the obligation in the supported theory. Unknown/timeouts are unresolved and do
-not receive success credit. Unsupported output expressions do not erase scores
+exact bounded domains. For large constant divisors (`>= 1_000_000`) or variable
+divisors (e.g., `goldilocks`, `whirlpool`, `plonky3`), `div` and `mod` subterms
+are purified into fresh Euclidean quotient/remainder variables (`N = q * D + r`,
+`0 <= r < D`) so Z3 `QF_NIA` solves equivalence and existence queries without
+timeout. The output-existence obligation quantifies over bounded
+integer totalDebit (reducing directly when `candidate.output` has an isolated
+`totalDebit = rhs` equality). A SAT query returns concrete failing inputs; UNSAT
+establishes the obligation in the supported theory. Unknown/timeouts are unresolved
+and do not receive success credit. Unsupported output expressions do not erase scores
 for separately supported accepts facets. There is currently no general Lean
 automation fallback for arbitrary specs.
 
@@ -76,12 +89,13 @@ optimized Rust probes compare boundaries, reproducible random cases and every SM
 counterexample; sampling never substitutes for the universal SMT result.
 
 Supported production code consists of Authorization and authorize, module-level
-integer constants, inline modules/structs/non-recursive helpers (in settlement*
-tasks), immutable lets/shadowing, if/else, if-let, exhaustive Option matches,
-returns, ?, casts (when permitted by the crate contract; u128 is forbidden in
-pure-u64 settlement* tasks), arithmetic/comparisons/booleans, div_ceil,
-checked/wrapping add/sub/mul, checked div/rem, saturating add/sub, then_some,
-Some/None and Authorization construction. Built-in derives and cfg(test) modules
+integer constants, inline modules/structs/non-recursive helpers,
+immutable lets/shadowing, tuple destructuring lets (`let (d, borrow) = ...`),
+if/else, if-let, exhaustive Option matches,
+returns, ?, casts (`u32`, `u64`, `u128` when permitted by the crate contract; `u128` is forbidden in
+pure-u64 tasks), arithmetic/comparisons/booleans, bitwise/shift operators (`&`, `|`, `^`, `<<`, `>>`),
+div_ceil, checked/wrapping/overflowing/borrowing add/sub/mul, checked div/rem/shl/shr,
+saturating add/sub, then_some, Some/None and Authorization construction. Built-in derives and cfg(test) modules
 are accepted. Loops, macros, unsafe and extra dependencies are outside the
 accepted production subset. The soundness claim is scoped to this subset and to
 the functional authorization properties above. Rust/model semantic alignment is

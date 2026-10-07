@@ -10,7 +10,11 @@ COPY --from=rust /usr/local/rustup /usr/local/rustup
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 ENV PATH="/usr/local/cargo/bin:${PATH}" RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
 RUN python3 -c "import shutil; shutil.rmtree('/opt/security-verifier', ignore_errors=True)"
-COPY verifier/*.py verifier/requirements.txt /opt/security-verifier/
+COPY verifier/requirements.txt /opt/security-verifier/requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libseccomp2 \
+ && python3 -m pip install --break-system-packages --no-cache-dir -r /opt/security-verifier/requirements.txt \
+ && rm -rf /var/lib/apt/lists/*
+COPY verifier/*.py /opt/security-verifier/
 COPY verifier/pristine/ /opt/security-verifier/pristine/
 COPY verifier/variant.txt /opt/security-verifier/variant.txt
 COPY verifier/problem.txt /opt/security-verifier/problem.txt
@@ -18,7 +22,5 @@ COPY --from=api /build-api/.lake/build/lib/lean/SecurityChallenge.olean /opt/sec
 COPY --from=api /build-api/.lake/build/lib/lean/SpecAudit.olean /opt/security-verifier/api/SpecAudit.olean
 COPY verifier/SpecAudit.lean /opt/security-verifier/SpecAudit.lean
 COPY test.sh /tests/test.sh
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libseccomp2 \
- && python3 -m pip install --break-system-packages --no-cache-dir -r /opt/security-verifier/requirements.txt \
- && chmod 0555 /tests/test.sh && mkdir -p /workspace/submission/src /logs/verifier
+RUN chmod 0555 /tests/test.sh && mkdir -p /workspace/submission/src /logs/verifier
 WORKDIR /workspace

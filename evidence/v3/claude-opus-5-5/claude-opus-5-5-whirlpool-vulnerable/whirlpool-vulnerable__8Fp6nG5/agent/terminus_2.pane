@@ -1,0 +1,587 @@
+[?2004hroot@0b89097ffe0c:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@0b89097ffe0c:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@0b89097ffe0c:/workspace# cd /workspace && ls -R challenge lean submission 2>/dev/null | head -50
+[?2004lchallenge:
+Cargo.lock
+Cargo.toml
+src
+target
+
+challenge/src:
+lib.rs
+
+challenge/target:
+CACHEDIR.TAG
+release
+
+challenge/target/release:
+build
+deps
+examples
+incremental
+
+challenge/target/release/build:
+
+challenge/target/release/deps:
+libsettlement_gate-0aba5e1fc59a671e.rlib
+libsettlement_gate-0aba5e1fc59a671e.rmeta
+settlement_gate-0aba5e1fc59a671e.d
+settlement_gate-ebd00f5d27994bc9
+settlement_gate-ebd00f5d27994bc9.d
+
+challenge/target/release/examples:
+
+challenge/target/release/incremental:
+
+lean:
+SecurityChallenge.lean
+SecurityChallenge.olean
+Signature.lean
+check.py
+lean-toolchain
+
+submission:
+Audit.lean
+Proof.lean
+Spec.lean
+src
+
+submission/src:
+[?2004hroot@0b89097ffe0c:/workspace# cat challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod u128_math {
+    pub const LIMB_BASE: u64 = 0x1_0000_0000u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+    pub const FEE_RATE_MUL_VALUE: u64 = 1_000_000u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct U128Words {
+        pub w0: u64,
+        pub w1: u64,
+        pub w2: u64,
+        pub w3: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivStep {
+        pub quot: u64,
+        pub rem: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivResult {
+        pub q0: u64,
+        pub q1: u64,
+        pub q2: u64,
+        pub q3: u64,
+        pub rem: u64,
+    }
+
+    #[inline]
+    pub fn split_u128(amount: u64, fee: u64) -> U128Words {
+        U128Words {
+            w0: amount & LIMB_MASK,
+            w1: amount >> LIMB_SHIFT,
+            w2: fee & LIMB_MASK,
+            w3: fee >> LIMB_SHIFT,
+        }
+    }
+
+    #[inline]
+    pub fn div_step(rem: u64, word: u64) -> DivStep {
+        let num: u64 = rem * LIMB_BASE + word;
+        DivStep {
+            quot: num / FEE_RATE_MUL_VALUE,
+            rem: num % FEE_RATE_MUL_VALUE,
+        }
+    }
+
+    #[inline]
+    pub fn div_word_chain(words: U128Words) -> DivResult {
+        let step3: DivStep = div_step(0u64, words.w3);
+        let step2: DivStep = div_step(step3.rem, words.w2);
+        let step1: DivStep = div_step(step2.rem, words.w1);
+        let step0: DivStep = div_step(step1.rem, words.w0);
+        DivResult {
+            q0: step0.quot,
+            q1: step1.quot,
+            q2: step2.quot,
+            q3: step3.quot,
+            rem: step0.rem,
+        }
+    }
+
+    #[inline]
+    pub fn round_up_quotient(div: DivResult) -> U128Words {
+        let inc: u64 = if div.rem > 0u64 { 1u64 } else { 0u64 };
+        let s0: u64 = div.q0 + inc;
+        let r0: u64 = s0 & LIMB_MASK;
+        let c0: u64 = s0 >> LIMB_SHIFT;
+        let s1: u64 = div.q1 + c0;
+        let r1: u64 = s1 & LIMB_MASK;
+        let s2: u64 = div.q2;
+        let r2: u64 = s2 & LIMB_MASK;
+        let c2: u64 = s2 >> LIMB_SHIFT;
+        let r3: u64 = div.q3 + c2;
+        U128Words {
+            w0: r0,
+            w1: r1,
+            w2: r2,
+            w3: r3,
+        }
+    }
+
+    #[inline]
+    pub fn try_into_u64(words: U128Words) -> Option<u64> {
+        if words.w2 != 0u64 || words.w3 != 0u64 {
+            None
+        } else {
+            Some(words.w1 * LIMB_BASE + words.w0)
+        }
+    }
+
+    #[inline]
+    pub fn div_round_up_fee(amount: u64, fee: u64) -> Option<u64> {
+        let words: U128Words = split_u128(amount, fee);
+        let div: DivResult = div_word_chain(words);
+        let rounded: U128Words = round_up_quotient(div);
+        try_into_u64(rounded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::u128_math;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WhirlpoolQuote {
+        pub principal_share: u64,
+        pub gross_fee: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<WhirlpoolQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let gross_fee: u64 = u128_math::div_round_up_fee(amount, fee)?;
+        let total_debit: u64 = principal_share.checked_add(gross_fee)?;
+        Some(WhirlpoolQuote {
+            principal_share,
+            gross_fee,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: WhirlpoolQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a concentrated-liquidity Whirlpool swap debit against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `principal_share = floor(amount / 2)`
+/// - `gross_fee = ceil((amount + fee * 2^64) / 1_000_000)`
+/// - `total_debit = principal_share + gross_fee`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::WhirlpoolQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn rounds_up_fractional_fee() {
+        // amount = 100, fee = 0:
+        // principal_share = 50, gross_fee = ceil(100 / 1_000_000) = 1 -> total = 51
+        assert_eq!(authorize(51, 100, 0), Some(Authorization { total_debit: 51 }));
+        assert_eq!(authorize(50, 100, 0), None);
+    }
+
+    #[test]
+    fn multi_word_carry_across_q0_boundary() {
+        // Choose X = 1_000_000 * 0xFFFF_FFFF + 1 = 4_294_967_295_000_001 (fee = 0):
+        // gross_fee = 0x1_0000_0000 = 4_294_967_296
+        // principal_share = 2_147_483_647_500_000
+        let amount: u64 = 4_294_967_295_000_001u64;
+        let expected: u64 = (amount / 2) + 4_294_967_296u64;
+        assert_eq!(
+            authorize(expected, amount, 0),
+            Some(Authorization {
+                total_debit: expected
+            })
+        );
+    }
+}
+[?2004hroot@0b89097ffe0c:/workspace# cat lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def limbBase : UInt64 := 4294967296
+def feeRateMulValue : UInt64 := 1000000
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure U128Words where
+  w0 : UInt64
+  w1 : UInt64
+  w2 : UInt64
+  w3 : UInt64
+
+structure DivStep where
+  quot : UInt64
+  rem : UInt64
+
+structure DivResult where
+  q0 : UInt64
+  q1 : UInt64
+  q2 : UInt64
+  q3 : UInt64
+  rem : UInt64
+
+def splitU128 (amount fee : UInt64) : U128Words :=
+  { w0 := amount % limbBase, w1 := amount / limbBase, w2 := fee % limbBase, w3 := fee / limbBase }
+
+def divStep (rem word : UInt64) : DivStep :=
+  let num := limbBase * rem + word
+  { quot := num / feeRateMulValue, rem := num % feeRateMulValue }
+
+def divWordChain (words : U128Words) : DivResult :=
+  let step3 := divStep 0 words.w3
+  let step2 := divStep step3.rem words.w2
+  let step1 := divStep step2.rem words.w1
+  let step0 := divStep step1.rem words.w0
+  { q0 := step0.quot, q1 := step1.quot, q2 := step2.quot, q3 := step3.quot, rem := step0.rem }
+
+def roundUpQuotient (div : DivResult) : U128Words :=
+  let inc : UInt64 := if 0 < div.rem then 1 else 0
+  let s0 := inc + div.q0
+  let r0 := s0 % limbBase
+  let c0 := s0 / limbBase
+  let s1 := c0 + div.q1
+  let r1 := s1 % limbBase
+  let s2 := div.q2
+  let r2 := s2 % limbBase
+  let c2 := s2 / limbBase
+  let r3 := c2 + div.q3
+  { w0 := r0, w1 := r1, w2 := r2, w3 := r3 }
+
+def tryIntoU64 (words : U128Words) : Option UInt64 :=
+  if words.w2 = 0 ∧ words.w3 = 0 then
+    some (limbBase * words.w1 + words.w0)
+  else
+    none
+
+def divRoundUpFee (amount fee : UInt64) : Option UInt64 :=
+  let words := splitU128 amount fee
+  let div := divWordChain words
+  let rounded := roundUpQuotient div
+  tryIntoU64 rounded
+
+structure WhirlpoolQuote where
+  principalShare : UInt64
+  grossFee : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option WhirlpoolQuote :=
+  let principalShare := amount / principalDivisor
+  match divRoundUpFee amount fee with
+  | some grossFee =>
+    if grossFee ≤ u64Max - principalShare then
+      some {
+        principalShare := principalShare,
+        grossFee := grossFee,
+        totalDebit := principalShare + grossFee
+      }
+    else
+      none
+  | none => none
+
+def verifyAffordability (balance : UInt64) (quote : WhirlpoolQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@0b89097ffe0c:/workspace# cat lean/check.py lean/Signature.lean lean/lean-toolchain; head -50 submission/*.lean
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+leanprover/lean4:v4.31.0
+==> submission/Audit.lean <==
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+
+==> submission/Proof.lean <==
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+
+==> submission/Spec.lean <==
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+[?2004hroot@0b89097ffe0c:/workspace# cat > submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact intended debit: floor(amount/2) + ceil((amount + fee*2^64)/1_000_000). -/
+[?2004l[?2004h> def intendedTotal (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 + (amount.toNat + fee.toNat * 2 ^ 64 + 999999) / 1000000
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => intendedTotal amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee totalDebit => totalDebit.toNat = intendedTotal amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# cat > submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# cat > submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have h1 := (h.1 18446744073709551615 18446744073709551615 999999).mp
+[?2004l[?2004h>     ⟨9223372036854775807, by rfl⟩
+[?2004l[?2004h>   exact absurd h1 (by decide)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# cat > submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance": 18446744073709551615, "amount": 18446744073709551615, "fee": 999999}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# mkdir -p submission/src && cp challenge/src/lib.rs submission/src/lib.rs
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# python3 - <<'EOF'
+[?2004l[?2004h> p='submission/src/lib.rs'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> old='''        let r1: u64 = s1 & LIMB_MASK;
+[?2004l[?2004h>         let s2: u64 = div.q2;'''
+[?2004l[?2004h> new='''        let r1: u64 = s1 & LIMB_MASK;
+[?2004l[?2004h>         let c1: u64 = s1 >> LIMB_SHIFT;
+[?2004l[?2004h>         let s2: u64 = div.q2 + c1;'''
+[?2004l[?2004h> assert old in s
+[?2004l[?2004h> s=s.replace(old,new)
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# diff challenge/src/lib.rs submission/src/lib.rs
+[?2004l77c77,78
+<         let s2: u64 = div.q2;
+---
+>         let c1: u64 = s1 >> LIMB_SHIFT;
+>         let s2: u64 = div.q2 + c1;
+[?2004hroot@0b89097ffe0c:/workspace# time python3 lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:5:0: error: unexpected token '/'; expected command
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+
+real	0m1.364s
+user	0m0.641s
+sys	0m0.717s
+EXIT=1
+[?2004hroot@0b89097ffe0c:/workspace# cat > submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Exact intended debit: floor(amount/2) + ceil((amount + fee*2^64)/1000000), computed in Nat.
+[?2004l[?2004h> def intendedTotal (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 + (amount.toNat + fee.toNat * 2 ^ 64 + 999999) / 1000000
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => intendedTotal amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee totalDebit => totalDebit.toNat = intendedTotal amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# cat > submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have h1 := (h.1 18446744073709551615 18446744073709551615 999999).mp
+[?2004l[?2004h>     ⟨9223372036854775807, by decide⟩
+[?2004l[?2004h>   exact (by decide : ¬ (intendedTotal 18446744073709551615 999999 ≤ (18446744073709551615 : UInt64).toNat)) h1
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# time python3 lean/check.py; echo EXIT=$?
+[?2004l
+real	0m3.823s
+user	0m1.770s
+sys	0m2.048s
+EXIT=0
+[?2004hroot@0b89097ffe0c:/workspace# rm -rf /tmp/orig /tmp/fixed && cp -r challenge /tmp/orig && cp -r challenge /tmp/fixed && cp submission/src/lib.rs /tmp/fixed/src/lib.rs
+[?2004l[?2004hroot@0b89097ffe0c:/workspace# for d in /tmp/orig /tmp/fixed; do printf '\n#[cfg(test)]\nmod cx { #[test] fn cx(){ println!("CX={:?}", crate::authorize(u64::MAX,u64::MAX,999999)); } }\n' >> $d/src/lib.rs; (cd $d && cargo test --offline -q -- --nocapture 2>&1 | grep -E 'CX=|test result|error' ); done
+[?2004l[01;31m[KCX=[m[KSome(Authorization { total_debit: 9223372036854775807 })
+[01;31m[Ktest result[m[K: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest result[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[KCX=[m[KNone
+[01;31m[Ktest result[m[K: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest result[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[?2004hroot@0b89097ffe0c:/workspace# python3 - <<'EOF'
+[?2004l[?2004h> import random
+[?2004l[?2004h> M=(1<<64)-1;B=1<<32;D=10**6
+[?2004l[?2004h> def w(x):
+[?2004l[?2004h>     assert x<=M, 'overflow'
+[?2004l[?2004h>     return x
+[?2004l[?2004h> def fixed(b,a,f):
+[?2004l[?2004h>     ws=[a&(B-1),a>>32,f&(B-1),f>>32]
+[?2004l[?2004h>     r=0;q=[0]*4
+[?2004l[?2004h>     for i in (3,2,1,0):
+[?2004l[?2004h>         n=w(w(r*B)+ws[i]);q[i]=n//D;r=n%D
+[?2004l[?2004h>     inc=1 if r>0 else 0
+[?2004l[?2004h>     s0=w(q[0]+inc);r0=s0&(B-1);c0=s0>>32
+[?2004l[?2004h>     s1=w(q[1]+c0);r1=s1&(B-1);c1=s1>>32
+[?2004l[?2004h>     s2=w(q[2]+c1);r2=s2&(B-1);c2=s2>>32
+[?2004l[?2004h>     r3=w(q[3]+c2)
+[?2004l[?2004h>     if r2 or r3: return None
+[?2004l[?2004h>     g=w(w(r1*B)+r0);p=a//2
+[?2004l[?2004h>     if p+g>M: return None
+[?2004l[?2004h>     t=p+g
+[?2004l[?2004h>     return t if t<=b else None
+[?2004l[?2004h> def spec(b,a,f):
+[?2004l[?2004h>     t=a//2+(a+f*2**64+D-1)//D
+[?2004l[?2004h>     return t if t<=b else None
+[?2004l[?2004h> edge=[0,1,2,D-1,D,D+1,B-1,B,B+1,M,M-1,M//2,999999,(M+1)//D,D*(B-1)+1]
+[?2004l[?2004h> n=0
+[?2004l[?2004h> for a in edge:
+[?2004l[?2004h>   for f in edge:
+[?2004l[?2004h>     for b in edge+[a//2+(a+f*2**64+D-1)//D] if a//2+(a+f*2**64+D-1)//D<=M else edge:
+[?2004l[?2004h>       assert fixed(b,a,f)==spec(b,a,f),(b,a,f);n+=1
+[?2004l[?2004h> for _ in range(300000):
+[?2004l[?2004h>     a=random.getrandbits(random.choice([8,32,64]));f=random.getrandbits(random.choice([1,4,8,13]))
+[?2004l[?2004h>     t=a//2+(a+f*2**64+D-1)//D
+[?2004l[?2004h>     b=random.choice([random.getrandbits(64),min(t,M),max(t-1,0)])
+[?2004l[?2004h>     assert fixed(b,a,f)==spec(b,a,f),(b,a,f);n+=1
+[?2004l[?2004h> print('OK',n)
+[?2004l[?2004h> EOF
+[?2004lOK 303442
+[?2004hroot@0b89097ffe0c:/workspace# 

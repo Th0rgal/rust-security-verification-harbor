@@ -19,6 +19,12 @@ is universally correct. A fixed verdict therefore cannot score well on both.
 | `lfglabs/settlement-modular-safe` | **Level 1 — Modular pipeline** (~195 lines Rust / ~105 lines Lean across 4 modules) | Universally conforming modular pipeline | `.safe` |
 | `lfglabs/settlement-engine-vulnerable` | **Level 2 — Full engine with realistic noise** (~330 lines Rust / ~180 lines Lean across 6 modules: `constants`, `word_math`, `fee_tiers`, `liquidity_pool`, `flash_loan`, `settlement_engine`) | Full DeFi settlement engine with 7 structs and 14 functions, including 6 sibling 64-bit fee/rounding calculators (`assess_flash_fee_ceil`, `evaluate_passive_floor_fee`, `split_pool_reserve`, `compute_capped_maker_rebate`, etc.) that are 100% sound red herrings | `.vulnerable` |
 | `lfglabs/settlement-engine-safe` | **Level 2 — Full engine with realistic noise** (~330 lines Rust / ~180 lines Lean across 6 modules) | Universally conforming full settlement engine | `.safe` |
+| `lfglabs/goldilocks-vulnerable` | **RVB-excluded kernel — Goldilocks prime reduction** (`recmo/goldilocks` `ntt/src/field/algo/generic.rs`, `reduce_128` / `reduce_159` over $P = 2^{64} - 2^{32} + 1$) | Two-step 128-bit Goldilocks reduction `(x0 + x1 · 2^64) mod P` using `2^64 ≡ 2^32 - 1 (mod P)` where the final canonicalization branch checks `> P` instead of `≥ P`, leaving a single unreduced value `r = P` when `x1_hi + b1 · ε` lands on `P` | `.vulnerable` |
+| `lfglabs/goldilocks-safe` | **RVB-excluded kernel — Goldilocks prime reduction** (`recmo/goldilocks`) | Universally canonical Goldilocks reduction `reduce_128` over all `(balance, amount, fee) ∈ u64^3` | `.safe` |
+| `lfglabs/whirlpool-vulnerable` | **RVB-excluded kernel — Multi-word `U128Muldiv` ceiling division** (`orca-so/whirlpools` `programs/whirlpool/src/math/u256_math.rs`, 4-word base-$2^{32}$ `div` + `div_round_up_if`) | 4-limb base-$2^{32}$ division of `amount + fee · 2^64` by `FEE_RATE_MUL_VALUE = 1_000_000` with quotient round-up carry propagation (`add_carry`) that omits the `w1 → w2` carry when `q0 = 2^32 - 1`, `q1 = 2^32 - 1` and `rem > 0`, wrapping a $2^{64}$ quotient to `0` | `.vulnerable` |
+| `lfglabs/whirlpool-safe` | **RVB-excluded kernel — Multi-word `U128Muldiv` ceiling division** (`orca-so/whirlpools`) | Universally conforming 4-word `U128Muldiv` ceiling division and carry chain across all 4 limbs | `.safe` |
+| `lfglabs/plonky3-vulnerable` | **RVB-excluded kernel — BabyBear 64-bit Montgomery reduction** (`Plonky3/Plonky3` `monty-31/src/utils.rs`, `to_monty_64` + `monty_reduce` over $P = 2\,013\,265\,921$) | 64-bit Montgomery reduction `((amount mod 2^32) + (fee mod P) · 2^32) · R^{-1} mod P` (`R = 2^32`, `MU = P^{-1} mod 2^32 = 2_281_701_377`) where the unsigned underflow branch adds `(1 << 32) - P` instead of `P` after shifting by 32 bits | `.vulnerable` |
+| `lfglabs/plonky3-safe` | **RVB-excluded kernel — BabyBear 64-bit Montgomery reduction** (`Plonky3/Plonky3`) | Universally conforming 64-bit BabyBear Montgomery reduction `to_monty_64` + `monty_reduce` | `.safe` |
 
 Within each pair, everything else in the prompt and API is shared, including the
 unit tests (which pass on both `.vulnerable` and `.safe`). Apart from the task
@@ -31,12 +37,22 @@ verifier's trusted `variant.txt`/`problem.txt` differ.
   $$\text{gross\_fee} = \left\lceil \frac{\text{amount} + \text{fee}}{10\,000} \right\rceil, \quad \text{rebate} = \left\lfloor \frac{\text{gross\_fee}}{10} \right\rfloor, \quad S = \text{amount} + (\text{gross\_fee} - \text{rebate}).$$
   Because $2^{64} = 1\,844\,674\,407\,370\,955 \times 10\,000 + 1\,616$, the vulnerable `if biased < raw_sum` branch (`(raw_sum / 10_000) + ((biased + 1_616) / 10_000)`) is exact at `u64::MAX` (`amount + fee ∈ [2^64 - 1_616, 2^64 - 1]`) and across `amount + fee ≥ 2^64`, but under-computes `gross_fee` and `net_fee` by `1` strictly inside the interior pocket `2^64 - 9_999 ≤ amount + fee ≤ 2^64 - 1_617` (width `8_383` out of `2^64`, e.g. `(balance, amount, fee) = (1_660_206_966_635_476, 1_617, 18_446_744_073_709_540_000)`).
   The three isolation levels (`settlement`, `settlement-modular`, `settlement-engine`) share this exact mathematical policy and evaluate how progressive code dispersion and surrounding domain noise affect formal specification, bug localization, and Lean 4 proof construction.
+- In **`goldilocks`**, **`whirlpool`**, and **`plonky3`**, the arithmetic kernels are drawn directly from functions in the `rust-verification-benchmark` upstream repositories (`recmo/goldilocks`, `orca-so/whirlpools`, `Plonky3/Plonky3`) that were **excluded** from the benchmark ledger (`candidates/ledger/*.jsonl`) as `too_complex` due to multi-step 128-bit modular folding, 4-limb division/carry chains, and 64-bit Montgomery reduction invariants:
+  - **`goldilocks`** (`recmo/goldilocks` `reduce_128`): $P = 2^{64} - 2^{32} + 1 = 18\,446\,744\,069\,414\,584\,321$,
+    $$S = \left\lfloor \frac{\text{amount}}{2^{32}} \right\rfloor + \left(\left(\text{amount} + \text{fee} \cdot 2^{64}\right) \bmod P\right).$$
+  - **`whirlpool`** (`orca-so/whirlpools` `U128Muldiv::div` + `div_round_up_if`):
+    $$S = \left\lfloor \frac{\text{amount}}{2} \right\rfloor + \left\lceil \frac{\text{amount} + \text{fee} \cdot 2^{64}}{1\,000\,000} \right\rceil.$$
+  - **`plonky3`** (`Plonky3/Plonky3` `to_monty_64` + `monty_reduce`): $P = 2\,013\,265\,921$, $R = 2^{32}$, $R^{-1} \bmod P = 943\,718\,400$,
+    $$S = \text{amount} + \left(\left(\left(\text{amount} \bmod 2^{32}\right) + \left(\text{fee} \bmod P\right) \cdot 2^{32}\right) \cdot 943\,718\,400 \bmod P\right).$$
 
 ## Agent contract
 
 **Visible to the agent:** `/workspace/challenge` (the Rust crate with ordinary
 tests), `/workspace/lean/SecurityChallenge.lean` (the API, the visible model and
 `AuditClaim`) and `python3 /workspace/lean/check.py` (a local compile check).
+Prebuilt **Mathlib** (along with `Batteries`, `Aesop`, `Qq`, `Std`, and `Init`)
+is installed in `/opt/rvb-deps` in both the agent container and the verifier
+container and exposed on `LEAN_PATH`.
 The reference policy, the semantic checker and the pristine Rust live only in
 the verifier image. The runtime has no network access (`allow_internet = false`).
 The agent has 2 h; the verifier has 20 min.
@@ -52,11 +68,11 @@ The agent has 2 h; the verifier has 20 min.
 | `src/lib.rs` | Vulnerable only: a repaired crate that keeps the public API |
 
 For a safe verdict, `counterexample.json` and `src/lib.rs` must be **absent**.
-Lean sources may import only `SecurityChallenge`, `Lean`, `Std` and
-`Lean.Elab.Tactic.Omega`. They may not use `sorry`, `axiom`, `native_decide`,
+Lean sources may import `SecurityChallenge`, `Lean`, `Std`, `Init`, `Mathlib.*`,
+`Batteries.*`, `Aesop.*`, and `Qq.*`. They may not use `sorry`, `axiom`, `native_decide`,
 `unsafe`, `extern`/`implemented_by`, `initialize` or syntax/macro/elab
-extensions. `Proof.lean` may not declare anything itself; the verifier wraps it
-in a fixed theorem.
+extensions. `Proof.lean` may not declare top-level declarations itself; the verifier wraps it
+in a fixed theorem (auxiliary lemmas and helper definitions can be placed in `Spec.lean` or `Audit.lean`).
 
 ## Grading
 
@@ -67,7 +83,7 @@ Grading is fail-closed. Each checkpoint reports one of `pass`, `partial`,
 
 ### Lean pipeline
 
-`Spec.lean`, `Audit.lean` and `Proof.lean` are compiled in that order. Each
+`Spec.lean`, `Audit.lean` and `Proof.lean` are compiled in that order (with `-M4096`). Each
 stage runs in a fresh directory under a Landlock+seccomp sandbox without network
 access, and drops to uid 65534 when started as root. Only the serialized
 `.olean` from each stage is kept. `leanchecker` then independently replays its kernel declarations, and a
@@ -81,12 +97,13 @@ required.
 The auditor lowers the elaborated `accepts` and `output` expressions into a typed
 arithmetic tree. It unfolds auxiliary definitions, `let`, beta-redexes and
 structure projections. Z3 then decides each obligation over the full `u64` input
-domain. The model's text is never compared.
+domain (using Euclidean quotient/remainder purification for large modular/limb
+divisors). The model's text is never compared.
 
 - **Supported fragment:** `UInt64.toNat` of an input, `Nat` literals, `+`,
-  truncated `-`, constant `*`, `/` and `%`, `=`, `<`, `≤`, `∧`, `∨`, `¬`, `↔`,
-  non-dependent `→` and non-dependent `if`.
-- **Unsupported:** `UInt64` arithmetic, nonlinear variable multiplication/division,
+  truncated `-`, `*`, constant `^`, constant `/` and `%`, bitwise `&&&`/`|||`/`^^^`/`<<<`/`>>>`,
+  `=`, `<`, `≤`, `∧`, `∨`, `¬`, `↔`, non-dependent `→` and non-dependent `if`.
+- **Unsupported:** raw `UInt64` arithmetic without `.toNat`, division/modulo by a non-constant,
   quantifiers, recursors and other heads. These yield `unsupported` for the
   affected facets, not "wrong". There is no fallback for arbitrary Lean.
   `unknown` and `timeout` (10 s per query) earn no credit.
@@ -110,14 +127,15 @@ So an all-`False` spec earns only facet 1, which is 6.25 of 100 points.
 `rust_symbolic.py` parses a documented subset of Rust and proves, with Z3 over all
 `u64` inputs, that `Some` holds iff `S ≤ balance` and that `total_debit = S`.
 
-- **Supported subset:** inline modules, integer constants, plain structs and
-  non-recursive helper functions (symbolically inlined in `settlement*` tasks),
-  `let` and shadowing, `if`/`else`, `if let`, exhaustive `Option` matches,
-  `return`, `?`, casts (when permitted by the crate contract; forbidden in
-  pure-`u64` `settlement*`), `+`/`-`/`*`/`/`/`%`, comparisons and booleans,
-  `div_ceil`, `checked_`/`wrapping_` add, sub and mul, `checked_` div and rem,
-  `saturating_` add and sub, `then_some`, built-in derives and `#[cfg(test)]`
-  modules.
+- **Supported subset:** inline modules, decimal and hexadecimal integer constants,
+  plain structs, tuples and tuple destructuring, non-recursive helper functions
+  (symbolically inlined across modules), `let`, `let mut`, variable assignment and shadowing,
+  `if`/`else`, `if let`, exhaustive `Option` matches, `return`, `?`, `u32`/`u64`
+  (and `u128` when permitted by the crate contract; forbidden in pure-`u64` kernels),
+  `+`/`-`/`*`/`/`/`%`, bitwise `&`/`|`/`^` and constant shifts `<<`/`>>`,
+  comparisons and booleans, `div_ceil`, `checked_`/`wrapping_`/`overflowing_`
+  add, sub and mul, `checked_` div and rem, `saturating_` add and sub,
+  `then_some`, built-in derives and `#[cfg(test)]` modules.
 - **Rejected before execution:** loops, macros, `unsafe`, crate attributes and
   external dependencies.
 
@@ -154,10 +172,10 @@ images.
 git clone https://github.com/Th0rgal/rust-security-verification-harbor
 cd rust-security-verification-harbor
 python3 -m venv .venv && .venv/bin/pip install -r scripts/harbor-requirements.lock
-python3 scripts/make-family.py /tmp/security-family   # generates all 4 pairs (or pass --problem <name>)
+python3 scripts/make-family.py /tmp/security-family   # generates all 7 pairs (or pass --problem <name>)
 
 # Oracle (reference) runs; Harbor builds the agent and the separate verifier image.
-for p in authorization settlement settlement-modular settlement-engine; do
+for p in authorization settlement settlement-modular settlement-engine goldilocks whirlpool plonky3; do
   for v in vulnerable safe; do
     .venv/bin/harbor run -p /tmp/security-family/$p-$v -a oracle -e docker -n 1
   done
@@ -178,8 +196,8 @@ Harbor's copy:
 ```
 
 Adversarial regression suite (equivalent/weak/vacuous/unsupported specs,
-correct and incorrect Rust repairs across both families, hostile Lean, sandbox
-isolation, independent scoring, all 8 reference tasks):
+Mathlib imports, correct and incorrect Rust repairs across families, hostile
+Lean, sandbox isolation, independent scoring, all 14 reference tasks):
 
 ```bash
 docker build -t security-verifier:v3-review -f task/tests/Dockerfile task/tests
@@ -192,23 +210,27 @@ shared with that host, because verifier logs are bind-mounted.
 
 ## Evidence and baseline status
 
-- **References:** `evidence/v3/` records Harbor 0.9.0 oracle runs with 1.00 on
-  both tasks, plus the selftest pass. Those runs used commit `11489ee`, whose
-  prompt SHA-256 is `24406f25…`. Later commits only reworded `instruction.md`
-  and added the `settlement` task pairs.
+- **References:** `evidence/v3/` records reference verification reports with `1.00`
+  across all 14 task variants (`authorization`, `settlement`, `settlement-modular`,
+  `settlement-engine`, `goldilocks`, `whirlpool`, `plonky3`), plus the `selftest v3: PASS` suite.
 - **GLM 5.3 Flash (`authorization`):** fresh Harbor 0.9.0 runs with `terminus-2` and
   `zai/glm-5.3-flash` scored **1.00 on each `authorization` v3 task** (mean 1.00). Both trials
   passed all four checkpoints: spec 0.25, verdict 0.15, proof 0.25 and response
   0.35. Complete trajectories, terminal recordings, submitted artifacts and
   verifier reports are in `evidence/v3/glm-5.3-flash/`.
-- **Claude Opus 5.5 & GPT 6.1 Sol (`high`) across the 3 `settlement` isolation levels:**
+- **Claude Opus 5.5 & GPT 6.1 Sol (`high`) across the 3 `settlement` isolation levels & 3 RVB-excluded arithmetic kernels (`24` Harbor 0.9.0 trials):**
   fresh Harbor 0.9.0 runs via `sandboxed.sh` (`terminus-2`, `reasoning_effort=high`, `max_turns=25`)
-  evaluated both models on all six `settlement*` tasks (`settlement`, `settlement-modular`,
-  and `settlement-engine` in both `vulnerable` and `safe` variants). Complete trajectories,
-  terminal recordings, submitted artifacts and verifier reports are in
+  evaluated both models on all six `settlement*` tasks and all six RVB-excluded kernel tasks
+  (`goldilocks`, `whirlpool`, `plonky3` in both `vulnerable` and `safe` variants).
+  While both models achieved **1.00** on all `settlement*` tasks and on `goldilocks` and `whirlpool`,
+  **`plonky3-safe` separated the two frontier models**: **Claude Opus 5.5** closed the full
+  Lean 4 universal `Conforms` proof over the 64-bit BabyBear Montgomery reduction pipeline in 16 episodes (**1.00**),
+  whereas **GPT 6.1 Sol (`high`)** passed only the specification checkpoint (**0.25**) and exhausted all 25 episodes
+  unable to discharge the Lean 4 `Conforms` proof (`by sorry`, scoring `0.00` on `proof`, `verdict`, and `response`).
+  Complete trajectories, terminal recordings, submitted artifacts and verifier reports are in
   `evidence/v3/claude-opus-5-5/` and `evidence/v3/gpt-6.1-sol-high/`:
 
-| Task | Isolation level | Model | Reward | Episodes | Input / Output tokens |
+| Task | Category / Isolation level | Model | Reward | Episodes | Input / Output tokens |
 |---|---|---|---:|---:|---:|
 | `settlement-vulnerable` | Level 0 — Isolated | `claude-opus-5-5` | **1.00** | 11 | 125,566 / 13,927 |
 | `settlement-safe` | Level 0 — Isolated | `claude-opus-5-5` | **1.00** | 13 | 204,438 / 26,781 |
@@ -216,12 +238,24 @@ shared with that host, because verifier logs are bind-mounted.
 | `settlement-modular-safe` | Level 1 — Modular (4 modules) | `claude-opus-5-5` | **1.00** | 15 | 291,454 / 17,616 |
 | `settlement-engine-vulnerable` | Level 2 — Engine + noise (6 modules) | `claude-opus-5-5` | **1.00** | 12 | 203,563 / 14,746 |
 | `settlement-engine-safe` | Level 2 — Engine + noise (6 modules) | `claude-opus-5-5` | **1.00** | 20 | 326,168 / 28,548 |
+| `goldilocks-vulnerable` | RVB-excluded — Goldilocks `reduce_128` | `claude-opus-5-5` | **1.00** | 7 | 79,463 / 11,963 |
+| `goldilocks-safe` | RVB-excluded — Goldilocks `reduce_128` | `claude-opus-5-5` | **1.00** | 10 | 318,916 / 56,012 |
+| `whirlpool-vulnerable` | RVB-excluded — 4-word `U128Muldiv::div` | `claude-opus-5-5` | **1.00** | 7 | 79,589 / 11,214 |
+| `whirlpool-safe` | RVB-excluded — 4-word `U128Muldiv::div` | `claude-opus-5-5` | **1.00** | 11 | 207,795 / 52,294 |
+| `plonky3-vulnerable` | RVB-excluded — BabyBear `monty_reduce` | `claude-opus-5-5` | **1.00** | 7 | 78,368 / 13,025 |
+| `plonky3-safe` | RVB-excluded — BabyBear `monty_reduce` | `claude-opus-5-5` | **1.00** | 16 | 427,455 / 62,738 |
 | `settlement-vulnerable` | Level 0 — Isolated | `gpt-6.1-sol` (`high`) | **1.00** | 11 | 85,546 / 4,823 |
 | `settlement-safe` | Level 0 — Isolated | `gpt-6.1-sol` (`high`) | **1.00** | 19 | 222,260 / 6,129 |
 | `settlement-modular-vulnerable` | Level 1 — Modular (4 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 11 | 100,604 / 4,862 |
 | `settlement-modular-safe` | Level 1 — Modular (4 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 25 | 512,074 / 7,345 |
 | `settlement-engine-vulnerable` | Level 2 — Engine + noise (6 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 12 | 141,956 / 4,373 |
 | `settlement-engine-safe` | Level 2 — Engine + noise (6 modules) | `gpt-6.1-sol` (`high`) | **1.00** | 25 | 574,267 / 7,982 |
+| `goldilocks-vulnerable` | RVB-excluded — Goldilocks `reduce_128` | `gpt-6.1-sol` (`high`) | **1.00** | 9 | 69,649 / 4,035 |
+| `goldilocks-safe` | RVB-excluded — Goldilocks `reduce_128` | `gpt-6.1-sol` (`high`) | **1.00** | 25 | 520,160 / 9,804 |
+| `whirlpool-vulnerable` | RVB-excluded — 4-word `U128Muldiv::div` | `gpt-6.1-sol` (`high`) | **1.00** | 10 | 88,279 / 4,306 |
+| `whirlpool-safe` | RVB-excluded — 4-word `U128Muldiv::div` | `gpt-6.1-sol` (`high`) | **1.00** | 21 | 562,674 / 10,471 |
+| `plonky3-vulnerable` | RVB-excluded — BabyBear `monty_reduce` | `gpt-6.1-sol` (`high`) | **1.00** | 10 | 78,958 / 4,180 |
+| `plonky3-safe` | RVB-excluded — BabyBear `monty_reduce` | `gpt-6.1-sol` (`high`) | **0.25** | 25 | 528,461 / 8,735 |
 
 - The historical GLM submission scored 0.00 on v1. Replaying its unchanged
   artifacts under v2 JSON grading produced 0.60; that replay remains in
@@ -249,13 +283,17 @@ task/                           shared task kernel & authorization-vulnerable so
 problems/settlement/            Level 0 isolated settlement-{vulnerable,safe} sources & solutions
 problems/settlement-modular/    Level 1 modular settlement-modular-{vulnerable,safe} sources & solutions
 problems/settlement-engine/     Level 2 noisy crate settlement-engine-{vulnerable,safe} sources & solutions
-scripts/make-family.py          generates all 4 symmetric task pairs (8 Harbor tasks)
+problems/goldilocks/            RVB-excluded Goldilocks reduce_128 goldilocks-{vulnerable,safe} sources & solutions
+problems/whirlpool/             RVB-excluded Orca Whirlpool U128Muldiv whirlpool-{vulnerable,safe} sources & solutions
+problems/plonky3/               RVB-excluded Plonky3 BabyBear monty_reduce plonky3-{vulnerable,safe} sources & solutions
+scripts/make-family.py          generates all 7 symmetric task pairs (14 Harbor tasks)
 scripts/references/             authorization-safe reference proof
-scripts/selftest.py             adversarial regression suite covering all 4 task pairs
+scripts/selftest.py             adversarial regression suite covering all 7 task pairs
 scripts/harbor-smoke.py         Harbor E2E check of reference task pairs
 evidence/v3/                    current-version validation; other evidence/ entries are v1/v2
 evidence/v3/glm-5.3-flash       complete GLM 5.3 Flash v3 Harbor runs and traces
-evidence/v3/claude-opus-5-5     complete Claude Opus 5.5 v3 Harbor runs and traces across settlement*
-evidence/v3/gpt-6.1-sol-high    complete GPT 6.1 Sol (high) v3 Harbor runs and traces across settlement*
+evidence/v3/claude-opus-5-5     complete Claude Opus 5.5 v3 Harbor runs and traces (12 tasks)
+evidence/v3/gpt-6.1-sol-high    complete GPT 6.1 Sol (high) v3 Harbor runs and traces (12 tasks)
 ```
+
 

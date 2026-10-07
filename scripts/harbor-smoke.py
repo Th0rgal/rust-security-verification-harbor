@@ -10,7 +10,7 @@ import tempfile
 import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
-PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine')
+PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3')
 p=argparse.ArgumentParser()
 p.add_argument('--harbor',default='harbor')
 p.add_argument('--problem',choices=('all',)+PROBLEMS,default='all')

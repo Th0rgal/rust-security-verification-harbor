@@ -1,0 +1,1509 @@
+[?2004hroot@200a1e56d231:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@200a1e56d231:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@200a1e56d231:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod field {
+    pub const GOLDILOCKS_MODULUS: u64 = 0xFFFF_FFFF_0000_0001u64;
+    pub const GOLDILOCKS_EPSILON: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TranscriptLimbs {
+        pub low: u64,
+        pub mid: u64,
+        pub high: u64,
+    }
+
+    #[inline]
+    pub fn split_transcript(amount: u64, fee: u64) -> TranscriptLimbs {
+        TranscriptLimbs {
+            low: amount,
+            mid: fee & GOLDILOCKS_EPSILON,
+            high: fee >> LIMB_SHIFT,
+        }
+    }
+
+    /// Fold the top 32-bit limb `high * 2^96` into `low` using `2^96 == -1 (mod P)`.
+    #[inline]
+    pub fn fold_high_limb(low: u64, high: u64) -> u64 {
+        let (low2, borrow) = low.overflowing_sub(high);
+        if borrow {
+            low2.wrapping_add(GOLDILOCKS_MODULUS)
+        } else {
+            low2
+        }
+    }
+
+    /// Fold the middle 32-bit limb `mid * 2^64` using `2^64 == 2^32 - 1 (mod P)`.
+    #[inline]
+    pub fn fold_mid_limb(low2: u64, mid: u64) -> u64 {
+        let product: u64 = mid * GOLDILOCKS_EPSILON;
+        let (sum1, carry1) = low2.overflowing_add(product);
+        if carry1 {
+            sum1.wrapping_add(GOLDILOCKS_EPSILON)
+        } else {
+            sum1
+        }
+    }
+
+    #[inline]
+    pub fn canonicalize(folded: u64) -> u64 {
+        if folded >= GOLDILOCKS_MODULUS {
+            folded - GOLDILOCKS_MODULUS
+        } else {
+            folded
+        }
+    }
+
+    /// Reduce the 128-bit integer `amount + fee * 2^64` modulo the Goldilocks
+    /// prime `P = 2^64 - 2^32 + 1 = 18446744069414584321` in pure `u64`.
+    #[inline]
+    pub fn reduce_128(amount: u64, fee: u64) -> u64 {
+        let limbs: TranscriptLimbs = split_transcript(amount, fee);
+        let low2: u64 = fold_high_limb(limbs.low, limbs.high);
+        let folded: u64 = fold_mid_limb(low2, limbs.mid);
+        canonicalize(folded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::field;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GoldilocksQuote {
+        pub principal_share: u64,
+        pub field_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<GoldilocksQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let field_surcharge: u64 = field::reduce_128(amount, fee);
+        let total_debit: u64 = principal_share.checked_add(field_surcharge)?;
+        Some(GoldilocksQuote {
+            principal_share,
+            field_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: GoldilocksQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Goldilocks rollup settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2^64 - 2^32 + 1 = 18446744069414584321` (Goldilocks prime)
+/// - `principal_share = floor(amount / 2)`
+/// - `field_surcharge = (amount + fee * 2^64) mod P`
+/// - `total_debit = principal_share + field_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::GoldilocksQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 100, fee = 1:
+        // principal_share = 50
+        // field_surcharge = (100 + 2^64) mod P = 100 + (2^32 - 1) = 4294967395
+        // total_debit = 4294967445
+        assert_eq!(
+            authorize(4_294_967_445, 100, 1),
+            Some(Authorization {
+                total_debit: 4_294_967_445
+            })
+        );
+        assert_eq!(authorize(4_294_967_444, 100, 1), None);
+    }
+
+    #[test]
+    fn canonicalizes_values_above_modulus() {
+        // amount = P + 10 = 18446744069414584331, fee = 0:
+        // principal_share = 9223372034707292165
+        // field_surcharge = 10
+        assert_eq!(
+            authorize(9_223_372_034_707_292_175, 18_446_744_069_414_584_331, 0),
+            Some(Authorization {
+                total_debit: 9_223_372_034_707_292_175
+            })
+        );
+    }
+}
+[?2004hroot@200a1e56d231:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def goldilocksModulus : UInt64 := 18446744069414584321
+def goldilocksEpsilon : UInt64 := 4294967295
+def limbBase : UInt64 := 4294967296
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure TranscriptLimbs where
+  low : UInt64
+  mid : UInt64
+  high : UInt64
+
+def splitTranscript (amount fee : UInt64) : TranscriptLimbs :=
+  { low := amount, mid := fee % limbBase, high := fee / limbBase }
+
+def foldHighLimb (low high : UInt64) : UInt64 :=
+  let low2 := low - high
+  if low < high then
+    goldilocksModulus + low2
+  else
+    low2
+
+def foldMidLimb (low2 mid : UInt64) : UInt64 :=
+  let product := goldilocksEpsilon * mid
+  let sum1 := low2 + product
+  if sum1 < low2 then
+    goldilocksEpsilon + sum1
+  else
+    sum1
+
+def canonicalize (folded : UInt64) : UInt64 :=
+  if goldilocksModulus ≤ folded then
+    folded - goldilocksModulus
+  else
+    folded
+
+def reduce128 (amount fee : UInt64) : UInt64 :=
+  let limbs := splitTranscript amount fee
+  let low2 := foldHighLimb limbs.low limbs.high
+  let folded := foldMidLimb low2 limbs.mid
+  canonicalize folded
+
+structure GoldilocksQuote where
+  principalShare : UInt64
+  fieldSurcharge : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option GoldilocksQuote :=
+  let principalShare := amount / principalDivisor
+  let fieldSurcharge := reduce128 amount fee
+  if fieldSurcharge ≤ u64Max - principalShare then
+    some {
+      principalShare := principalShare,
+      fieldSurcharge := fieldSurcharge,
+      totalDebit := principalShare + fieldSurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : GoldilocksQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@200a1e56d231:/workspace# cat /workspace/lean/check.py; ls -la /workspace/lean; ls -la /workspace/submission; cat /workspace/challenge/Cargo.toml
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+total 196
+drwxr-xr-x 1 root root   4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2761 Oct  7 06:59 SecurityChallenge.lean
+-rw-r--r-- 1 root root 175432 Oct  7 07:02 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  6 11:24 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+total 24
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34msrc[0m
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@200a1e56d231:/workspace# cat /workspace/lean/SecurityChallenge.lean; cat /workspace/submission/{Spec,Audit,Proof}.lean; cat /workspace/lean/Signature.lean; ls -l /workspace/submission/src; which lean; lean --version
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def goldilocksModulus : UInt64 := 18446744069414584321
+def goldilocksEpsilon : UInt64 := 4294967295
+def limbBase : UInt64 := 4294967296
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure TranscriptLimbs where
+  low : UInt64
+  mid : UInt64
+  high : UInt64
+
+def splitTranscript (amount fee : UInt64) : TranscriptLimbs :=
+  { low := amount, mid := fee % limbBase, high := fee / limbBase }
+
+def foldHighLimb (low high : UInt64) : UInt64 :=
+  let low2 := low - high
+  if low < high then
+    goldilocksModulus + low2
+  else
+    low2
+
+def foldMidLimb (low2 mid : UInt64) : UInt64 :=
+  let product := goldilocksEpsilon * mid
+  let sum1 := low2 + product
+  if sum1 < low2 then
+    goldilocksEpsilon + sum1
+  else
+    sum1
+
+def canonicalize (folded : UInt64) : UInt64 :=
+  if goldilocksModulus ≤ folded then
+    folded - goldilocksModulus
+  else
+    folded
+
+def reduce128 (amount fee : UInt64) : UInt64 :=
+  let limbs := splitTranscript amount fee
+  let low2 := foldHighLimb limbs.low limbs.high
+  let folded := foldMidLimb low2 limbs.mid
+  canonicalize folded
+
+structure GoldilocksQuote where
+  principalShare : UInt64
+  fieldSurcharge : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option GoldilocksQuote :=
+  let principalShare := amount / principalDivisor
+  let fieldSurcharge := reduce128 amount fee
+  if fieldSurcharge ≤ u64Max - principalShare then
+    some {
+      principalShare := principalShare,
+      fieldSurcharge := fieldSurcharge,
+      totalDebit := principalShare + fieldSurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : GoldilocksQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+total 0
+/opt/lean/bin/lean
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[?2004hroot@200a1e56d231:/workspace# ls /opt/rvb-deps/packages; grep -nE 'theorem|@[[]simp[]]' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -100; ls /opt/lean/src/lean/Init/Data/UInt; ls /opt/rvb-deps/packages/mathlib/Mathlib/Data/Nat
+[?2004l[0m[01;34mCli[0m  [01;34mLeanSearchClient[0m  [01;34mQq[0m  [01;34maeneas[0m  [01;34maesop[0m  [01;34mbatteries[0m  [01;34mhax[0m  [01;34mimportGraph[0m  [01;34mmathlib[0m  [01;34mplausible[0m  [01;34mproofwidgets[0m
+30:macro "declare_uint_theorems" typeName:ident bits:term:arg : command => do
+34:  theorem zero_def : (0 : $typeName) = ⟨0⟩ := (rfl)
+35:  theorem one_def : (1 : $typeName) = ⟨1⟩ := (rfl)
+36:  theorem sub_def (a b : $typeName) : a - b = ⟨a.toBitVec - b.toBitVec⟩ := (rfl)
+37:  theorem mul_def (a b : $typeName) : a * b = ⟨a.toBitVec * b.toBitVec⟩ := (rfl)
+38:  theorem mod_def (a b : $typeName) : a % b = ⟨a.toBitVec % b.toBitVec⟩ := (rfl)
+39:  theorem add_def (a b : $typeName) : a + b = ⟨a.toBitVec + b.toBitVec⟩ := (rfl)
+41:  @[simp] theorem toNat_ofBitVec : (ofBitVec a).toNat = a.toNat := (rfl)
+43:  @[simp] theorem toNat_ofNat' {n : Nat} : (ofNat n).toNat = n % 2 ^ $bits := BitVec.toNat_ofNat ..
+46:  theorem toNat_ofNat {n : Nat} : toNat (no_index (OfNat.ofNat n)) = n % 2 ^ $bits := toNat_ofNat'
+48:  @[simp] theorem toNat_ofNatLT {n : Nat} {h : n < size} : (ofNatLT n h).toNat = n := BitVec.toNat_ofNatLT ..
+50:  @[simp] theorem toFin_val (x : $typeName) : x.toFin.val = x.toNat := (rfl)
+52:  @[simp] theorem toNat_toBitVec (x : $typeName) : x.toBitVec.toNat = x.toNat := (rfl)
+53:  @[simp] theorem toFin_toBitVec (x : $typeName) : x.toBitVec.toFin = x.toFin := (rfl)
+55:  @[simp] theorem ofBitVec_toBitVec : ∀ (a : $typeName), ofBitVec a.toBitVec = a
+58:  theorem toBitVec_ofNat' (n : Nat) : (ofNat n).toBitVec = BitVec.ofNat _ n := (rfl)
+60:  theorem toNat_ofNat_of_lt' {n : Nat} (h : n < size) : (ofNat n).toNat = n := by
+62:  theorem toNat_ofNat_of_lt {n : Nat} (h : n < size) : toNat (OfNat.ofNat n) = n :=
+65:  @[int_toBitVec] theorem le_iff_toBitVec_le {a b : $typeName} : a ≤ b ↔ a.toBitVec ≤ b.toBitVec := .rfl
+67:  @[int_toBitVec] theorem lt_iff_toBitVec_lt {a b : $typeName} : a < b ↔ a.toBitVec < b.toBitVec := .rfl
+69:  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+71:  theorem lt_iff_toNat_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+73:  @[simp] protected theorem not_le {a b : $typeName} : ¬ a ≤ b ↔ b < a := by
+76:  @[simp] protected theorem not_lt {a b : $typeName} : ¬ a < b ↔ b ≤ a := by
+79:  @[simp] protected theorem le_refl (a : $typeName) : a ≤ a := by simp [le_iff_toBitVec_le]
+82:  protected theorem le_rfl {a : $typeName} : a ≤ a := le_refl _
+84:  @[simp] protected theorem lt_irrefl (a : $typeName) : ¬ a < a := by simp
+86:  protected theorem le_trans {a b c : $typeName} : a ≤ b → b ≤ c → a ≤ c := BitVec.le_trans
+88:  protected theorem lt_trans {a b c : $typeName} : a < b → b < c → a < c := BitVec.lt_trans
+90:  protected theorem le_total (a b : $typeName) : a ≤ b ∨ b ≤ a := BitVec.le_total ..
+92:  protected theorem lt_asymm {a b : $typeName} : a < b → ¬ b < a := BitVec.lt_asymm
+94:  protected theorem toBitVec_eq_of_eq {a b : $typeName} (h : a = b) : a.toBitVec = b.toBitVec := h ▸ rfl
+96:  protected theorem eq_of_toBitVec_eq {a b : $typeName} (h : a.toBitVec = b.toBitVec) : a = b := by
+100:  protected theorem toBitVec_inj {a b : $typeName} : a.toBitVec = b.toBitVec ↔ a = b :=
+105:  protected theorem eq_iff_toBitVec_eq {a b : $typeName} : a = b ↔ a.toBitVec = b.toBitVec :=
+109:  protected theorem eq_of_toFin_eq {a b : $typeName} (h : a.toFin = b.toFin) : a = b := by
+114:  protected theorem toFin_inj {a b : $typeName} : a.toFin = b.toFin ↔ a = b :=
+118:  protected theorem toBitVec_ne_of_ne {a b : $typeName} (h : a ≠ b) : a.toBitVec ≠ b.toBitVec :=
+122:  protected theorem ne_of_toBitVec_ne {a b : $typeName} (h : a.toBitVec ≠ b.toBitVec) : a ≠ b :=
+127:  protected theorem ne_iff_toBitVec_ne {a b : $typeName} : a ≠ b ↔ a.toBitVec ≠ b.toBitVec :=
+131:  protected theorem ne_of_lt {a b : $typeName} (h : a < b) : a ≠ b := by
+136:  @[simp] protected theorem toNat_zero : (0 : $typeName).toNat = 0 := Nat.zero_mod _
+138:  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+140:  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+142:  @[simp] protected theorem toNat_mul (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.toNat_mul  ..
+144:  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+146:  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+148:  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+150:  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+153:  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+162:  protected theorem mod_lt (a : $typeName) {b : $typeName} : 0 < b → a % b < b := by
+166:  protected theorem toNat.inj : ∀ {a b : $typeName}, a.toNat = b.toNat → a = b
+169:  protected theorem toNat_inj : ∀ {a b : $typeName}, a.toNat = b.toNat ↔ a = b :=
+173:  protected theorem le_antisymm_iff {a b : $typeName} : a = b ↔ a ≤ b ∧ b ≤ a :=
+177:  protected theorem le_antisymm {a b : $typeName} (h₁ : a ≤ b) (h₂ : b ≤ a) : a = b :=
+193:  @[simp] protected theorem ofNat_one : ofNat 1 = 1 := (rfl)
+195:  @[simp] protected theorem ofNat_toNat {x : $typeName} : ofNat x.toNat = x := by
+199:  @[simp]
+200:  theorem toFin_ofNat (n : Nat) : toFin (no_index (OfNat.ofNat n)) = OfNat.ofNat n := (rfl)
+203:  theorem toBitVec_ofNat (n : Nat) : toBitVec (no_index (OfNat.ofNat n)) = BitVec.ofNat _ n := (rfl)
+205:  @[simp]
+206:  theorem ofBitVec_ofNat (n : Nat) : ofBitVec (BitVec.ofNat _ n) = OfNat.ofNat n := (rfl)
+208:  @[simp, int_toBitVec] protected theorem toBitVec_add {a b : $typeName} : (a + b).toBitVec = a.toBitVec + b.toBitVec := (rfl)
+209:  @[simp, int_toBitVec] protected theorem toBitVec_sub {a b : $typeName} : (a - b).toBitVec = a.toBitVec - b.toBitVec := (rfl)
+210:  @[simp, int_toBitVec] protected theorem toBitVec_mul {a b : $typeName} : (a * b).toBitVec = a.toBitVec * b.toBitVec := (rfl)
+211:  @[simp, int_toBitVec] protected theorem toBitVec_div {a b : $typeName} : (a / b).toBitVec = a.toBitVec / b.toBitVec := (rfl)
+212:  @[simp, int_toBitVec] protected theorem toBitVec_mod {a b : $typeName} : (a % b).toBitVec = a.toBitVec % b.toBitVec := (rfl)
+213:  @[simp, int_toBitVec] protected theorem toBitVec_neg {a : $typeName} : (-a).toBitVec = -a.toBitVec := (rfl)
+219:        `(@[simp] theorem toNat_toUInt8 (x : $typeName) : x.toUInt8.toNat = x.toNat % 2 ^ 8 := (rfl))
+222:        `(@[simp] theorem toNat_toUInt16 (x : $typeName) : x.toUInt16.toNat = x.toNat := (rfl))
+225:        `(@[simp] theorem toNat_toUInt16 (x : $typeName) : x.toUInt16.toNat = x.toNat % 2 ^ 16 := (rfl))
+228:        `(@[simp] theorem toNat_toUInt32 (x : $typeName) : x.toUInt32.toNat = x.toNat := (rfl))
+231:        `(@[simp] theorem toNat_toUInt32 (x : $typeName) : x.toUInt32.toNat = x.toNat % 2 ^ 32 := (rfl))
+234:        `(@[simp] theorem toNat_toUSize (x : $typeName) : x.toUSize.toNat = x.toNat := (rfl))
+237:        `(@[simp] theorem toNat_toUSize (x : $typeName) : x.toUSize.toNat = x.toNat % 2 ^ System.Platform.numBits := (rfl))
+240:        `(@[simp] theorem toNat_toUInt64 (x : $typeName) : x.toUInt64.toNat = x.toNat := (rfl))
+244:declare_uint_theorems UInt8 8
+245:declare_uint_theorems UInt16 16
+246:declare_uint_theorems UInt32 32
+247:declare_uint_theorems UInt64 64
+248:declare_uint_theorems USize System.Platform.numBits
+250:@[simp] theorem USize.toNat_ofNat32 {n : Nat} {h : n < 4294967296} : (ofNat32 n h).toNat = n := (rfl)
+252:@[simp] theorem USize.toNat_toUInt8 (x : USize) : x.toUInt8.toNat = x.toNat % 2 ^ 8 := (rfl)
+253:@[simp] theorem USize.toNat_toUInt16 (x : USize) : x.toUInt16.toNat = x.toNat % 2 ^ 16 := (rfl)
+254:@[simp] theorem USize.toNat_toUInt32 (x : USize) : x.toUInt32.toNat = x.toNat % 2 ^ 32 := (rfl)
+255:@[simp] theorem USize.toNat_toUInt64 (x : USize) : x.toUInt64.toNat = x.toNat := (rfl)
+257:theorem USize.toNat_ofNat_of_lt_32 {n : Nat} (h : n < 4294967296) : toNat (ofNat n) = n :=
+260:theorem UInt8.ofNat_mod_size : ofNat (x % 2 ^ 8) = ofNat x := by
+262:theorem UInt16.ofNat_mod_size : ofNat (x % 2 ^ 16) = ofNat x := by
+264:theorem UInt32.ofNat_mod_size : ofNat (x % 2 ^ 32) = ofNat x := by
+266:theorem UInt64.ofNat_mod_size : ofNat (x % 2 ^ 64) = ofNat x := by
+268:theorem USize.ofNat_mod_size : ofNat (x % 2 ^ System.Platform.numBits) = ofNat x := by
+271:theorem UInt8.ofNat_size : ofNat size = 0 := by decide
+272:theorem UInt16.ofNat_size : ofNat size = 0 := by decide
+273:theorem UInt32.ofNat_size : ofNat size = 0 := by decide
+274:theorem UInt64.ofNat_size : ofNat size = 0 := by decide
+275:theorem USize.ofNat_size : ofNat size = 0 := by
+278:theorem UInt8.lt_ofNat_iff {n : UInt8} {m : Nat} (h : m < size) : n < ofNat m ↔ n.toNat < m := by
+280:theorem UInt8.ofNat_lt_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+282:theorem UInt8.le_ofNat_iff {n : UInt8} {m : Nat} (h : m < size) : n ≤ ofNat m ↔ n.toNat ≤ m := by
+Basic.lean  BasicAux.lean  Bitwise.lean  Lemmas.lean  Log2.lean
+Basic.lean       [0m[01;34mCast[0m                   Dist.lean        [01;34mFib[0m                  Lattice.lean       Notation.lean  Pairing.lean   Size.lean        Upto.lean
+BinaryRec.lean   ChineseRemainder.lean  EvenOddRec.lean  Find.lean            Log.lean           Nth.lean       Periodic.lean  Sqrt.lean        WithBot.lean
+BitIndices.lean  [01;34mChoose[0m                 [01;34mFactorial[0m        [01;34mGCD[0m                  MaxPowDiv.lean     [01;34mNthRoot[0m        [01;34mPrime[0m          Squarefree.lean
+Bits.lean        Count.lean             [01;34mFactorization[0m    Hyperoperation.lean  ModEq.lean         [01;34mOrder[0m          PrimeFin.lean  SuccPred.lean
+Bitwise.lean     [01;34mDigits[0m                 Factors.lean     Init.lean            Multiplicity.lean  PSub.lean      Set.lean       Totient.lean
+[?2004hroot@200a1e56d231:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Mathlib.Tactic
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact settlement debit, without machine-word truncation. -/
+[?2004l[?2004h> def exactDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 +
+[?2004l[?2004h>     (amount.toNat + fee.toNat * 18446744073709551616) % 18446744069414584321
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := exactDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     exactDebit amount fee ≤ balance.toNat ∧ totalDebit.toNat = exactDebit amount fee
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem reduction_correct (a f : UInt64) :
+[?2004l[?2004h>     (reduce128 a f).toNat =
+[?2004l[?2004h>       (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l[?2004h>   unfold reduce128 splitTranscript foldHighLimb foldMidLimb canonicalize
+[?2004l[?2004h>   simp only [UInt64.le_iff_toNat_le, UInt64.lt_iff_toNat_lt,
+[?2004l[?2004h>     UInt64.toNat_add, UInt64.toNat_sub, UInt64.toNat_mul,
+[?2004l[?2004h>     UInt64.toNat_mod, UInt64.toNat_div]
+[?2004l[?2004h>   simp only [goldilocksModulus, goldilocksEpsilon, limbBase, UInt64.toNat_ofNat]
+[?2004l[?2004h>   norm_num at *
+[?2004l[?2004h>   split_ifs <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   unfold AuditClaim verdict
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · sorry
+[?2004l[?2004h>   · sorry
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:7:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  h ≥ 18446744069414584321
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≤ -1
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≤ -1
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+  b + 18446744073709551616*c - 18446744069414584321*i - j ≥ 1
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(18446744069414584321 + (a - f / 4294967296)).toNat
+ g := ↑((18446744069414584321 + (a - f / 4294967296)).toNat + 4294967295 * (f.toNat % 4294967296)) /
+  18446744073709551616
+ h := ↑(4294967295 + (18446744069414584321 + (a - f / 4294967296) + 4294967295 * (f % 4294967296))).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+ j := ↑(4294967295 + (18446744069414584321 + (a - f / 4294967296) + 4294967295 * (f % 4294967296)) -
+      18446744069414584321).toNat
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ h ≤ 18446744069414584320
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≤ -1
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≤ -1
+  b + 18446744073709551616*c - h - 18446744069414584321*i ≥ 1
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(18446744069414584321 + (a - f / 4294967296)).toNat
+ g := ↑((18446744069414584321 + (a - f / 4294967296)).toNat + 4294967295 * (f.toNat % 4294967296)) /
+  18446744073709551616
+ h := ↑(4294967295 + (18446744069414584321 + (a - f / 4294967296) + 4294967295 * (f % 4294967296))).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  h ≥ 18446744069414584321
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≥ 0
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≤ -1
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+  b + 18446744073709551616*c - 18446744069414584321*i - j ≥ 1
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(18446744069414584321 + (a - f / 4294967296)).toNat
+ g := ↑((18446744069414584321 + (a - f / 4294967296)).toNat + 4294967295 * (f.toNat % 4294967296)) /
+  18446744073709551616
+ h := ↑(18446744069414584321 + (a - f / 4294967296) + 4294967295 * (f % 4294967296)).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+ j := ↑(18446744069414584321 + (a - f / 4294967296) + 4294967295 * (f % 4294967296) - 18446744069414584321).toNat
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ h ≤ 18446744069414584320
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≥ 0
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≤ -1
+  b + 18446744073709551616*c - h - 18446744069414584321*i ≥ 1
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(18446744069414584321 + (a - f / 4294967296)).toNat
+ g := ↑((18446744069414584321 + (a - f / 4294967296)).toNat + 4294967295 * (f.toNat % 4294967296)) /
+  18446744073709551616
+ h := ↑(18446744069414584321 + (a - f / 4294967296) + 4294967295 * (f % 4294967296)).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  h ≥ 18446744069414584321
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≤ -1
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≥ 0
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+  b + 18446744073709551616*c - 18446744069414584321*i - j ≥ 1
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(a - f / 4294967296).toNat
+ g := ↑((a - f / 4294967296).toNat + 4294967295 * (f.toNat % 4294967296)) / 18446744073709551616
+ h := ↑(4294967295 + (a - f / 4294967296 + 4294967295 * (f % 4294967296))).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+ j := ↑(4294967295 + (a - f / 4294967296 + 4294967295 * (f % 4294967296)) - 18446744069414584321).toNat
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ h ≤ 18446744069414584320
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≤ -1
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≥ 0
+  b + 18446744073709551616*c - h - 18446744069414584321*i ≥ 1
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(a - f / 4294967296).toNat
+ g := ↑((a - f / 4294967296).toNat + 4294967295 * (f.toNat % 4294967296)) / 18446744073709551616
+ h := ↑(4294967295 + (a - f / 4294967296 + 4294967295 * (f % 4294967296))).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  h ≥ 18446744069414584321
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≥ 0
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≥ 0
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+  b + 18446744073709551616*c - 18446744069414584321*i - j ≥ 1
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(a - f / 4294967296).toNat
+ g := ↑((a - f / 4294967296).toNat + 4294967295 * (f.toNat % 4294967296)) / 18446744073709551616
+ h := ↑(a - f / 4294967296 + 4294967295 * (f % 4294967296)).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+ j := ↑(a - f / 4294967296 + 4294967295 * (f % 4294967296) - 18446744069414584321).toNat
+CandidateSpec.lean:28:16: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ h ≤ 18446744069414584320
+  e ≥ 0
+  0 ≤ c ≤ 18446744073709551615
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967295*c - 18446744069414584320*d - 18446744073709551616*g ≥ 0
+  0 ≤ 4294967295*c - 18446744069414584320*d + e - 18446744073709551616*g ≤ 18446744073709551615
+  0 ≤ b ≤ 18446744073709551615
+  b - d ≥ 0
+  b + 18446744073709551616*c - h - 18446744069414584321*i ≥ 1
+  0 ≤ b + 18446744073709551616*c - 18446744069414584321*i ≤ 18446744069414584320
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑f.toNat / 4294967296
+ e := ↑(a - f / 4294967296).toNat
+ g := ↑((a - f / 4294967296).toNat + 4294967295 * (f.toNat % 4294967296)) / 18446744073709551616
+ h := ↑(a - f / 4294967296 + 4294967295 * (f % 4294967296)).toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+CandidateSpec.lean:24:22: warning: This simp argument is unused:
+  UInt64.toNat_sub
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.le_iff_toNat_le, UInt64.lt_iff_toNat_lt,
+  ̵  ̵ ̵ ̵UInt64.toNat_add, UInt64.toNat_s̵u̵b̵,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵mul,
+      UInt64.toNat_mod, UInt64.toNat_div]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean'
+[?2004l[?2004h> s=open(p).read(); s=s[:s.index(' theorem reduction_correct')].replace('/--','/-'); open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace# cat >> /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> private theorem high_correct (a h : UInt64) (hh : h.toNat < 4294967296) :
+[?2004l[?2004h>     (foldHighLimb a h).toNat =
+[?2004l[?2004h>       if a.toNat < h.toNat then a.toNat + 18446744069414584321 - h.toNat
+[?2004l[?2004h>       else a.toNat - h.toNat := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   unfold foldHighLimb
+[?2004l[?2004h>   split <;> rename_i hc
+[?2004l[?2004h>   · simp only [UInt64.lt_iff_toNat_lt] at hc
+[?2004l[?2004h>     simp only [UInt64.toNat_add, UInt64.toNat_sub, goldilocksModulus,
+[?2004l[?2004h>       UInt64.toNat_ofNat]
+[?2004l[?2004h>     norm_num
+[?2004l[?2004h>     rw [if_pos hc]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · have hn : ¬ a.toNat < h.toNat := hc
+[?2004l[?2004h>     rw [if_neg hn, UInt64.toNat_sub_of_le a h (by simpa using hn)]
+[?2004l[?2004h> 
+[?2004l[?2004h> private theorem mid_correct (a m : UInt64) (hm : m.toNat < 4294967296) :
+[?2004l[?2004h>     (foldMidLimb a m).toNat =
+[?2004l[?2004h>       if a.toNat + 4294967295 * m.toNat < 18446744073709551616
+[?2004l[?2004h>       then a.toNat + 4294967295 * m.toNat
+[?2004l[?2004h>       else a.toNat + 4294967295 * m.toNat - 18446744069414584321 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have hp : 4294967295 * m.toNat < 18446744073709551616 := by omega
+[?2004l[?2004h>   unfold foldMidLimb
+[?2004l[?2004h>   simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_add, UInt64.toNat_mul,
+[?2004l[?2004h>     goldilocksEpsilon, UInt64.toNat_ofNat]
+[?2004l[?2004h>   norm_num
+[?2004l[?2004h>   rw [Nat.mod_eq_of_lt hp]
+[?2004l[?2004h>   split_ifs <;> simp only [UInt64.toNat_add, UInt64.toNat_mul,
+[?2004l[?2004h>     goldilocksEpsilon, UInt64.toNat_ofNat] <;> norm_num <;> omega
+[?2004l[?2004h> 
+[?2004l[?2004h> private theorem canonical_correct (a : UInt64) :
+[?2004l[?2004h>     (canonicalize a).toNat = a.toNat % 18446744069414584321 := by
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   unfold canonicalize
+[?2004l[?2004h>   split <;> rename_i hc
+[?2004l[?2004h>   · rw [UInt64.toNat_sub_of_le _ _ hc]
+[?2004l[?2004h>     simp only [goldilocksModulus, UInt64.toNat_ofNat] at *
+[?2004l[?2004h>     norm_num at *
+[?2004l[?2004h>     change 18446744069414584321 ≤ a.toNat at hc
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · change ¬18446744069414584321 ≤ a.toNat at hc
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:31:50: error: Type mismatch: After simplification, term
+  hn
+ has type
+  h.toNat ≤ a.toNat
+but is expected to have type
+  h ≤ a
+CandidateSpec.lean:44:6: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  4294967295 * m.toNat % 18446744073709551616
+in the target expression
+  (if (a.toNat + 4294967295 * m.toNat) % 18446744073709551616 < a.toNat then 4294967295 + (a + 4294967295 * m)
+      else a + 4294967295 * m).toNat =
+    if a.toNat + 4294967295 * m.toNat < 18446744073709551616 then a.toNat + 4294967295 * m.toNat
+    else a.toNat + 4294967295 * m.toNat - 18446744069414584321
+
+a m : UInt64
+hm : m.toNat < 4294967296
+ha : a.toNat < 2 ^ 64
+hp : 4294967295 * m.toNat < 18446744073709551616
+⊢ (if (a.toNat + 4294967295 * m.toNat) % 18446744073709551616 < a.toNat then 4294967295 + (a + 4294967295 * m)
+      else a + 4294967295 * m).toNat =
+    if a.toNat + 4294967295 * m.toNat < 18446744073709551616 then a.toNat + 4294967295 * m.toNat
+    else a.toNat + 4294967295 * m.toNat - 18446744069414584321
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean';s=open(p).read().replace('(by simpa using hn)', '(by rw [UInt64.le_iff_toNat_le]; omega)').replace('  rw [Nat.mod_eq_of_lt hp]\n','');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace# cat >> /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem reduction_correct (a f : UInt64) :
+[?2004l[?2004h>     (reduce128 a f).toNat =
+[?2004l[?2004h>       (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321 := by
+[?2004l[?2004h>   let h := f / limbBase
+[?2004l[?2004h>   let m := f % limbBase
+[?2004l[?2004h>   let l := foldHighLimb a h
+[?2004l[?2004h>   have hf := f.toNat_lt
+[?2004l[?2004h>   have hh : h.toNat < 4294967296 := by
+[?2004l[?2004h>     dsimp [h, limbBase]
+[?2004l[?2004h>     simp only [UInt64.toNat_div, UInt64.toNat_ofNat]
+[?2004l[?2004h>     norm_num
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   have hm : m.toNat < 4294967296 := by
+[?2004l[?2004h>     dsimp [m, limbBase]
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_ofNat]
+[?2004l[?2004h>     norm_num
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   have decomp : f.toNat = m.toNat + 4294967296 * h.toNat := by
+[?2004l[?2004h>     dsimp [m, h, limbBase]
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_div, UInt64.toNat_ofNat]
+[?2004l[?2004h>     norm_num
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   have hl := high_correct a h hh
+[?2004l[?2004h>   have identity :
+[?2004l[?2004h>       a.toNat + f.toNat * 18446744073709551616 + 18446744069414584321 =
+[?2004l[?2004h>       (l.toNat + 4294967295 * m.toNat) +
+[?2004l[?2004h>       (m.toNat + 4294967297 * h.toNat +
+[?2004l[?2004h>         (if a.toNat < h.toNat then 0 else 1)) * 18446744069414584321 := by
+[?2004l[?2004h>     change l.toNat = _ at hl
+[?2004l[?2004h>     split_ifs at hl ⊢ <;> omega
+[?2004l[?2004h>   have cong := congrArg (fun n : Nat => n % 18446744069414584321) identity
+[?2004l[?2004h>   simp only [Nat.add_mod, Nat.mul_mod] at cong
+[?2004l[?2004h>   norm_num at cong
+[?2004l[?2004h>   simp only [Nat.add_zero, Nat.mod_mod] at cong
+[?2004l[?2004h>   unfold reduce128 splitTranscript
+[?2004l[?2004h>   change (canonicalize (foldMidLimb l m)).toNat = _
+[?2004l[?2004h>   rw [canonical_correct, mid_correct l m hm]
+[?2004l[?2004h>   rw [cong]
+[?2004l[?2004h>   split_ifs <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:91:13: warning: Possibly looping simp theorem: `Nat.add_mod`
+
+Hint: You can disable a simp theorem from the default simp set by passing `- theoremName` to `simp`.
+CandidateSpec.lean:91:26: warning: Possibly looping simp theorem: `Nat.mul_mod`
+
+Hint: You can disable a simp theorem from the default simp set by passing `- theoremName` to `simp`.
+CandidateSpec.lean:91:2: error: Tactic `simp` failed with a nested error:
+maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace# grep -R -nE 'theorem (add_mod_right|add_mul_mod_self|mul_add_mod_self)|protected theorem (add_mod_right|add_mul_mod_self)' /opt/lean/src/lean/Init/Data/Nat /opt/rvb-deps/packages/mathlib/Mathlib/Data/Nat | head -30
+[?2004l/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:331:@[simp] theorem add_mod_right (x z : Nat) : (x + z) % z = x % z := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:337:@[simp] theorem add_mul_mod_self_left (x y z : Nat) : (x + y * z) % y = x % y := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:342:@[simp] theorem mul_add_mod_self_left (a b c : Nat) : (a * b + c) % a = c % a := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:345:@[simp] theorem add_mul_mod_self_right (x y z : Nat) : (x + y * z) % z = x % z := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:348:@[simp] theorem mul_add_mod_self_right (a b c : Nat) : (a * b + c) % b = c % b := by
+[?2004hroot@200a1e56d231:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean';s=open(p).read().replace('  simp only [Nat.add_mod, Nat.mul_mod] at cong\n  norm_num at cong\n  simp only [Nat.add_zero, Nat.mod_mod] at cong','  simp only [Nat.add_mod_right, Nat.add_mul_mod_self_right] at cong');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace# cat >> /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem authorization_correct (b a f t : UInt64) :
+[?2004l[?2004h>     challengeAuthorize b a f = some t ↔
+[?2004l[?2004h>       exactDebit a f ≤ b.toNat ∧ t.toNat = exactDebit a f := by
+[?2004l[?2004h>   have hb := b.toNat_lt
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have ht := t.toNat_lt
+[?2004l[?2004h>   have hs := (reduce128 a f).toNat_lt
+[?2004l[?2004h>   have hp : (a / principalDivisor).toNat = a.toNat / 2 := by
+[?2004l[?2004h>     simp [principalDivisor, UInt64.toNat_div, UInt64.toNat_ofNat]
+[?2004l[?2004h>   have hr := reduction_correct a f
+[?2004l[?2004h>   unfold challengeAuthorize buildQuote
+[?2004l[?2004h>   split <;> rename_i hc
+[?2004l[?2004h>   · have hsum : (a / principalDivisor + reduce128 a f).toNat = exactDebit a f := by
+[?2004l[?2004h>       rw [UInt64.toNat_add, hp, hr]
+[?2004l[?2004h>       unfold exactDebit
+[?2004l[?2004h>       have hc' := hc
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, UInt64.toNat_sub_of_le] at hc'
+[?2004l[?2004h>       · simp only [u64Max, UInt64.toNat_ofNat] at hc'
+[?2004l[?2004h>         norm_num at hc'
+[?2004l[?2004h>         rw [hp, hr] at hc'
+[?2004l[?2004h>         omega
+[?2004l[?2004h>       · rw [UInt64.le_iff_toNat_le, hp]
+[?2004l[?2004h>         change a.toNat / 2 ≤ 18446744073709551615
+[?2004l[?2004h>         omega
+[?2004l[?2004h>     simp only [verifyAffordability]
+[?2004l[?2004h>     split <;> rename_i hbal
+[?2004l[?2004h>     · simp only [Option.some.injEq, ← UInt64.toNat_inj]
+[?2004l[?2004h>       rw [hsum]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at hbal
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     · simp only [Option.none_ne_some, false_iff, not_and]
+[?2004l[?2004h>       rw [UInt64.le_iff_toNat_le, hsum] at hbal
+[?2004l[?2004h>       omega
+[?2004l[?2004h>   · simp only [Option.none_ne_some, false_iff, not_and]
+[?2004l[?2004h>     have hsub : (u64Max - a / principalDivisor).toNat =
+[?2004l[?2004h>         18446744073709551615 - a.toNat / 2 := by
+[?2004l[?2004h>       rw [UInt64.toNat_sub_of_le, hp]
+[?2004l[?2004h>       · rfl
+[?2004l[?2004h>       · rw [UInt64.le_iff_toNat_le, hp]
+[?2004l[?2004h>         change a.toNat / 2 ≤ 18446744073709551615
+[?2004l[?2004h>         omega
+[?2004l[?2004h>     rw [UInt64.le_iff_toNat_le, hsub, hr] at hc
+[?2004l[?2004h>     unfold exactDebit
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   unfold AuditClaim verdict
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     change (∃ t, challengeAuthorize b a f = some t) ↔ exactDebit a f ≤ b.toNat
+[?2004l[?2004h>     constructor
+[?2004l[?2004h>     · rintro ⟨t, ht⟩
+[?2004l[?2004h>       exact ((authorization_correct b a f t).mp ht).1
+[?2004l[?2004h>     · intro h
+[?2004l[?2004h>       have hb := b.toNat_lt
+[?2004l[?2004h>       have hd : exactDebit a f < 2 ^ 64 := by omega
+[?2004l[?2004h>       refine ⟨UInt64.ofNat (exactDebit a f), ?_⟩
+[?2004l[?2004h>       apply (authorization_correct b a f _).mpr
+[?2004l[?2004h>       exact ⟨h, UInt64.toNat_ofNat_of_lt' hd⟩
+[?2004l[?2004h>   · intro b a f t ht
+[?2004l[?2004h>     exact (authorization_correct b a f t).mp ht
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@200a1e56d231:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:114:10: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  ?m.98 ≤ ?m.99
+in the target expression
+  (have principalShare := a / principalDivisor;
+    have fieldSurcharge := reduce128 a f;
+    if fieldSurcharge ≤ u64Max - principalShare then
+      some
+        { principalShare := principalShare, fieldSurcharge := fieldSurcharge,
+          totalDebit := principalShare + fieldSurcharge }
+    else none) =
+    some quote✝
+
+b a f t : UInt64
+hb : b.toNat < 2 ^ 64
+ha : a.toNat < 2 ^ 64
+ht : t.toNat < 2 ^ 64
+hs : (reduce128 a f).toNat < 2 ^ 64
+hp : (a / principalDivisor).toNat = a.toNat / 2
+hr : (reduce128 a f).toNat = (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321
+x✝ : Option GoldilocksQuote
+quote✝ : GoldilocksQuote
+hc hc' :
+  (have principalShare := a / principalDivisor;
+    have fieldSurcharge := reduce128 a f;
+    if fieldSurcharge ≤ u64Max - principalShare then
+      some
+        { principalShare := principalShare, fieldSurcharge := fieldSurcharge,
+          totalDebit := principalShare + fieldSurcharge }
+    else none) =
+    some quote✝
+⊢ (a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321) % 2 ^ 64 =
+    a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321
+CandidateSpec.lean:125:10: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  (a / principalDivisor + reduce128 a f).toNat
+in the target expression
+  quote✝.totalDebit.toNat = t.toNat ↔ exactDebit a f ≤ b.toNat ∧ t.toNat = exactDebit a f
+
+case h_1.isTrue
+b a f t : UInt64
+hb : b.toNat < 2 ^ 64
+ha : a.toNat < 2 ^ 64
+ht : t.toNat < 2 ^ 64
+hs : (reduce128 a f).toNat < 2 ^ 64
+hp : (a / principalDivisor).toNat = a.toNat / 2
+hr : (reduce128 a f).toNat = (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321
+x✝ : Option GoldilocksQuote
+quote✝ : GoldilocksQuote
+hc :
+  (have principalShare := a / principalDivisor;
+    have fieldSurcharge := reduce128 a f;
+    if fieldSurcharge ≤ u64Max - principalShare then
+      some
+        { principalShare := principalShare, fieldSurcharge := fieldSurcharge,
+          totalDebit := principalShare + fieldSurcharge }
+    else none) =
+    some quote✝
+hsum : (a / principalDivisor + reduce128 a f).toNat = exactDebit a f
+hbal : quote✝.totalDebit ≤ b
+⊢ quote✝.totalDebit.toNat = t.toNat ↔ exactDebit a f ≤ b.toNat ∧ t.toNat = exactDebit a f
+CandidateSpec.lean:128:17: error(lean.unknownIdentifier): Unknown constant `Option.none_ne_some`
+CandidateSpec.lean:128:6: error: `simp` made no progress
+CandidateSpec.lean:131:15: error(lean.unknownIdentifier): Unknown constant `Option.none_ne_some`
+CandidateSpec.lean:131:4: error: `simp` made no progress
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean';s=open(p).read().replace('  unfold challengeAuthorize buildQuote\n  split <;> rename_i hc','  unfold challengeAuthorize buildQuote\n  dsimp only\n  split_ifs with hc\n  all_goals dsimp only').replace('simp only [Option.none_ne_some, false_iff, not_and]', 'simp only [reduceCtorEq, false_iff, not_and]');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:111:12: error: `dsimp` made no progress
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace# sed -i 's/all_goals dsimp only/all_goals try dsimp only/' /workspace/submission/Spec.lean
+[?2004l[?2004hroot@200a1e56d231:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:119:12: error: Tactic `rewrite` failed: Did not find an occurrence of the pattern
+  (a / principalDivisor).toNat
+in the target expression
+  (reduce128 a f).toNat ≤ 18446744073709551615 - a.toNat / principalDivisor.toNat
+
+b a f t : UInt64
+hb : b.toNat < 2 ^ 64
+ha : a.toNat < 2 ^ 64
+ht : t.toNat < 2 ^ 64
+hs : (reduce128 a f).toNat < 2 ^ 64
+hp : (a / principalDivisor).toNat = a.toNat / 2
+hr : (reduce128 a f).toNat = (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321
+hc : reduce128 a f ≤ u64Max - a / principalDivisor
+hc' : (reduce128 a f).toNat ≤ 18446744073709551615 - a.toNat / principalDivisor.toNat
+⊢ (a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321) % 2 ^ 64 =
+    a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321
+CandidateSpec.lean:133:15: warning: This simp argument is unused:
+  reduceCtorEq
+
+Hint: Omit it from the simp argument list.
+  simp only [r̵e̵d̵u̵c̵e̵C̵t̵o̵r̵E̵q̵,̵ ̵false_iff, not_and]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace# cd /workspace/challenge && cargo test
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+[1m[32m     Running[0m unittests src/lib.rs (target/debug/deps/settlement_gate-66f23bc290c8a00c)
+
+running 3 tests
+test tests::canonicalizes_values_above_modulus ... [32mok[m
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@200a1e56d231:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean';s=open(p).read().replace('simp only [u64Max, UInt64.toNat_ofNat] at hc\'', 'simp only [u64Max, principalDivisor, UInt64.toNat_ofNat] at hc\'').replace('rw [hp, hr] at hc\'', 'rw [hr] at hc\'');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:120:8: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  k ≤ 18446744073709551615
+  j ≥ 1
+  h ≥ 0
+  g ≥ 0
+  0 ≤ e ≤ 18446744073709551615
+  0 ≤ e - 2*g - 18446744073709551616*h + 18446744069414584321*i ≤ 1
+  0 ≤ e - 18446744073709551616*h + 18446744069414584321*i ≤ 18446744073709551615
+  0 ≤ e ≤ 18446744069414584320
+  e + k ≤ 18446744073709551615
+  0 ≤ e + g - 18446744073709551616*j ≤ 18446744073709551615
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ c ≤ 18446744073709551615
+where
+ c := ↑b.toNat
+ d := ↑t.toNat
+ e := ↑(reduce128 a f).toNat
+ g := ↑a.toNat / 2
+ h := ↑f.toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+ j := ↑(a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321) / 18446744073709551616
+ k := ↑a.toNat / ↑(UInt64.toNat 2)
+CandidateSpec.lean:133:15: warning: This simp argument is unused:
+  reduceCtorEq
+
+Hint: Omit it from the simp argument list.
+  simp only [r̵e̵d̵u̵c̵e̵C̵t̵o̵r̵E̵q̵,̵ ̵false_iff, not_and]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace/challenge# 
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# find /workspace/submission -type f -maxdepth 3 -print; grep -nE 'sorry|axiom|native_decide|unsafe|extern' /workspace/submission/*.lean || true; cat /workspace/submission/Proof.lean; cat /workspace/submission/Audit.lean
+[?2004lfind: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+by
+  unfold AuditClaim verdict
+  constructor
+  · intro b a f
+    change (∃ t, challengeAuthorize b a f = some t) ↔ exactDebit a f ≤ b.toNat
+    constructor
+    · rintro ⟨t, ht⟩
+      exact ((authorization_correct b a f t).mp ht).1
+    · intro h
+      have hb := b.toNat_lt
+      have hd : exactDebit a f < 2 ^ 64 := by omega
+      refine ⟨UInt64.ofNat (exactDebit a f), ?_⟩
+      apply (authorization_correct b a f _).mpr
+      exact ⟨h, UInt64.toNat_ofNat_of_lt' hd⟩
+  · intro b a f t ht
+    exact (authorization_correct b a f t).mp ht
+import SecurityChallenge
+open SecurityChallenge
+
+def verdict : AuditVerdict := .safe
+[?2004hroot@200a1e56d231:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean';s=open(p).read();s=s.replace("        simp only [u64Max, principalDivisor, UInt64.toNat_ofNat] at hc'\n        norm_num at hc'\n        rw [hr] at hc'", "        change (reduce128 a f).toNat ≤ 18446744073709551615 - a.toNat / 2 at hc'\n        rw [hr] at hc'");open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:120:8: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  k ≤ 18446744073709551615
+  j ≥ 1
+  h ≥ 0
+  g ≥ 0
+  0 ≤ e ≤ 18446744073709551615
+  0 ≤ e - 2*g - 18446744073709551616*h + 18446744069414584321*i ≤ 1
+  0 ≤ e - 18446744073709551616*h + 18446744069414584321*i ≤ 18446744073709551615
+  0 ≤ e ≤ 18446744069414584320
+  e + k ≤ 18446744073709551615
+  0 ≤ e + g - 18446744073709551616*j ≤ 18446744073709551615
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ c ≤ 18446744073709551615
+where
+ c := ↑b.toNat
+ d := ↑t.toNat
+ e := ↑(reduce128 a f).toNat
+ g := ↑a.toNat / 2
+ h := ↑f.toNat
+ i := ↑(a.toNat + f.toNat * 18446744073709551616) / 18446744069414584321
+ j := ↑(a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321) / 18446744073709551616
+ k := ↑a.toNat / ↑(UInt64.toNat 2)
+CandidateSpec.lean:133:15: warning: This simp argument is unused:
+  reduceCtorEq
+
+Hint: Omit it from the simp argument list.
+  simp only [r̵e̵d̵u̵c̵e̵C̵t̵o̵r̵E̵q̵,̵ ̵false_iff, not_and]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@200a1e56d231:/workspace/challenge# 
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# sed -n '1,180p' /workspace/submission/Spec.lean
+[?2004limport SecurityChallenge
+import Mathlib.Tactic
+open SecurityChallenge
+
+/- Exact settlement debit, without machine-word truncation. -/
+def exactDebit (amount fee : UInt64) : Nat :=
+  amount.toNat / 2 +
+    (amount.toNat + fee.toNat * 18446744073709551616) % 18446744069414584321
+
+def candidateSpec : AuthorizationSpec where
+  accepts balance amount fee := exactDebit amount fee ≤ balance.toNat
+  output balance amount fee totalDebit :=
+    exactDebit amount fee ≤ balance.toNat ∧ totalDebit.toNat = exactDebit amount fee
+
+private theorem high_correct (a h : UInt64) (hh : h.toNat < 4294967296) :
+    (foldHighLimb a h).toNat =
+      if a.toNat < h.toNat then a.toNat + 18446744069414584321 - h.toNat
+      else a.toNat - h.toNat := by
+  have ha := a.toNat_lt
+  unfold foldHighLimb
+  split <;> rename_i hc
+  · simp only [UInt64.lt_iff_toNat_lt] at hc
+    simp only [UInt64.toNat_add, UInt64.toNat_sub, goldilocksModulus,
+      UInt64.toNat_ofNat]
+    norm_num
+    rw [if_pos hc]
+    omega
+  · have hn : ¬ a.toNat < h.toNat := hc
+    rw [if_neg hn, UInt64.toNat_sub_of_le a h (by rw [UInt64.le_iff_toNat_le]; omega)]
+
+private theorem mid_correct (a m : UInt64) (hm : m.toNat < 4294967296) :
+    (foldMidLimb a m).toNat =
+      if a.toNat + 4294967295 * m.toNat < 18446744073709551616
+      then a.toNat + 4294967295 * m.toNat
+      else a.toNat + 4294967295 * m.toNat - 18446744069414584321 := by
+  have ha := a.toNat_lt
+  have hp : 4294967295 * m.toNat < 18446744073709551616 := by omega
+  unfold foldMidLimb
+  simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_add, UInt64.toNat_mul,
+    goldilocksEpsilon, UInt64.toNat_ofNat]
+  norm_num
+  split_ifs <;> simp only [UInt64.toNat_add, UInt64.toNat_mul,
+    goldilocksEpsilon, UInt64.toNat_ofNat] <;> norm_num <;> omega
+
+private theorem canonical_correct (a : UInt64) :
+    (canonicalize a).toNat = a.toNat % 18446744069414584321 := by
+  have ha := a.toNat_lt
+  unfold canonicalize
+  split <;> rename_i hc
+  · rw [UInt64.toNat_sub_of_le _ _ hc]
+    simp only [goldilocksModulus, UInt64.toNat_ofNat] at *
+    norm_num at *
+    change 18446744069414584321 ≤ a.toNat at hc
+    omega
+  · change ¬18446744069414584321 ≤ a.toNat at hc
+    omega
+
+theorem reduction_correct (a f : UInt64) :
+    (reduce128 a f).toNat =
+      (a.toNat + f.toNat * 18446744073709551616) % 18446744069414584321 := by
+  let h := f / limbBase
+  let m := f % limbBase
+  let l := foldHighLimb a h
+  have hf := f.toNat_lt
+  have hh : h.toNat < 4294967296 := by
+    dsimp [h, limbBase]
+    simp only [UInt64.toNat_div, UInt64.toNat_ofNat]
+    norm_num
+    omega
+  have hm : m.toNat < 4294967296 := by
+    dsimp [m, limbBase]
+    simp only [UInt64.toNat_mod, UInt64.toNat_ofNat]
+    norm_num
+    omega
+  have decomp : f.toNat = m.toNat + 4294967296 * h.toNat := by
+    dsimp [m, h, limbBase]
+    simp only [UInt64.toNat_mod, UInt64.toNat_div, UInt64.toNat_ofNat]
+    norm_num
+    omega
+  have hl := high_correct a h hh
+  have identity :
+      a.toNat + f.toNat * 18446744073709551616 + 18446744069414584321 =
+      (l.toNat + 4294967295 * m.toNat) +
+      (m.toNat + 4294967297 * h.toNat +
+        (if a.toNat < h.toNat then 0 else 1)) * 18446744069414584321 := by
+    change l.toNat = _ at hl
+    split_ifs at hl ⊢ <;> omega
+  have cong := congrArg (fun n : Nat => n % 18446744069414584321) identity
+  simp only [Nat.add_mod_right, Nat.add_mul_mod_self_right] at cong
+  unfold reduce128 splitTranscript
+  change (canonicalize (foldMidLimb l m)).toNat = _
+  rw [canonical_correct, mid_correct l m hm]
+  rw [cong]
+  split_ifs <;> omega
+
+theorem authorization_correct (b a f t : UInt64) :
+    challengeAuthorize b a f = some t ↔
+      exactDebit a f ≤ b.toNat ∧ t.toNat = exactDebit a f := by
+  have hb := b.toNat_lt
+  have ha := a.toNat_lt
+  have ht := t.toNat_lt
+  have hs := (reduce128 a f).toNat_lt
+  have hp : (a / principalDivisor).toNat = a.toNat / 2 := by
+    simp [principalDivisor, UInt64.toNat_div, UInt64.toNat_ofNat]
+  have hr := reduction_correct a f
+  unfold challengeAuthorize buildQuote
+  dsimp only
+  split_ifs with hc
+  all_goals try dsimp only
+  · have hsum : (a / principalDivisor + reduce128 a f).toNat = exactDebit a f := by
+      rw [UInt64.toNat_add, hp, hr]
+      unfold exactDebit
+      have hc' := hc
+      rw [UInt64.le_iff_toNat_le, UInt64.toNat_sub_of_le] at hc'
+      · simp only [u64Max, principalDivisor, UInt64.toNat_ofNat] at hc'
+        norm_num at hc'
+        rw [hr] at hc'
+        omega
+      · rw [UInt64.le_iff_toNat_le, hp]
+        change a.toNat / 2 ≤ 18446744073709551615
+        omega
+    simp only [verifyAffordability]
+    split <;> rename_i hbal
+    · simp only [Option.some.injEq, ← UInt64.toNat_inj]
+      rw [hsum]
+      rw [UInt64.le_iff_toNat_le, hsum] at hbal
+      omega
+    · simp only [reduceCtorEq, false_iff, not_and]
+      rw [UInt64.le_iff_toNat_le, hsum] at hbal
+      omega
+  · simp only [reduceCtorEq, false_iff, not_and]
+    have hsub : (u64Max - a / principalDivisor).toNat =
+        18446744073709551615 - a.toNat / 2 := by
+      rw [UInt64.toNat_sub_of_le, hp]
+      · rfl
+      · rw [UInt64.le_iff_toNat_le, hp]
+        change a.toNat / 2 ≤ 18446744073709551615
+        omega
+    rw [UInt64.le_iff_toNat_le, hsub, hr] at hc
+    unfold exactDebit
+    omega
+[?2004hroot@200a1e56d231:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean';s=open(p).read();start=s.index("      · simp only [u64Max, principalDivisor");end=s.index("        omega",start);s=s[:start]+"      · change (reduce128 a f).toNat ≤ 18446744073709551615 - a.toNat / 2 at hc'\n        rw [hr] at hc'\n"+s[end:];open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:132:15: warning: This simp argument is unused:
+  reduceCtorEq
+
+Hint: Omit it from the simp argument list.
+  simp only [r̵e̵d̵u̵c̵e̵C̵t̵o̵r̵E̵q̵,̵ ̵false_iff, not_and]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+
+sed -n '108,126p' /workspace/submission/Spec.lean
+[?2004hroot@200a1e56d231:/workspace/challenge# 
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# sed -n '108,126p' /workspace/submission/Spec.lean
+[?2004l  split_ifs with hc
+  all_goals try dsimp only
+  · have hsum : (a / principalDivisor + reduce128 a f).toNat = exactDebit a f := by
+      rw [UInt64.toNat_add, hp, hr]
+      unfold exactDebit
+      have hc' := hc
+      rw [UInt64.le_iff_toNat_le, UInt64.toNat_sub_of_le] at hc'
+      · change (reduce128 a f).toNat ≤ 18446744073709551615 - a.toNat / 2 at hc'
+        rw [hr] at hc'
+        omega
+      · rw [UInt64.le_iff_toNat_le, hp]
+        change a.toNat / 2 ≤ 18446744073709551615
+        omega
+    simp only [verifyAffordability]
+    split <;> rename_i hbal
+    · simp only [Option.some.injEq, ← UInt64.toNat_inj]
+      rw [hsum]
+      rw [UInt64.le_iff_toNat_le, hsum] at hbal
+      omega
+[?2004hroot@200a1e56d231:/workspace/challenge# 
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# python3 /workspace/lean/check.py; status=$?; printf '\nLEAN_CHECK_EXIT=%s\n' "$status"; find /workspace/submission -maxdepth 3 -type f -print; test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src/lib.rs && echo SAFE_ARTIFACT_LAYOUT_OK
+[?2004lCandidateSpec.lean:45:4: warning: This simp argument is unused:
+  goldilocksEpsilon
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, g̵o̵l̵d̵i̵l̵o̵c̵k̵s̵E̵p̵s̵i̵l̵o̵n̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:132:15: warning: This simp argument is unused:
+  reduceCtorEq
+
+Hint: Omit it from the simp argument list.
+  simp only [r̵e̵d̵u̵c̵e̵C̵t̵o̵r̵E̵q̵,̵ ̵false_iff, not_and]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+
+
+LEAN_CHECK_EXIT=0
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+SAFE_ARTIFACT_LAYOUT_OK
+[?2004hroot@200a1e56d231:/workspace/challenge# 
+[?2004l[?2004hroot@200a1e56d231:/workspace/challenge# 

@@ -1,0 +1,2120 @@
+[?2004hroot@fe83daf3e3a3:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@fe83daf3e3a3:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@fe83daf3e3a3:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod monty31 {
+    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+
+    #[inline]
+    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+        let low: u64 = amount & LIMB_MASK;
+        let high: u64 = fee % BABY_BEAR_P;
+        low + high * LIMB_BASE
+    }
+
+    #[inline]
+    pub fn monty_quotient(x: u64) -> u64 {
+        let x_lo: u64 = x & LIMB_MASK;
+        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    }
+
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            hi + BABY_BEAR_P - LIMB_BASE
+        } else {
+            hi
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::monty31;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PlonkyQuote {
+        pub principal: u64,
+        pub monty_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+        let transcript: u64 = monty31::pack_transcript(amount, fee);
+        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+        Some(PlonkyQuote {
+            principal: amount,
+            monty_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Plonky3 BabyBear Montgomery settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2013265921` (BabyBear prime), `R = 2^32 = 4294967296`, `R_INV = 943718400` (`R * R_INV == 1 mod P`)
+/// - `transcript = (amount mod 2^32) + (fee mod P) * 2^32`
+/// - `monty_surcharge = (transcript * R_INV) mod P`
+/// - `total_debit = amount + monty_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::PlonkyQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn montgomery_identity_element() {
+        // transcript = R = 2^32 (amount = 0, fee = 1):
+        // monty_surcharge = (R * R_INV) mod P = 1
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 4294967296 (low = 0), fee = 5:
+        // transcript = 5 * 2^32 -> monty_surcharge = 5
+        // total_debit = 4294967301
+        assert_eq!(
+            authorize(4_294_967_301, 4_294_967_296, 5),
+            Some(Authorization {
+                total_debit: 4_294_967_301
+            })
+        );
+    }
+}
+[?2004hroot@fe83daf3e3a3:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def babyBearP : UInt64 := 2013265921
+def babyBearMu : UInt64 := 2281701377
+def limbBase : UInt64 := 4294967296
+def limbMask : UInt64 := 4294967295
+def u64Max : UInt64 := 18446744073709551615
+
+structure PlonkyQuote where
+  principal : UInt64
+  montySurcharge : UInt64
+  totalDebit : UInt64
+
+def packTranscript (amount fee : UInt64) : UInt64 :=
+  let low := amount % limbBase
+  let high := fee % babyBearP
+  limbBase * high + low
+
+def montyQuotient (x : UInt64) : UInt64 :=
+  let xLo := x % limbBase
+  (babyBearMu * xLo) % limbBase
+
+def montyReduce (x : UInt64) : UInt64 :=
+  let t := montyQuotient x
+  let u := babyBearP * t
+  let diff := x - u
+  let hi := diff / limbBase
+  if x < u then
+    babyBearP + hi - limbBase
+  else
+    hi
+
+def buildQuote (amount fee : UInt64) : Option PlonkyQuote :=
+  let transcript := packTranscript amount fee
+  let montySurcharge := montyReduce transcript
+  if montySurcharge ≤ u64Max - amount then
+    some {
+      principal := amount,
+      montySurcharge := montySurcharge,
+      totalDebit := amount + montySurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : PlonkyQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@fe83daf3e3a3:/workspace# ls -la /workspace/lean; cat /workspace/lean/check.py
+[?2004ltotal 172
+drwxr-xr-x 1 root root   4096 Oct  7 07:03 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2255 Oct  7 06:59 SecurityChallenge.lean
+-rw-r--r-- 1 root root 149272 Oct  7 07:03 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  6 11:24 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+[?2004hroot@fe83daf3e3a3:/workspace# which lean; lean --version; ls /opt/rvb-deps; cat /workspace/lean/Signature.lean; cat /workspace/challenge/Cargo.toml
+[?2004l/opt/lean/bin/lean
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[0m[01;34mpackages[0m  requirements-verifier.txt
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@fe83daf3e3a3:/workspace# grep -n 'theorem\|toNat_' $(lean --print-prefix)/src/lean/Init/Data/UInt/Lemmas.lean | head -100
+[?2004l30:macro "declare_uint_theorems" typeName:ident bits:term:arg : command => do
+34:  theorem zero_def : (0 : $typeName) = ⟨0⟩ := (rfl)
+35:  theorem one_def : (1 : $typeName) = ⟨1⟩ := (rfl)
+36:  theorem sub_def (a b : $typeName) : a - b = ⟨a.toBitVec - b.toBitVec⟩ := (rfl)
+37:  theorem mul_def (a b : $typeName) : a * b = ⟨a.toBitVec * b.toBitVec⟩ := (rfl)
+38:  theorem mod_def (a b : $typeName) : a % b = ⟨a.toBitVec % b.toBitVec⟩ := (rfl)
+39:  theorem add_def (a b : $typeName) : a + b = ⟨a.toBitVec + b.toBitVec⟩ := (rfl)
+41:  @[simp] theorem toNat_ofBitVec : (ofBitVec a).toNat = a.toNat := (rfl)
+43:  @[simp] theorem toNat_ofNat' {n : Nat} : (ofNat n).toNat = n % 2 ^ $bits := BitVec.toNat_ofNat ..
+46:  theorem toNat_ofNat {n : Nat} : toNat (no_index (OfNat.ofNat n)) = n % 2 ^ $bits := toNat_ofNat'
+48:  @[simp] theorem toNat_ofNatLT {n : Nat} {h : n < size} : (ofNatLT n h).toNat = n := BitVec.toNat_ofNatLT ..
+50:  @[simp] theorem toFin_val (x : $typeName) : x.toFin.val = x.toNat := (rfl)
+52:  @[simp] theorem toNat_toBitVec (x : $typeName) : x.toBitVec.toNat = x.toNat := (rfl)
+53:  @[simp] theorem toFin_toBitVec (x : $typeName) : x.toBitVec.toFin = x.toFin := (rfl)
+55:  @[simp] theorem ofBitVec_toBitVec : ∀ (a : $typeName), ofBitVec a.toBitVec = a
+58:  theorem toBitVec_ofNat' (n : Nat) : (ofNat n).toBitVec = BitVec.ofNat _ n := (rfl)
+60:  theorem toNat_ofNat_of_lt' {n : Nat} (h : n < size) : (ofNat n).toNat = n := by
+61:    rw [toNat, toBitVec_ofNat', BitVec.toNat_ofNat, Nat.mod_eq_of_lt h]
+62:  theorem toNat_ofNat_of_lt {n : Nat} (h : n < size) : toNat (OfNat.ofNat n) = n :=
+63:    toNat_ofNat_of_lt' h
+65:  @[int_toBitVec] theorem le_iff_toBitVec_le {a b : $typeName} : a ≤ b ↔ a.toBitVec ≤ b.toBitVec := .rfl
+67:  @[int_toBitVec] theorem lt_iff_toBitVec_lt {a b : $typeName} : a < b ↔ a.toBitVec < b.toBitVec := .rfl
+69:  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+71:  theorem lt_iff_toNat_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+73:  @[simp] protected theorem not_le {a b : $typeName} : ¬ a ≤ b ↔ b < a := by
+76:  @[simp] protected theorem not_lt {a b : $typeName} : ¬ a < b ↔ b ≤ a := by
+79:  @[simp] protected theorem le_refl (a : $typeName) : a ≤ a := by simp [le_iff_toBitVec_le]
+82:  protected theorem le_rfl {a : $typeName} : a ≤ a := le_refl _
+84:  @[simp] protected theorem lt_irrefl (a : $typeName) : ¬ a < a := by simp
+86:  protected theorem le_trans {a b c : $typeName} : a ≤ b → b ≤ c → a ≤ c := BitVec.le_trans
+88:  protected theorem lt_trans {a b c : $typeName} : a < b → b < c → a < c := BitVec.lt_trans
+90:  protected theorem le_total (a b : $typeName) : a ≤ b ∨ b ≤ a := BitVec.le_total ..
+92:  protected theorem lt_asymm {a b : $typeName} : a < b → ¬ b < a := BitVec.lt_asymm
+94:  protected theorem toBitVec_eq_of_eq {a b : $typeName} (h : a = b) : a.toBitVec = b.toBitVec := h ▸ rfl
+96:  protected theorem eq_of_toBitVec_eq {a b : $typeName} (h : a.toBitVec = b.toBitVec) : a = b := by
+100:  protected theorem toBitVec_inj {a b : $typeName} : a.toBitVec = b.toBitVec ↔ a = b :=
+105:  protected theorem eq_iff_toBitVec_eq {a b : $typeName} : a = b ↔ a.toBitVec = b.toBitVec :=
+109:  protected theorem eq_of_toFin_eq {a b : $typeName} (h : a.toFin = b.toFin) : a = b := by
+114:  protected theorem toFin_inj {a b : $typeName} : a.toFin = b.toFin ↔ a = b :=
+118:  protected theorem toBitVec_ne_of_ne {a b : $typeName} (h : a ≠ b) : a.toBitVec ≠ b.toBitVec :=
+122:  protected theorem ne_of_toBitVec_ne {a b : $typeName} (h : a.toBitVec ≠ b.toBitVec) : a ≠ b :=
+127:  protected theorem ne_iff_toBitVec_ne {a b : $typeName} : a ≠ b ↔ a.toBitVec ≠ b.toBitVec :=
+131:  protected theorem ne_of_lt {a b : $typeName} (h : a < b) : a ≠ b := by
+136:  @[simp] protected theorem toNat_zero : (0 : $typeName).toNat = 0 := Nat.zero_mod _
+138:  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+140:  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+142:  @[simp] protected theorem toNat_mul (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.toNat_mul  ..
+144:  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+146:  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+148:  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+150:  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+152:  open $typeName (toNat_mod toNat_lt_size) in
+153:  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+156:    · rw [toNat_mod, toNat_ofNat_of_lt' h2]
+159:      · apply toNat_lt_size
+162:  protected theorem mod_lt (a : $typeName) {b : $typeName} : 0 < b → a % b < b := by
+166:  protected theorem toNat.inj : ∀ {a b : $typeName}, a.toNat = b.toNat → a = b
+169:  protected theorem toNat_inj : ∀ {a b : $typeName}, a.toNat = b.toNat ↔ a = b :=
+172:  open $typeName (toNat_inj) in
+173:  protected theorem le_antisymm_iff {a b : $typeName} : a = b ↔ a ≤ b ∧ b ≤ a :=
+174:    toNat_inj.symm.trans Nat.le_antisymm_iff
+177:  protected theorem le_antisymm {a b : $typeName} (h₁ : a ≤ b) (h₂ : b ≤ a) : a = b :=
+193:  @[simp] protected theorem ofNat_one : ofNat 1 = 1 := (rfl)
+195:  @[simp] protected theorem ofNat_toNat {x : $typeName} : ofNat x.toNat = x := by
+197:    simp [Nat.mod_eq_of_lt x.toNat_lt_size]
+200:  theorem toFin_ofNat (n : Nat) : toFin (no_index (OfNat.ofNat n)) = OfNat.ofNat n := (rfl)
+203:  theorem toBitVec_ofNat (n : Nat) : toBitVec (no_index (OfNat.ofNat n)) = BitVec.ofNat _ n := (rfl)
+206:  theorem ofBitVec_ofNat (n : Nat) : ofBitVec (BitVec.ofNat _ n) = OfNat.ofNat n := (rfl)
+208:  @[simp, int_toBitVec] protected theorem toBitVec_add {a b : $typeName} : (a + b).toBitVec = a.toBitVec + b.toBitVec := (rfl)
+209:  @[simp, int_toBitVec] protected theorem toBitVec_sub {a b : $typeName} : (a - b).toBitVec = a.toBitVec - b.toBitVec := (rfl)
+210:  @[simp, int_toBitVec] protected theorem toBitVec_mul {a b : $typeName} : (a * b).toBitVec = a.toBitVec * b.toBitVec := (rfl)
+211:  @[simp, int_toBitVec] protected theorem toBitVec_div {a b : $typeName} : (a / b).toBitVec = a.toBitVec / b.toBitVec := (rfl)
+212:  @[simp, int_toBitVec] protected theorem toBitVec_mod {a b : $typeName} : (a % b).toBitVec = a.toBitVec % b.toBitVec := (rfl)
+213:  @[simp, int_toBitVec] protected theorem toBitVec_neg {a : $typeName} : (-a).toBitVec = -a.toBitVec := (rfl)
+219:        `(@[simp] theorem toNat_toUInt8 (x : $typeName) : x.toUInt8.toNat = x.toNat % 2 ^ 8 := (rfl))
+222:        `(@[simp] theorem toNat_toUInt16 (x : $typeName) : x.toUInt16.toNat = x.toNat := (rfl))
+225:        `(@[simp] theorem toNat_toUInt16 (x : $typeName) : x.toUInt16.toNat = x.toNat % 2 ^ 16 := (rfl))
+228:        `(@[simp] theorem toNat_toUInt32 (x : $typeName) : x.toUInt32.toNat = x.toNat := (rfl))
+231:        `(@[simp] theorem toNat_toUInt32 (x : $typeName) : x.toUInt32.toNat = x.toNat % 2 ^ 32 := (rfl))
+234:        `(@[simp] theorem toNat_toUSize (x : $typeName) : x.toUSize.toNat = x.toNat := (rfl))
+237:        `(@[simp] theorem toNat_toUSize (x : $typeName) : x.toUSize.toNat = x.toNat % 2 ^ System.Platform.numBits := (rfl))
+240:        `(@[simp] theorem toNat_toUInt64 (x : $typeName) : x.toUInt64.toNat = x.toNat := (rfl))
+244:declare_uint_theorems UInt8 8
+245:declare_uint_theorems UInt16 16
+246:declare_uint_theorems UInt32 32
+247:declare_uint_theorems UInt64 64
+248:declare_uint_theorems USize System.Platform.numBits
+250:@[simp] theorem USize.toNat_ofNat32 {n : Nat} {h : n < 4294967296} : (ofNat32 n h).toNat = n := (rfl)
+252:@[simp] theorem USize.toNat_toUInt8 (x : USize) : x.toUInt8.toNat = x.toNat % 2 ^ 8 := (rfl)
+253:@[simp] theorem USize.toNat_toUInt16 (x : USize) : x.toUInt16.toNat = x.toNat % 2 ^ 16 := (rfl)
+254:@[simp] theorem USize.toNat_toUInt32 (x : USize) : x.toUInt32.toNat = x.toNat % 2 ^ 32 := (rfl)
+255:@[simp] theorem USize.toNat_toUInt64 (x : USize) : x.toUInt64.toNat = x.toNat := (rfl)
+257:theorem USize.toNat_ofNat_of_lt_32 {n : Nat} (h : n < 4294967296) : toNat (ofNat n) = n :=
+258:  toNat_ofNat_of_lt (Nat.lt_of_lt_of_le h USize.le_size)
+260:theorem UInt8.ofNat_mod_size : ofNat (x % 2 ^ 8) = ofNat x := by
+262:theorem UInt16.ofNat_mod_size : ofNat (x % 2 ^ 16) = ofNat x := by
+264:theorem UInt32.ofNat_mod_size : ofNat (x % 2 ^ 32) = ofNat x := by
+266:theorem UInt64.ofNat_mod_size : ofNat (x % 2 ^ 64) = ofNat x := by
+268:theorem USize.ofNat_mod_size : ofNat (x % 2 ^ System.Platform.numBits) = ofNat x := by
+271:theorem UInt8.ofNat_size : ofNat size = 0 := by decide
+[?2004hroot@fe83daf3e3a3:/workspace# ls /opt/rvb-deps/.lake/build/lib/lean/Mathlib/Tactic | head; ls -la /workspace/submission
+[?2004lls: cannot access '/opt/rvb-deps/.lake/build/lib/lean/Mathlib/Tactic': No such file or directory
+total 24
+drwxr-xr-x 1 root root 4096 Oct  7 07:03 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  7 07:03 [01;34msrc[0m
+[?2004hroot@fe83daf3e3a3:/workspace# find /opt/rvb-deps/packages -maxdepth 2 -type d | head -30; cat /workspace/submission/{Spec,Audit,Proof}.lean; ls -l /workspace/submission/src
+[?2004l/opt/rvb-deps/packages
+/opt/rvb-deps/packages/aeneas
+/opt/rvb-deps/packages/aeneas/.git
+/opt/rvb-deps/packages/aeneas/docs
+/opt/rvb-deps/packages/aeneas/.claude
+/opt/rvb-deps/packages/aeneas/backends
+/opt/rvb-deps/packages/aeneas/src
+/opt/rvb-deps/packages/aeneas/documentation
+/opt/rvb-deps/packages/aeneas/tests
+/opt/rvb-deps/packages/aeneas/scripts
+/opt/rvb-deps/packages/aeneas/static
+/opt/rvb-deps/packages/aeneas/.github
+/opt/rvb-deps/packages/hax
+/opt/rvb-deps/packages/hax/Hax
+/opt/rvb-deps/packages/hax/.git
+/opt/rvb-deps/packages/hax/docbuild
+/opt/rvb-deps/packages/hax/.lake
+/opt/rvb-deps/packages/hax/CoreModels
+/opt/rvb-deps/packages/hax/Tests
+/opt/rvb-deps/packages/LeanSearchClient
+/opt/rvb-deps/packages/LeanSearchClient/LeanSearchClientTest
+/opt/rvb-deps/packages/LeanSearchClient/LeanSearchClient
+/opt/rvb-deps/packages/LeanSearchClient/.git
+/opt/rvb-deps/packages/LeanSearchClient/.lake
+/opt/rvb-deps/packages/LeanSearchClient/.github
+/opt/rvb-deps/packages/importGraph
+/opt/rvb-deps/packages/importGraph/.git
+/opt/rvb-deps/packages/importGraph/.lake
+/opt/rvb-deps/packages/importGraph/html-template
+/opt/rvb-deps/packages/importGraph/ImportGraphTest
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+total 0
+[?2004hroot@fe83daf3e3a3:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Exact settlement arithmetic; neither the product nor the debit wraps.
+[?2004l[?2004h> def settlementDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat +
+[?2004l[?2004h>     (((amount.toNat % 4294967296 + (fee.toNat % 2013265921) * 4294967296)
+[?2004l[?2004h>        * 943718400) % 2013265921)
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := settlementDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output _ amount fee totalDebit := totalDebit.toNat = settlementDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace# cat > /workspace/lean/Test.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Std.Tactic
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> set_option maxRecDepth 4096
+[?2004l[?2004h> set_option maxHeartbeats 2000000
+[?2004l[?2004h> example (a f : UInt64) :
+[?2004l[?2004h>     (montyReduce (packTranscript a f)).toNat =
+[?2004l[?2004h>     (((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921) := by
+[?2004l[?2004h>   unfold montyReduce montyQuotient packTranscript
+[?2004l[?2004h>   simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod,
+[?2004l[?2004h>     UInt64.toNat_div, UInt64.toNat_sub, UInt64.lt_iff_toNat_lt,
+[?2004l[?2004h>     babyBearP, babyBearMu, limbBase, UInt64.toNat_ofNat]
+[?2004l[?2004h>   split <;> simp only [UInt64.toNat_add, UInt64.toNat_sub, UInt64.toNat_div,
+[?2004l[?2004h>     babyBearP, limbBase, UInt64.toNat_ofNat] <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace# cd /workspace/lean && lean Test.lean
+[?2004lTest.lean:14:49: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  -2013265921 ≤ n - 18446744073709551616*o ≤ 18446744071696285694
+  -18446744071427850241 ≤ n - 18446744073709551616*o - 18446744073709551616*p ≤ 2281701374
+  k ≥ 0
+  0 ≤ k - 2013265921*l ≤ 2013265920
+  i ≥ 0
+  0 ≤ i - 4294967296*j ≤ 4294967295
+  i - 4294967296*j + 4294967296*k - 8646911288846319616*l ≥ 0
+  0 ≤ 943718400*i - 4053239664633446400*j + 4053239664633446400*k - 8160249286451986593900134400*l - 2013265921*m ≤ 2013265920
+  943718400*i - 4053239664633446400*j + 4053239664633446400*k - 8160249286451986593900134400*l - 2013265921*m - n + 18446744073709551616*o + 18446744073709551616*p ≥ 18446744071427850242
+  g ≥ 0
+  d ≥ 0
+  0 ≤ d - 4294967296*e ≤ 4294967295
+  0 ≤ 4294967296*d - 18446744073709551616*e + g - 18446744073709551616*h ≤ 18446744073709551615
+  b ≥ 0
+  0 ≤ 2013265921*b - 18446744073709551616*c ≤ 18446744073709551615
+  2013265921*b - 18446744073709551616*c - 4294967296*d + 18446744073709551616*e - g + 18446744073709551616*h ≥ 1
+where
+ b := ↑(2281701377 % 2 ^ 64 *
+        ((4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64)) % 2 ^ 64 + a.toNat % (4294967296 % 2 ^ 64)) % 2 ^ 64 %
+          (4294967296 % 2 ^ 64)) %
+      2 ^ 64) %
+  ↑(4294967296 % 2 ^ 64)
+ c := ↑(2013265921 % 2 ^ 64 *
+      (2281701377 % 2 ^ 64 *
+            ((4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64)) % 2 ^ 64 + a.toNat % (4294967296 % 2 ^ 64)) %
+                2 ^ 64 %
+              (4294967296 % 2 ^ 64)) %
+          2 ^ 64 %
+        (4294967296 % 2 ^ 64))) /
+  18446744073709551616
+ d := ↑f.toNat % ↑(2013265921 % 2 ^ 64)
+ e := ↑(4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64))) / 18446744073709551616
+ g := ↑a.toNat % ↑(4294967296 % 2 ^ 64)
+ h := ↑(4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64)) % 2 ^ 64 + a.toNat % (4294967296 % 2 ^ 64)) /
+  18446744073709551616
+ i := ↑a.toNat
+ j := ↑a.toNat / 4294967296
+ k := ↑f.toNat
+ l := ↑f.toNat / 2013265921
+ m := ↑((a.toNat % 4294967296 + f.toNat % 2013265921 * 4294967296) * 943718400) / 2013265921
+ n := ↑((2 ^ 64 -
+          (2013265921 *
+              (2281701377 * ((4294967296 * (f % 2013265921) + a % 4294967296) % 4294967296) % 4294967296)).toNat +
+        ((4294967296 * (f % 2013265921)).toNat + (a % 4294967296).toNat) % 2 ^ 64) %
+      2 ^ 64) /
+  ↑(4294967296 % 2 ^ 64)
+ o := ↑(2013265921 % 2 ^ 64 +
+      (2 ^ 64 -
+              (2013265921 *
+                  (2281701377 * ((4294967296 * (f % 2013265921) + a % 4294967296) % 4294967296) % 4294967296)).toNat +
+            ((4294967296 * (f % 2013265921)).toNat + (a % 4294967296).toNat) % 2 ^ 64) %
+          2 ^ 64 /
+        (4294967296 % 2 ^ 64)) /
+  18446744073709551616
+ p := ↑(2 ^ 64 - 4294967296 % 2 ^ 64 +
+      (2013265921 % 2 ^ 64 +
+          (2 ^ 64 -
+                  (2013265921 *
+                      (2281701377 * ((4294967296 * (f % 2013265921) + a % 4294967296) % 4294967296) %
+                        4294967296)).toNat +
+                ((4294967296 * (f % 2013265921)).toNat + (a % 4294967296).toNat) % 2 ^ 64) %
+              2 ^ 64 /
+            (4294967296 % 2 ^ 64)) %
+        2 ^ 64) /
+  18446744073709551616
+Test.lean:14:49: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  k ≥ 0
+  0 ≤ k - 2013265921*l ≤ 2013265920
+  i ≥ 0
+  0 ≤ i - 4294967296*j ≤ 4294967295
+  i - 4294967296*j + 4294967296*k - 8646911288846319616*l ≥ 0
+  0 ≤ 943718400*i - 4053239664633446400*j + 4053239664633446400*k - 8160249286451986593900134400*l - 2013265921*m ≤ 2013265920
+  943718400*i - 4053239664633446400*j + 4053239664633446400*k - 8160249286451986593900134400*l - 2013265921*m - n ≥ 1
+  g ≥ 0
+  0 ≤ 2013265921*g - 18446744073709551616*h ≤ 18446744073709551615
+  d ≥ 0
+  b ≥ 0
+  0 ≤ b - 4294967296*c ≤ 4294967295
+  0 ≤ 4294967296*b - 18446744073709551616*c + d - 18446744073709551616*e ≤ 18446744073709551615
+  4294967296*b - 18446744073709551616*c + d - 18446744073709551616*e - 2013265921*g + 18446744073709551616*h ≥ 0
+where
+ b := ↑f.toNat % ↑(2013265921 % 2 ^ 64)
+ c := ↑(4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64))) / 18446744073709551616
+ d := ↑a.toNat % ↑(4294967296 % 2 ^ 64)
+ e := ↑(4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64)) % 2 ^ 64 + a.toNat % (4294967296 % 2 ^ 64)) /
+  18446744073709551616
+ g := ↑(2281701377 % 2 ^ 64 *
+        ((4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64)) % 2 ^ 64 + a.toNat % (4294967296 % 2 ^ 64)) % 2 ^ 64 %
+          (4294967296 % 2 ^ 64)) %
+      2 ^ 64) %
+  ↑(4294967296 % 2 ^ 64)
+ h := ↑(2013265921 % 2 ^ 64 *
+      (2281701377 % 2 ^ 64 *
+            ((4294967296 % 2 ^ 64 * (f.toNat % (2013265921 % 2 ^ 64)) % 2 ^ 64 + a.toNat % (4294967296 % 2 ^ 64)) %
+                2 ^ 64 %
+              (4294967296 % 2 ^ 64)) %
+          2 ^ 64 %
+        (4294967296 % 2 ^ 64))) /
+  18446744073709551616
+ i := ↑a.toNat
+ j := ↑a.toNat / 4294967296
+ k := ↑f.toNat
+ l := ↑f.toNat / 2013265921
+ m := ↑((a.toNat % 4294967296 + f.toNat % 2013265921 * 4294967296) * 943718400) / 2013265921
+ n := ↑((2 ^ 64 -
+          (2013265921 *
+              (2281701377 * ((4294967296 * (f % 2013265921) + a % 4294967296) % 4294967296) % 4294967296)).toNat +
+        ((4294967296 * (f % 2013265921)).toNat + (a % 4294967296).toNat) % 2 ^ 64) %
+      2 ^ 64) /
+  ↑(4294967296 % 2 ^ 64)
+Test.lean:11:4: warning: This simp argument is unused:
+  UInt64.toNat_div
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod,
+  ̵  ̵ ̵ ̵UInt64.toNat_d̵i̵v̵,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵sub,
+  ̲  ̲ ̲ ̲UInt64.lt_iff_toNat_lt,
+  ̵  ̵ ̵ ̵babyBearP, babyBearMu, limbBase, UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Test.lean:11:22: warning: This simp argument is unused:
+  UInt64.toNat_sub
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod,
+  ̵  ̵ ̵ ̵UInt64.toNat_div,
+  ̲ U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵s̵u̵b̵,̵  ̲ ̲UInt64.lt_iff_toNat_lt,
+  ̵  ̵ ̵ ̵babyBearP, babyBearMu, limbBase, UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Test.lean:14:4: warning: This simp argument is unused:
+  babyBearP
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_sub, UInt64.toNat_div,
+  ̵  ̵ ̵ ̵b̵a̵b̵y̵B̵e̵a̵r̵P̵,̵ ̵limbBase,
+  ̲  ̲ ̲ ̲UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+Test.lean:14:15: warning: This simp argument is unused:
+  limbBase
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_add, UInt64.toNat_sub, UInt64.toNat_div, babyBearP,
+  ̲  ̲ ̲ ̲l̵i̵m̵b̵B̵a̵s̵e̵,̵ ̵UInt64.toNat_ofNat]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@fe83daf3e3a3:/workspace/lean# find /opt/rvb-deps/packages -path '*/Mathlib/Tactic.olean' -o -path '*/Mathlib/Tactic/Omega.olean'
+[?2004l/opt/rvb-deps/packages/mathlib/.lake/build/lib/lean/Mathlib/Tactic.olean
+[?2004hroot@fe83daf3e3a3:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/lean/Test.lean'
+[?2004l[?2004h> s=open(p).read(); s=s[:s.index('  simp only')]+'''  split <;>
+[?2004l[?2004h>     simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_mod,
+[?2004l[?2004h>       UInt64.toNat_div, UInt64.toNat_sub, UInt64.lt_iff_toNat_lt,
+[?2004l[?2004h>       babyBearP, babyBearMu, limbBase, UInt64.toNat_ofNat] at * <;>
+[?2004l[?2004h>     simp at * <;> omega
+[?2004l[?2004h> '''; open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:10:2: error: Tactic `split` failed: Could not split an `if` or `match` expression in the goal
+
+Hint: Use `set_option trace.split.failure true` to display additional diagnostic information
+
+a f : UInt64
+⊢ (have t :=
+        have xLo :=
+          (have low := a % limbBase;
+            have high := f % babyBearP;
+            limbBase * high + low) %
+            limbBase;
+        babyBearMu * xLo % limbBase;
+      have u := babyBearP * t;
+      have diff :=
+        (have low := a % limbBase;
+          have high := f % babyBearP;
+          limbBase * high + low) -
+          u;
+      have hi := diff / limbBase;
+      if
+          (have low := a % limbBase;
+            have high := f % babyBearP;
+            limbBase * high + low) <
+            u then
+        babyBearP + hi - limbBase
+      else hi).toNat =
+    (a.toNat % 4294967296 + f.toNat % 2013265921 * 4294967296) * 943718400 % 2013265921
+[?2004hroot@fe83daf3e3a3:/workspace/lean# sed -i '/  split/i\  dsimp only' Test.lean
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:15:18: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  -18446744071427850241 ≤ j - 18446744073709551616*k ≤ 2281701374
+  0 ≤ j ≤ 4294967295
+  4294967296*h - j - 4294967296*l ≥ -4294967295
+  b ≥ 0
+  0 ≤ b - 4294967296*g ≤ 4294967295
+  4294967296 ≤ 1069547521*b - 2013265921*c - 4294967296*d + g + j + 4294967296*l ≤ 6308233216
+  1069547521*b - 2013265921*c - 4294967296*d + 2013265921*e + g + j + 4294967296*l ≥ 4294967296
+  0 ≤ 2281701377*b - 4294967296*c ≤ 4294967295
+  0 ≤ 4593671624212873217*b - 8646911288846319616*c - 18446744073709551616*d ≤ 18446744073709551615
+  18446744073709551616 ≤ 4593671624212873217*b - 8646911288846319616*c - 18446744073709551616*d - 18446744073709551616*h + 4294967296*j + 18446744073709551616*l ≤ 36893488147419103231
+  4593671624212873217*b - 8646911288846319616*c - 18446744073709551616*d ≤ 18446744073709551616
+  4593671624212873217*b - 8646911288846319616*c - 18446744073709551616*d + 4294967296*j + 18446744073709551616*l ≥ 18446744073709551616
+  4335132435327573971750092800*b - 8160249286451986593900134400*c - 17408531802450660115768934400*d - 2013265921*i + 4053239664633446399*j + 18446744073709551616*k + 17408531802450660115768934400*l ≥ 17408531820897404187196784642
+  17408531802450660115768934400 ≤ 4335132435327573971750092800*b - 8160249286451986593900134400*c - 17408531802450660115768934400*d - 2013265921*i + 4053239664633446400*j + 17408531802450660115768934400*l ≤ 17408531802450660117782200320
+where
+ b := ↑a.toNat
+ c := ↑(2281701377 * a.toNat) / 4294967296
+ d := ↑(2013265921 * (2281701377 * a.toNat % 4294967296)) / 18446744073709551616
+ e := ↑f.toNat / 2013265921
+ g := ↑a.toNat / 4294967296
+ h := ↑(4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296) / 18446744073709551616
+ i := ↑((a.toNat % 4294967296 + f.toNat % 2013265921 * 4294967296) * 943718400) / 2013265921
+ j := ↑((18446744073709551616 - 2013265921 * (2281701377 * a.toNat % 4294967296) % 18446744073709551616 +
+        (4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296)) %
+      18446744073709551616) /
+  4294967296
+ k := ↑(18446744069414584320 +
+      (2013265921 +
+        (18446744073709551616 - 2013265921 * (2281701377 * a.toNat % 4294967296) % 18446744073709551616 +
+              (4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296)) %
+            18446744073709551616 /
+          4294967296)) /
+  18446744073709551616
+ l := ↑(18446744073709551616 - 2013265921 * (2281701377 * a.toNat % 4294967296) % 18446744073709551616 +
+      (4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296)) /
+  18446744073709551616
+Test.lean:15:18: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ j ≤ 4294967295
+  4294967296*e - j - 4294967296*k ≤ -4294967296
+  c ≥ 0
+  0 ≤ c - 4294967296*d ≤ 4294967295
+  4294967296 ≤ 1069547521*c + d - 2013265921*g - 4294967296*h + j + 4294967296*k ≤ 6308233216
+  0 ≤ 2281701377*c - 4294967296*g ≤ 4294967295
+  18446744073709551616 ≤ 4593671624212873217*c - 18446744073709551616*e - 8646911288846319616*g - 18446744073709551616*h + 4294967296*j + 18446744073709551616*k ≤ 36893488147419103231
+  0 ≤ 4593671624212873217*c - 8646911288846319616*g - 18446744073709551616*h ≤ 18446744073709551615
+  4593671624212873217*c - 8646911288846319616*g - 18446744073709551616*h ≤ 18446744073709551616
+  4593671624212873217*c - 8646911288846319616*g - 18446744073709551616*h + 4294967296*j + 18446744073709551616*k ≥ 18446744073709551616
+  4335132435327573971750092800*c - 8160249286451986593900134400*g - 17408531802450660115768934400*h - 2013265921*i + 4053239664633446399*j + 17408531802450660115768934400*k ≥ 17408531802450660115768934401
+  17408531802450660115768934400 ≤ 4335132435327573971750092800*c - 8160249286451986593900134400*g - 17408531802450660115768934400*h - 2013265921*i + 4053239664633446400*j + 17408531802450660115768934400*k ≤ 17408531802450660117782200320
+  2013265921*b + 1069547521*c + d - 2013265921*g - 4294967296*h + j + 4294967296*k ≥ 4294967296
+where
+ b := ↑f.toNat / 2013265921
+ c := ↑a.toNat
+ d := ↑a.toNat / 4294967296
+ e := ↑(4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296) / 18446744073709551616
+ g := ↑(2281701377 * a.toNat) / 4294967296
+ h := ↑(2013265921 * (2281701377 * a.toNat % 4294967296)) / 18446744073709551616
+ i := ↑((a.toNat % 4294967296 + f.toNat % 2013265921 * 4294967296) * 943718400) / 2013265921
+ j := ↑((18446744073709551616 - 2013265921 * (2281701377 * a.toNat % 4294967296) % 18446744073709551616 +
+        (4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296)) %
+      18446744073709551616) /
+  4294967296
+ k := ↑(18446744073709551616 - 2013265921 * (2281701377 * a.toNat % 4294967296) % 18446744073709551616 +
+      (4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296)) /
+  18446744073709551616
+[?2004hroot@fe83daf3e3a3:/workspace/lean# cat > Test.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Std.Tactic
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> set_option maxRecDepth 4096
+[?2004l[?2004h> set_option maxHeartbeats 2000000
+[?2004l[?2004h> set_option linter.unusedSimpArgs false
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem pack_nat (a f : UInt64) :
+[?2004l[?2004h>   (packTranscript a f).toNat = 4294967296 * (f.toNat % 2013265921) + a.toNat % 4294967296 := by
+[?2004l[?2004h>   have ha := Nat.mod_lt a.toNat (by decide : 0 < 4294967296)
+[?2004l[?2004h>   have hf := Nat.mod_lt f.toNat (by decide : 0 < 2013265921)
+[?2004l[?2004h>   simp [packTranscript, limbBase, babyBearP, UInt64.toNat_ofNat]
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem quotient_nat (x : UInt64) :
+[?2004l[?2004h>   (montyQuotient x).toNat = (2281701377 * (x.toNat % 4294967296)) % 4294967296 := by
+[?2004l[?2004h>   have hx := Nat.mod_lt x.toNat (by decide : 0 < 4294967296)
+[?2004l[?2004h>   simp only [montyQuotient, UInt64.toNat_mul, UInt64.toNat_mod,
+[?2004l[?2004h>     babyBearMu, limbBase, UInt64.toNat_ofNat]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem inverse_low (x : Nat) :
+[?2004l[?2004h>   (2013265921 * ((2281701377 * (x % 4294967296)) % 4294967296)) % 4294967296 = x % 4294967296 := by
+[?2004l[?2004h>   rw [Nat.mul_mod, Nat.mod_mod, ← Nat.mul_mod, ← Nat.mul_assoc]
+[?2004l[?2004h>   rw [Nat.mul_mod]
+[?2004l[?2004h>   simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem reduce_bounds (x : UInt64) (hx : x.toNat < 8646911288846319616) :
+[?2004l[?2004h>   (montyReduce x).toNat < 2013265921 ∧
+[?2004l[?2004h>   ((montyReduce x).toNat * 4294967296) % 2013265921 = x.toNat % 2013265921 := by
+[?2004l[?2004h>   have ht := Nat.mod_lt (2281701377 * (x.toNat % 4294967296)) (by decide : 0 < 4294967296)
+[?2004l[?2004h>   have hlow := inverse_low x.toNat
+[?2004l[?2004h>   have hu : (babyBearP * montyQuotient x).toNat =
+[?2004l[?2004h>       2013265921 * ((2281701377 * (x.toNat % 4294967296)) % 4294967296) := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mul, quotient_nat, babyBearP, UInt64.toNat_ofNat]
+[?2004l[?2004h>     simp
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   split <;>
+[?2004l[?2004h>     simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div,
+[?2004l[?2004h>       UInt64.lt_iff_toNat_lt, hu, babyBearP, limbBase, UInt64.toNat_ofNat] at * <;>
+[?2004l[?2004h>     simp at * <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:43:18: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ 2*a - 4294967296*b - c - 9225231847*d ≤ 4294967295
+  0 ≤ 2*a - c - 9225231847*d ≤ 8646911288846319615
+  125829121*a - 1069547521*c - 9866823852609101287*d ≥ 1
+  1 ≤ 125829121*a - 1069547521*c - 9866823852609101287*d + 4294967296*f ≤ 4294967296
+  2013265922 ≤ 125829121*a - 1069547521*c - 9866823852609101287*d + 18446744073709551616*e + 4294967296*f ≤ 18446744073709551616
+  0 ≤ 268435458*a - 2281701377*c - 21049224208444153319*d ≤ 4294967295
+  268435458*a - 2281701377*c - 21049224208444153319*d ≤ 9162596893
+  268435458*a - 2281701377*c - 2602480134734601703*d ≥ 0
+where
+ a := ↑(2281701377 * x.toNat) / 4294967296
+ b := ↑x.toNat / 4294967296
+ c := Lean.Omega.bmod_div_term 2013265922
+  [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+  (Lean.Omega.Coeffs.ofList
+    [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+      ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])
+ d := Lean.Omega.bmod_div_term 6 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 9]
+  (Lean.Omega.Coeffs.ofList
+    [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+      ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+      Lean.Omega.bmod_div_term 2013265922
+        [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+      Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+      Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])]),
+      Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])])]),
+      Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])]),
+            Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯])])])]),
+      Lean.Omega.bmod_div_term 26843492 [0, 0, 0, 0, 0, 0, 0, 0, 0, 26843491, 152113457]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])]),
+            Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯])])]),
+            Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯])]),
+                  Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList ⋯),
+                        Lean.Omega.bmod_div_term 841097759 ⋯ ⋯])])]),
+      Lean.Omega.bmod_div_term 8947490 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8947489, -26843491]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296, ⋯])])]),
+            Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯])])]),
+            Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList ⋯)]),
+                  Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList ⋯),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          ⋯,
+                        ⋯])]),
+            Lean.Omega.bmod_div_term 26843492 [0, 0, 0, 0, 0, 0, 0, 0, 0, 26843491, 152113457]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList ⋯),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          ⋯]),
+                  Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616] ⋯,
+                        ⋯, ⋯]),
+                  Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616, ⋯,
+                        ⋯])])]),
+      Lean.Omega.bmod_div_term 1025 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1024, -8947489]
+        (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯, ⋯]),
+      ⋯])
+ e := ↑(18446744069414584320 +
+      (2013265921 +
+        (18446744073709551616 - 2013265921 * (2281701377 * x.toNat % 4294967296) + x.toNat) % 18446744073709551616 /
+          4294967296)) /
+  18446744073709551616
+ f := ↑(18446744073709551616 - 2013265921 * (2281701377 * x.toNat % 4294967296) + x.toNat) / 18446744073709551616
+Test.lean:43:18: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ 2*a - 4294967296*b - c - 9225231847*d ≤ 4294967295
+  0 ≤ 2*a - c - 9225231847*d ≤ 8646911288846319615
+  125829121*a - 1069547521*c - 9866823852609101287*d ≤ 0
+  1 ≤ 125829121*a - 1069547521*c - 9866823852609101287*d + 4294967296*e ≤ 2281701375
+  0 ≤ 268435458*a - 2281701377*c - 21049224208444153319*d ≤ 4294967295
+  268435458*a - 2281701377*c - 21049224208444153319*d ≤ 9162596893
+  268435458*a - 2281701377*c - 2602480134734601703*d ≥ 0
+where
+ a := ↑(2281701377 * x.toNat) / 4294967296
+ b := ↑x.toNat / 4294967296
+ c := Lean.Omega.bmod_div_term 2013265922
+  [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+  (Lean.Omega.Coeffs.ofList
+    [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+      ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])
+ d := Lean.Omega.bmod_div_term 6 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 9]
+  (Lean.Omega.Coeffs.ofList
+    [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+      ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+      Lean.Omega.bmod_div_term 2013265922
+        [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+      Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+      Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])]),
+      Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])])]),
+      Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])]),
+            Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯])])])]),
+      Lean.Omega.bmod_div_term 26843492 [0, 0, 0, 0, 0, 0, 0, 0, 0, 26843491, 152113457]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                              ↑(montyQuotient x).toNat,
+                              ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])])]),
+            Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯])])]),
+            Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯])]),
+                  Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList ⋯),
+                        Lean.Omega.bmod_div_term 841097759 ⋯ ⋯])])]),
+      Lean.Omega.bmod_div_term 8947490 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8947489, -26843491]
+        (Lean.Omega.Coeffs.ofList
+          [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+            ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+            ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+            Lean.Omega.bmod_div_term 2013265922
+              [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+            Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616])]),
+            Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296, ⋯])])]),
+            Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList
+                            [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                              ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯])])]),
+            Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯]),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          (Lean.Omega.Coeffs.ofList ⋯)]),
+                  Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList ⋯),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          ⋯,
+                        ⋯])]),
+            Lean.Omega.bmod_div_term 26843492 [0, 0, 0, 0, 0, 0, 0, 0, 0, 26843491, 152113457]
+              (Lean.Omega.Coeffs.ofList
+                [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296, ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296,
+                  ↑x.toNat / 4294967296, ↑(montyQuotient x).toNat,
+                  ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                  Lean.Omega.bmod_div_term 2013265922
+                    [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616]),
+                  Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯])]),
+                  Lean.Omega.bmod_div_term 841097759 [0, 0, 0, 0, 0, 841097758, 0, -2013265921]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616]
+                          (Lean.Omega.Coeffs.ofList ⋯),
+                        Lean.Omega.bmod_div_term 2013265922 [2013265921, -4026531842, 0, 0, 0, 9225231847, 2013265921]
+                          ⋯]),
+                  Lean.Omega.bmod_div_term 331070406 [0, 0, 0, 0, 0, 0, 0, 331070405, -841097758]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616,
+                        Lean.Omega.bmod_div_term 2013265922
+                          [4593671624212873217, -8646911288846319616, 0, 0, -2013265921, 18446744073709551616] ⋯,
+                        ⋯, ⋯]),
+                  Lean.Omega.bmod_div_term 152113458 [0, 0, 0, 0, 0, 0, 0, 0, 152113457, 331070405]
+                    (Lean.Omega.Coeffs.ofList
+                      [↑x.toNat, ↑(2281701377 * x.toNat) / 4294967296,
+                        ↑(2013265921 * (2281701377 * x.toNat)) / 4294967296, ↑x.toNat / 4294967296,
+                        ↑(montyQuotient x).toNat, ↑(2013265921 * (montyQuotient x).toNat) / 18446744073709551616, ⋯,
+                        ⋯])])]),
+      Lean.Omega.bmod_div_term 1025 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1024, -8947489]
+        (Lean.Omega.Coeffs.ofList [↑x.toNat, ⋯, ⋯]),
+      ⋯])
+ e := ↑(18446744073709551616 - 2013265921 * (2281701377 * x.toNat % 4294967296) + x.toNat) / 18446744073709551616
+[?2004hroot@fe83daf3e3a3:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Test.lean';s=open(p).read();s=s[:s.index('theorem reduce_bounds')];s+='''theorem nat_reduce (x t : Nat) (hx : x < 8646911288846319616)
+[?2004l[?2004h>     (ht : t < 4294967296)
+[?2004l[?2004h>     (hlow : (2013265921 * t) % 4294967296 = x % 4294967296) :
+[?2004l[?2004h>     let hi := (18446744073709551616 - 2013265921 * t + x) % 18446744073709551616 / 4294967296
+[?2004l[?2004h>     let z := if x < 2013265921 * t then
+[?2004l[?2004h>       (18446744069414584320 + (2013265921 + hi)) % 18446744073709551616 else hi
+[?2004l[?2004h>     z < 2013265921 ∧ (z * 4294967296) % 2013265921 = x % 2013265921 := by
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   split <;> omega
+[?2004l[?2004h> ''';open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:36:12: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  -18446744069414584320 ≤ c - 18446744073709551616*d ≤ 2281701374
+  0 ≤ c ≤ 4294967295
+  c + 4294967296*e ≤ 4294967295
+  0 ≤ a ≤ 4294967295
+  a ≤ 9162596893
+  18446744073709551616 ≤ 2013265921*a - 4294967296*b + 4294967296*c + 18446744073709551616*e ≤ 18446744078004518911
+  18446744073709551616 ≤ 2013265921*a + 4294967296*c + 18446744073709551616*e ≤ 27093655362555871231
+where
+ a := ↑t
+ b := ↑x / 4294967296
+ c := ↑((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) / 4294967296
+ d := ↑(18446744069414584320 +
+      (2013265921 + (18446744073709551616 - 2013265921 * t + x) % 18446744073709551616 / 4294967296)) /
+  18446744073709551616
+ e := ↑(18446744073709551616 - 2013265921 * t + x) / 18446744073709551616
+Test.lean:36:12: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  c ≥ 2013265921
+  0 ≤ c ≤ 4294967295
+  c + 4294967296*d ≥ 4294967296
+  0 ≤ a ≤ 4294967295
+  a ≤ 9162596893
+  18446744073709551616 ≤ 2013265921*a - 4294967296*b + 4294967296*c + 18446744073709551616*d ≤ 18446744078004518911
+  18446744073709551616 ≤ 2013265921*a + 4294967296*c + 18446744073709551616*d ≤ 27093655362555871231
+where
+ a := ↑t
+ b := ↑x / 4294967296
+ c := ↑((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) / 4294967296
+ d := ↑(18446744073709551616 - 2013265921 * t + x) / 18446744073709551616
+[?2004hroot@fe83daf3e3a3:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Test.lean';s=open(p).read();s=s.replace('  dsimp only\n  split <;> omega','''  have hu : 2013265921 * t < 8646911288846319616 := by omega
+[?2004l[?2004h>   have hd : (18446744073709551616 - 2013265921 * t + x) % 4294967296 = 0 := by omega
+[?2004l[?2004h>   have hd2 : ((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) % 4294967296 = 0 := by omega
+[?2004l[?2004h>   dsimp only
+[?2004l[?2004h>   split <;> omega''');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:39:12: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 4294967295
+  -18446744069414584320 ≤ d - 18446744073709551616*e ≤ 2281701374
+  4294967296*c + d ≤ 4294967295
+  0 ≤ a ≤ 4294967295
+  a ≤ 9162596893
+  18446744073709551616 ≤ 2013265921*a - 4294967296*b + 18446744073709551616*c + 4294967296*d ≤ 18446744078004518911
+  18446744073709551616 ≤ 2013265921*a + 18446744073709551616*c + 4294967296*d ≤ 27093655362555871231
+where
+ a := ↑t
+ b := ↑x / 4294967296
+ c := ↑(18446744073709551616 - 2013265921 * t + x) / 18446744073709551616
+ d := ↑((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) / 4294967296
+ e := ↑(18446744069414584320 +
+      (2013265921 + (18446744073709551616 - 2013265921 * t + x) % 18446744073709551616 / 4294967296)) /
+  18446744073709551616
+Test.lean:39:12: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  2013265921 ≤ d ≤ 4294967295
+  4294967296*c + d ≥ 4294967296
+  0 ≤ a ≤ 4294967295
+  a ≤ 9162596893
+  18446744073709551616 ≤ 2013265921*a - 4294967296*b + 18446744073709551616*c + 4294967296*d ≤ 18446744078004518911
+  18446744073709551616 ≤ 2013265921*a + 18446744073709551616*c + 4294967296*d ≤ 27093655362555871231
+where
+ a := ↑t
+ b := ↑x / 4294967296
+ c := ↑(18446744073709551616 - 2013265921 * t + x) / 18446744073709551616
+ d := ↑((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) / 4294967296
+[?2004hroot@fe83daf3e3a3:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Test.lean';s=open(p).read();s=s[:s.index('  dsimp only\n',s.index('theorem nat_reduce'))]+'''  dsimp only
+[?2004l[?2004h>   by_cases h : x < 2013265921 * t
+[?2004l[?2004h>   · simp only [if_pos h]
+[?2004l[?2004h>     have he : (18446744073709551616 - 2013265921 * t + x) % 18446744073709551616 =
+[?2004l[?2004h>         18446744073709551616 - 2013265921 * t + x := by omega
+[?2004l[?2004h>     rw [he]
+[?2004l[?2004h>     constructor <;> omega
+[?2004l[?2004h>   · simp only [if_neg h]
+[?2004l[?2004h>     have he : (18446744073709551616 - 2013265921 * t + x) % 18446744073709551616 =
+[?2004l[?2004h>         x - 2013265921 * t := by omega
+[?2004l[?2004h>     rw [he]
+[?2004l[?2004h>     constructor <;> omega
+[?2004l[?2004h> ''';open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:44:20: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ c ≤ 4294967295
+  -18446744069414584320 ≤ c - 18446744073709551616*d ≤ 2281701374
+  0 ≤ a ≤ 4294967295
+  a ≤ 9162596893
+  18446744073709551616 ≤ 2013265921*a - 4294967296*b + 4294967296*c ≤ 18446744078004518911
+  18446744073709551616 ≤ 2013265921*a + 4294967296*c ≤ 27093655362555871231
+where
+ a := ↑t
+ b := ↑x / 4294967296
+ c := ↑((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) / 4294967296
+ d := ↑(18446744069414584320 + (2013265921 + (18446744073709551616 - 2013265921 * t + x) / 4294967296)) /
+  18446744073709551616
+Test.lean:44:20: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ c ≤ 4294967295
+  -18446744071427850241 ≤ c - 18446744073709551616*e ≤ 2281701374
+  -79228162504464504808680718336 ≤ 4294967296*c - 79228162514264337593543950336*e - 2013265921*f ≤ -79228162504464504806667452416
+  0 ≤ a ≤ 4294967295
+  a ≤ 9162596893
+  18446744073709551616 ≤ 2013265921*a - 4294967296*b + 4294967296*c ≤ 18446744078004518911
+  2013265921*a - 2013265921*d + 79228162514264337593543950336*e + 2013265921*f ≥ 79228162522911248882390269953
+  18446744073709551616 ≤ 2013265921*a + 4294967296*c ≤ 27093655362555871231
+  18446744073709551616 ≤ 2013265921*a + 4294967296*c - 2013265921*d ≤ 18446744075722817536
+where
+ a := ↑t
+ b := ↑x / 4294967296
+ c := ↑((18446744073709551616 - 2013265921 * t + x) % 18446744073709551616) / 4294967296
+ d := ↑x / 2013265921
+ e := ↑(18446744069414584320 + (2013265921 + (18446744073709551616 - 2013265921 * t + x) / 4294967296)) /
+  18446744073709551616
+ f := ↑((18446744069414584320 + (2013265921 + (18446744073709551616 - 2013265921 * t + x) / 4294967296)) %
+        18446744073709551616 *
+      4294967296) /
+  2013265921
+[?2004hroot@fe83daf3e3a3:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Test.lean';s=open(p).read();s=s.replace('    rw [he]\n    constructor <;> omega\n  ·', '''    rw [he] at hd2 ⊢
+[?2004l[?2004h>     have hh : 4294967296 * ((18446744073709551616 - 2013265921 * t + x) / 4294967296) =
+[?2004l[?2004h>         18446744073709551616 - 2013265921 * t + x := by
+[?2004l[?2004h>       have hh := Nat.mod_add_div (18446744073709551616 - 2013265921 * t + x) 4294967296
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     have hr : 4294967296 ≤ 2013265921 + ((18446744073709551616 - 2013265921 * t + x) / 4294967296) := by omega
+[?2004l[?2004h>     have he2 : (18446744069414584320 + (2013265921 + (18446744073709551616 - 2013265921 * t + x) / 4294967296)) % 18446744073709551616 =
+[?2004l[?2004h>         2013265921 + (18446744073709551616 - 2013265921 * t + x) / 4294967296 - 4294967296 := by omega
+[?2004l[?2004h>     rw [he2]
+[?2004l[?2004h>     constructor <;> omega
+[?2004l[?2004h>   ·''');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# cat >> Test.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem reduce_bounds (x : UInt64) (hx : x.toNat < 8646911288846319616) :
+[?2004l[?2004h>   (montyReduce x).toNat < 2013265921 ∧
+[?2004l[?2004h>   ((montyReduce x).toNat * 4294967296) % 2013265921 = x.toNat % 2013265921 := by
+[?2004l[?2004h>   have ht : (montyQuotient x).toNat < 4294967296 := by
+[?2004l[?2004h>     rw [quotient_nat]
+[?2004l[?2004h>     exact Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   have hl : (2013265921 * (montyQuotient x).toNat) % 4294967296 = x.toNat % 4294967296 := by
+[?2004l[?2004h>     rw [quotient_nat]
+[?2004l[?2004h>     exact inverse_low _
+[?2004l[?2004h>   have hu : (babyBearP * montyQuotient x).toNat = 2013265921 * (montyQuotient x).toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mul, babyBearP, UInt64.toNat_ofNat]
+[?2004l[?2004h>     simp
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   have h := nat_reduce x.toNat (montyQuotient x).toNat hx ht hl
+[?2004l[?2004h>   unfold montyReduce
+[?2004l[?2004h>   dsimp only at h ⊢
+[?2004l[?2004h>   split <;>
+[?2004l[?2004h>     simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div,
+[?2004l[?2004h>       UInt64.lt_iff_toNat_lt, hu, babyBearP, limbBase, UInt64.toNat_ofNat] at * <;>
+[?2004l[?2004h>     simp at * <;> exact h
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem invert_residue (x z : Nat) (hz : z < 2013265921)
+[?2004l[?2004h>     (h : (z * 4294967296) % 2013265921 = x % 2013265921) :
+[?2004l[?2004h>     z = (x * 943718400) % 2013265921 := by
+[?2004l[?2004h>   have hh := congrArg (fun n : Nat => (n * 943718400) % 2013265921) h
+[?2004l[?2004h>   simp only [Nat.mod_mul_mod] at hh
+[?2004l[?2004h>   rw [Nat.mul_assoc, Nat.mul_mod] at hh
+[?2004l[?2004h>   simp at hh
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem surcharge_nat (a f : UInt64) :
+[?2004l[?2004h>     (montyReduce (packTranscript a f)).toNat =
+[?2004l[?2004h>     ((a.toNat % 4294967296 + (f.toNat % 2013265921) * 4294967296) * 943718400) % 2013265921 := by
+[?2004l[?2004h>   have ha := Nat.mod_lt a.toNat (by decide : 0 < 4294967296)
+[?2004l[?2004h>   have hf := Nat.mod_lt f.toNat (by decide : 0 < 2013265921)
+[?2004l[?2004h>   have hx : (packTranscript a f).toNat < 8646911288846319616 := by rw [pack_nat]; omega
+[?2004l[?2004h>   have h := reduce_bounds (packTranscript a f) hx
+[?2004l[?2004h>   have hi := invert_residue _ _ h.1 h.2
+[?2004l[?2004h>   rw [pack_nat] at hi
+[?2004l[?2004h>   simpa [Nat.mul_comm, Nat.add_comm] using hi
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004lTest.lean:78:18: error: Type mismatch
+  h
+[Error pretty printing: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information]
+Test.lean:78:18: error: Type mismatch
+  h
+[Error pretty printing: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information]
+[?2004hroot@fe83daf3e3a3:/workspace/lean# python3 - <<'PY'
+[?2004l[?2004h> p='Test.lean';s=open(p).read();s=s.replace('  split <;>\n    simp only [UInt64.toNat_sub', '  split <;>\n    simp only [hu] at * <;>\n    simp only [UInt64.toNat_sub');s=s.replace('    simp at * <;> exact h','    simp at * <;> omega');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean
+[?2004l^Csed -i 's/simp at \* <;> omega/simp at * <;> trace_state/' Test.lean
+lean Test.lean > /workspace/lean/goals.txt 2>&1; head -c 14000 /workspace/lean/goals.txt
+
+[?2004hroot@fe83daf3e3a3:/workspace/lean# sed -i 's/simp at \* <;> omega/simp at * <;> trace_state/' Test.lean
+[?2004l[?2004hroot@fe83daf3e3a3:/workspace/lean# lean Test.lean > /workspace/lean/goals.txt 2>&1; head -c 14000 /workspace/lean/goals.txt
+[?2004lTest.lean:61:78: error: unsolved goals
+case isTrue
+x : UInt64
+hx : x.toNat < 8646911288846319616
+ht : (montyQuotient x).toNat < 4294967296
+hl : 2013265921 * (montyQuotient x).toNat % 4294967296 = x.toNat % 4294967296
+h :
+  (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+        (18446744069414584320 +
+            (2013265921 +
+              (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                4294967296)) %
+          18446744073709551616
+      else
+        (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 / 4294967296) <
+      2013265921 ∧
+    (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+            (18446744069414584320 +
+                (2013265921 +
+                  (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                    4294967296)) %
+              18446744073709551616
+          else
+            (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+              4294967296) *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+hu : True
+h✝ : x.toNat < 2013265921 * (montyQuotient x).toNat % 18446744073709551616
+⊢ (18446744069414584320 +
+          (2013265921 +
+            (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+                18446744073709551616 /
+              4294967296)) %
+        18446744073709551616 <
+      2013265921 ∧
+    (18446744069414584320 +
+              (2013265921 +
+                (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+                    18446744073709551616 /
+                  4294967296)) %
+            18446744073709551616 *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+
+case isFalse
+x : UInt64
+hx : x.toNat < 8646911288846319616
+ht : (montyQuotient x).toNat < 4294967296
+hl : 2013265921 * (montyQuotient x).toNat % 4294967296 = x.toNat % 4294967296
+h :
+  (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+        (18446744069414584320 +
+            (2013265921 +
+              (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                4294967296)) %
+          18446744073709551616
+      else
+        (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 / 4294967296) <
+      2013265921 ∧
+    (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+            (18446744069414584320 +
+                (2013265921 +
+                  (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                    4294967296)) %
+              18446744073709551616
+          else
+            (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+              4294967296) *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+hu : True
+h✝ : 2013265921 * (montyQuotient x).toNat % 18446744073709551616 ≤ x.toNat
+⊢ (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+          18446744073709551616 /
+        4294967296 <
+      2013265921 ∧
+    (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+              18446744073709551616 /
+            4294967296 *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+case isTrue
+x : UInt64
+hx : x.toNat < 8646911288846319616
+ht : (montyQuotient x).toNat < 4294967296
+hl : 2013265921 * (montyQuotient x).toNat % 4294967296 = x.toNat % 4294967296
+h :
+  (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+        (18446744069414584320 +
+            (2013265921 +
+              (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                4294967296)) %
+          18446744073709551616
+      else
+        (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 / 4294967296) <
+      2013265921 ∧
+    (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+            (18446744069414584320 +
+                (2013265921 +
+                  (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                    4294967296)) %
+              18446744073709551616
+          else
+            (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+              4294967296) *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+hu : True
+h✝ : x.toNat < 2013265921 * (montyQuotient x).toNat % 18446744073709551616
+⊢ (18446744069414584320 +
+          (2013265921 +
+            (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+                18446744073709551616 /
+              4294967296)) %
+        18446744073709551616 <
+      2013265921 ∧
+    (18446744069414584320 +
+              (2013265921 +
+                (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+                    18446744073709551616 /
+                  4294967296)) %
+            18446744073709551616 *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+case isFalse
+x : UInt64
+hx : x.toNat < 8646911288846319616
+ht : (montyQuotient x).toNat < 4294967296
+hl : 2013265921 * (montyQuotient x).toNat % 4294967296 = x.toNat % 4294967296
+h :
+  (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+        (18446744069414584320 +
+            (2013265921 +
+              (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                4294967296)) %
+          18446744073709551616
+      else
+        (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 / 4294967296) <
+      2013265921 ∧
+    (if x.toNat < 2013265921 * (montyQuotient x).toNat then
+            (18446744069414584320 +
+                (2013265921 +
+                  (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+                    4294967296)) %
+              18446744073709551616
+          else
+            (18446744073709551616 - 2013265921 * (montyQuotient x).toNat + x.toNat) % 18446744073709551616 /
+              4294967296) *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+hu : True
+h✝ : 2013265921 * (montyQuotient x).toNat % 18446744073709551616 ≤ x.toNat
+⊢ (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+          18446744073709551616 /
+        4294967296 <
+      2013265921 ∧
+    (18446744073709551616 - 2013265921 * (montyQuotient x).toNat % 18446744073709551616 + x.toNat) %
+              18446744073709551616 /
+            4294967296 *
+          4294967296 %
+        2013265921 =
+      x.toNat % 2013265921
+[?2004hroot@fe83daf3e3a3:/workspace/lean# 
