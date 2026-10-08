@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Generate symmetric Harbor task pairs from the shared source kernel."""
+"""Generate symmetric Harbor task pairs from the shared source kernel.
+
+By default (`--problem challenge`), generates the 6 non-redundant Challenge
+Benchmark pairs (12 Harbor tasks). Pass `--problem all` to also generate the
+auxiliary calibration/regression pairs (`authorization`, `settlement`,
+`settlement-modular`, `openpql`).
+"""
 import argparse
 from pathlib import Path
 import shutil
 import subprocess
 
 ROOT=Path(__file__).resolve().parents[1]
-PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine')
+CHALLENGE_PROBLEMS=('settlement-engine','goldilocks','whirlpool','plonky3','succinct','ruint')
+ALL_PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3','succinct','openpql','ruint')
 p=argparse.ArgumentParser()
 p.add_argument('output',type=Path)
-p.add_argument('--problem',choices=('all',)+PROBLEMS,default='all',help='which task family to generate')
+p.add_argument('--problem',choices=('challenge','all')+ALL_PROBLEMS,default='challenge',help='which task family to generate (default: challenge = 6 core pairs / 12 tasks)')
 p.add_argument('--build-api',action='store_true',help='rebuild pinned Lean APIs with local lake')
 a=p.parse_args()
-selected=PROBLEMS if a.problem=='all' else (a.problem,)
+selected=CHALLENGE_PROBLEMS if a.problem=='challenge' else (ALL_PROBLEMS if a.problem=='all' else (a.problem,))
 for problem in selected:
     for variant in ('vulnerable','safe'):
         task=a.output/(problem+'-'+variant)
@@ -36,7 +43,7 @@ for problem in selected:
                 shutil.copy(ROOT/'scripts/references/safe-Proof.lean',task/'solution/Proof.lean')
                 (task/'solution/counterexample.json').unlink()
                 (task/'solution/src/lib.rs').unlink()
-        elif problem.startswith('settlement'):
+        else:
             pdir=ROOT/'problems'/problem
             for path in (task/'environment/workspace/challenge/src/lib.rs',verifier/'pristine/lib.rs'):
                 shutil.copy(pdir/variant/'lib.rs',path)

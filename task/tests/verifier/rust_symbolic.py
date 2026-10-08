@@ -2,9 +2,9 @@
 from dataclasses import dataclass
 import re
 import z3
-from spec import MAX, Unsupported, expected_debit_z3, query
+from spec import MAX, Unsupported, expected_debit_z3, query, _bitand_z3, _bitor_z3, _bitxor_z3
 
-TOKEN = re.compile(r'\s+|//[^\n]*|/\*|"(?:\\.|[^"\\])*"|[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9_]*(?:u64|u128)?|::|->|=>|<=|>=|==|!=|&&|\|\||[^\s]')
+TOKEN = re.compile(r'\s+|//[^\n]*|/\*|"(?:\\.|[^"\\])*"|0x[0-9A-Fa-f_]+(?:u32|u64|u128)?|[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9_]*(?:u32|u64|u128)?|::|->|=>|<<|>>|<=|>=|==|!=|&&|\|\||[^\s]')
 
 
 def tokenize(source):
@@ -29,7 +29,8 @@ def tokenize(source):
 class Parser:
     def __init__(self, source, allow_u128=True, allow_modules=False):
         self.ts = tokenize(source); self.i = 0; self.nodes = 0
-        self.int_types = ('u64', 'u128') if allow_u128 else ('u64',)
+        base_ints = ('u32', 'u64') if allow_modules else ('u64',)
+        self.int_types = base_ints + (('u128',) if allow_u128 else ())
         self.allow_modules = allow_modules
         self.structs = {}
         self.item_names = set()
@@ -59,7 +60,17 @@ class Parser:
         return self.ts[begin:self.i-1]
     def parse_type(self):
         t = self.take()
+        while self.allow_modules and self.accept('::'):
+            t = self.name()
         if t in self.int_types or t == 'bool': return t
+        if t == '(':
+            items = []
+            while not self.accept(')'):
+                items.append(self.parse_type())
+                if not self.accept(',') and self.peek() != ')':
+                    raise Unsupported('expected comma in tuple type')
+            if len(items) < 2: raise Unsupported('tuple type requires at least 2 elements')
+            return ('tuple', items)
         if t == 'Option':
             self.take('<'); inner = self.parse_type(); self.take('>')
             return ('Option', inner)
@@ -103,6 +114,7 @@ class Parser:
     def helper_fn_decl(self, fname, funcs, mod_prefix=''):
         self.take('('); params = []
         while not self.accept(')'):
+            self.accept('mut')
             pname = self.name(); self.take(':'); pty = self.parse_type()
             params.append((pname, pty))
             if not self.accept(',') and self.peek() != ')':
@@ -168,6 +180,7 @@ class Parser:
                     if not is_pub or state['body'] is not None: raise Unsupported('duplicate or private authorize')
                     self.take('('); names = []
                     for n in range(3):
+                        self.accept('mut')
                         names.append(self.name()); self.take(':'); self.take('u64')
                         if n < 2: self.take(',')
                     self.accept(','); self.take(')'); self.take('->')
@@ -195,11 +208,28 @@ class Parser:
         self.take('{'); statements = []
         while not self.accept('}'):
             if self.accept('let'):
-                name = self.name(); ty = None
-                if self.accept(':'):
-                    ty = self.parse_type()
-                self.take('='); value = self.expr(); self.take(';')
-                statements.append(('let', name, ty, value))
+                if self.accept('('):
+                    names = []
+                    while not self.accept(')'):
+                        self.accept('mut')
+                        names.append(self.name())
+                        if not self.accept(',') and self.peek() != ')':
+                            raise Unsupported('expected comma in tuple let')
+                    if len(names) < 2 or len(set(names)) != len(names):
+                        raise Unsupported('invalid tuple let pattern')
+                    ty = self.parse_type() if self.accept(':') else None
+                    self.take('='); value = self.expr(); self.take(';')
+                    statements.append(('let_tuple', names, ty, value))
+                else:
+                    self.accept('mut')
+                    name = self.name(); ty = None
+                    if self.accept(':'):
+                        ty = self.parse_type()
+                    self.take('='); value = self.expr(); self.take(';')
+                    statements.append(('let', name, ty, value))
+            elif re.fullmatch('[A-Za-z_][A-Za-z_0-9]*', self.peek()) and self.peek(1) == '=':
+                name = self.take(); self.take('='); value = self.expr(); self.take(';')
+                statements.append(('assign', name, value))
             else:
                 value = self.expr()
                 if self.accept(';'): statements.append(('stmt', value))
@@ -210,10 +240,20 @@ class Parser:
         return ('block', statements)
     def expr(self, minimum=0):
         self.nodes += 1
-        if self.nodes > 1024: raise Unsupported('expression limit exceeded')
+        if self.nodes > 2048: raise Unsupported('expression limit exceeded')
         t = self.take()
         if t == '(':
-            left = self.expr(); self.take(')')
+            first = self.expr()
+            if self.accept(','):
+                items = [first]
+                while not self.accept(')'):
+                    items.append(self.expr())
+                    if not self.accept(',') and self.peek() != ')':
+                        raise Unsupported('expected comma in tuple expression')
+                left = ('tuple', items)
+            else:
+                self.take(')')
+                left = first
         elif t == '{':
             self.i -= 1; left = self.block()
         elif t == 'return': left = ('return', self.expr())
@@ -247,16 +287,21 @@ class Parser:
             self.take('('); val = self.expr(); self.take(')'); left = ('some', val)
         elif t == 'None': left = ('none',)
         elif t in ('true', 'false'): left = ('bool', t == 'true')
-        elif re.fullmatch(r'[0-9][0-9_]*(?:u64|u128)?', t):
-            m = re.fullmatch(r'([0-9_]+)(u64|u128)?', t)
+        elif re.fullmatch(r'0x[0-9A-Fa-f_]+(?:u32|u64|u128)?', t):
+            m = re.fullmatch(r'0x([0-9A-Fa-f_]+)(u32|u64|u128)?', t)
+            if m[2] and m[2] not in self.int_types: raise Unsupported('unsupported integer width')
+            left = ('num', int(m[1].replace('_', ''), 16), m[2])
+        elif re.fullmatch(r'[0-9][0-9_]*(?:u32|u64|u128)?', t):
+            m = re.fullmatch(r'([0-9_]+)(u32|u64|u128)?', t)
             if m[2] and m[2] not in self.int_types: raise Unsupported('unsupported integer width')
             left = ('num', int(m[1].replace('_', '')), m[2])
-        elif t in ('u64', 'u128') and self.accept('::'):
+        elif t in ('u32', 'u64', 'u128') and self.accept('::'):
             if t not in self.int_types: raise Unsupported('unsupported integer width')
             item = self.take()
-            if item == 'MAX': left = ('num', 2**(64 if t == 'u64' else 128)-1, t)
-            elif item == 'from' and t == 'u128':
-                self.take('('); val = self.expr(); self.take(')'); left = ('cast', val, 'u128')
+            width = 32 if t == 'u32' else 64 if t == 'u64' else 128
+            if item == 'MAX': left = ('num', 2**width - 1, t)
+            elif item == 'from' and t in ('u64', 'u128'):
+                self.take('('); val = self.expr(); self.take(')'); left = ('cast', val, t)
             else: raise Unsupported('unsupported associated item')
         elif re.fullmatch('[A-Za-z_][A-Za-z_0-9]*', t):
             ident = t
@@ -284,16 +329,27 @@ class Parser:
             else:
                 left = ('var', ident)
         else: raise Unsupported('unsupported expression: ' + t)
-        precedence = {'||': 10, '&&': 20, '==': 30, '!=': 30, '<': 40, '>': 40, '<=': 40, '>=': 40, '+': 50, '-': 50, '*': 60, '/': 60, '%': 60}
+        precedence = {
+            '||': 10, '&&': 20,
+            '==': 30, '!=': 30, '<': 40, '>': 40, '<=': 40, '>=': 40,
+            '|': 42, '^': 44, '&': 46, '<<': 48, '>>': 48,
+            '+': 50, '-': 50, '*': 60, '/': 60, '%': 60,
+        }
         while True:
             t = self.peek()
             if t == '.' and 90 >= minimum:
-                self.take(); member = self.name()
+                self.take()
+                if re.fullmatch(r'[0-9]+', self.peek()):
+                    idx_tok = self.take()
+                    left = ('tuple_index', left, int(idx_tok))
+                    continue
+                member = self.name()
                 if self.accept('('):
                     arg = self.expr(); self.take(')')
                     if member not in ('checked_add', 'checked_sub', 'checked_mul', 'checked_div', 'checked_rem',
-                                      'wrapping_add', 'wrapping_sub', 'wrapping_mul', 'saturating_add', 'saturating_sub',
-                                      'div_ceil', 'then_some'):
+                                      'wrapping_add', 'wrapping_sub', 'wrapping_mul',
+                                      'overflowing_add', 'overflowing_sub', 'overflowing_mul',
+                                      'saturating_add', 'saturating_sub', 'div_ceil', 'then_some'):
                         raise Unsupported('unsupported method ' + member)
                     left = ('method', member, left, arg)
                 elif self.allow_modules:
@@ -318,12 +374,24 @@ class Value:
     data: object = None
 
 
+def _int_width(ty):
+    if ty == 'u32': return 32
+    if ty == 'u64': return 64
+    if ty == 'u128': return 128
+    raise Unsupported(f'expected integer type, got {ty}')
+
+
 def check_val_type(v, expected_ty):
-    if expected_ty in ('u64', 'u128', 'bool'):
+    if expected_ty in ('u32', 'u64', 'u128', 'bool'):
         return typed(v, expected_ty)
     if expected_ty == 'Authorization':
         if v.ty != 'auth': raise Unsupported('expected Authorization value')
         return v
+    if isinstance(expected_ty, tuple) and expected_ty[0] == 'tuple':
+        if not (isinstance(v.ty, tuple) and v.ty[0] == 'tuple' and len(v.data) == len(expected_ty[1])):
+            raise Unsupported('tuple type mismatch')
+        checked_items = [check_val_type(item, ety) for item, ety in zip(v.data, expected_ty[1])]
+        return Value(('tuple', [c.ty for c in checked_items]), checked_items)
     if isinstance(expected_ty, tuple) and expected_ty[0] == 'struct':
         if v.ty != expected_ty: raise Unsupported(f'expected struct {expected_ty[1]}, got {v.ty}')
         return v
@@ -336,8 +404,9 @@ def check_val_type(v, expected_ty):
 
 
 def typed(v, ty):
-    if v.ty == 'literal' and ty in ('u64', 'u128'):
-        if not 0 <= v.data < 2**(64 if ty == 'u64' else 128): raise Unsupported('literal out of range')
+    if v.ty == 'literal' and ty in ('u32', 'u64', 'u128'):
+        w = _int_width(ty)
+        if not 0 <= v.data < 2**w: raise Unsupported('literal out of range')
         return Value(ty, z3.IntVal(v.data))
     if v.ty != ty: raise Unsupported(f'type mismatch: {v.ty} vs {ty}')
     return v
@@ -345,14 +414,11 @@ def typed(v, ty):
 
 def pair(a, b):
     if a.ty == 'literal' and b.ty == 'literal':
-        # Rust can default an uncontextualized literal expression to i32.
-        # Guessing u64 here would miss signed negative intermediates. Require
-        # an explicit suffix or an already typed operand instead.
-        raise Unsupported('two untyped integer operands require an explicit u64/u128 suffix')
+        raise Unsupported('two untyped integer operands require an explicit integer suffix')
     elif a.ty == 'literal': a = typed(a, b.ty)
     elif b.ty == 'literal': b = typed(b, a.ty)
-    if a.ty != b.ty or a.ty not in ('u64', 'u128'): raise Unsupported('integer operands required')
-    return a, b, 2**(64 if a.ty == 'u64' else 128)
+    if a.ty != b.ty or a.ty not in ('u32', 'u64', 'u128'): raise Unsupported('integer operands required')
+    return a, b, 2**_int_width(a.ty)
 
 
 class Interpreter:
@@ -364,23 +430,36 @@ class Interpreter:
         self.call_depth = 0
     def evaluate(self, e, env, guard):
         self.steps += 1
-        if self.steps > 8192: raise Unsupported('symbolic expansion limit exceeded')
+        if self.steps > 16384: raise Unsupported('symbolic expansion limit exceeded')
         k = e[0]
         if k == 'block':
             active = [(guard, dict(env))]; completed = []
             for stmt in e[1]:
                 next_active = []
                 for g, local in active:
-                    rhs = stmt[3] if stmt[0] == 'let' else stmt[1]
+                    kind = stmt[0]
+                    rhs = stmt[3] if kind in ('let', 'let_tuple') else stmt[2] if kind == 'assign' else stmt[1]
                     for h, val in self.evaluate(rhs, local, g):
                         if val.ty == 'return': completed.append((h, val)); continue
-                        if stmt[0] == 'tail': completed.append((h, val)); continue
+                        if kind == 'tail': completed.append((h, val)); continue
                         new_env = dict(local)
-                        if stmt[0] == 'let':
+                        if kind == 'let':
                             if stmt[2]: val = check_val_type(val, stmt[2])
-                            # Rust defaults unconstrained integer lets to i32, outside this subset.
-                            if val.ty == 'literal': raise Unsupported('integer let needs u64/u128 annotation')
+                            if val.ty == 'literal': raise Unsupported('integer let needs explicit type annotation')
                             new_env[stmt[1]] = val
+                        elif kind == 'let_tuple':
+                            names, ty_ann = stmt[1], stmt[2]
+                            if ty_ann: val = check_val_type(val, ty_ann)
+                            if not (isinstance(val.ty, tuple) and val.ty[0] == 'tuple' and len(val.data) == len(names)):
+                                raise Unsupported('let tuple destructuring requires matching tuple value')
+                            for nm, elem in zip(names, val.data):
+                                if elem.ty == 'literal': raise Unsupported('tuple element needs explicit type')
+                                new_env[nm] = elem
+                        elif kind == 'assign':
+                            target_name = stmt[1]
+                            if target_name not in new_env: raise Unsupported('assignment to unbound variable ' + target_name)
+                            expected_ty = new_env[target_name].ty
+                            new_env[target_name] = check_val_type(val, expected_ty)
                         next_active.append((h, new_env))
                 active = next_active
             return completed + [(g, Value('unit')) for g, _ in active]
@@ -394,6 +473,32 @@ class Interpreter:
             return [(guard, val)]
         if k == 'bool': return [(guard, Value('bool', z3.BoolVal(e[1])))]
         if k in ('none', 'unit'): return [(guard, Value(k))]
+        if k == 'tuple':
+            items = e[1]
+            active = [(guard, [])]
+            for item_expr in items:
+                next_active = []
+                for g, acc in active:
+                    if isinstance(acc, Value) and acc.ty == 'return':
+                        next_active.append((g, acc)); continue
+                    for h, v in self.evaluate(item_expr, env, g):
+                        if v.ty == 'return': next_active.append((h, v)); continue
+                        next_active.append((h, acc + [v]))
+                active = next_active
+            out = []
+            for g, acc in active:
+                if isinstance(acc, Value) and acc.ty == 'return': out.append((g, acc))
+                else: out.append((g, Value(('tuple', [x.ty for x in acc]), acc)))
+            return out
+        if k == 'tuple_index':
+            target, idx = e[1], e[2]
+            out = []
+            for g, val in self.evaluate(target, env, guard):
+                if val.ty == 'return': out.append((g, val)); continue
+                if not (isinstance(val.ty, tuple) and val.ty[0] == 'tuple' and 0 <= idx < len(val.data)):
+                    raise Unsupported(f'invalid tuple index .{idx}')
+                out.append((g, val.data[idx]))
+            return out
         if k == 'struct':
             sname, fexprs = e[1], e[2]
             if sname not in self.structs: raise Unsupported('unknown struct ' + sname)
@@ -471,8 +576,11 @@ class Interpreter:
                     elif val.ty == 'some': val = val.data
                     else: raise Unsupported('? requires Option')
                 elif k == 'cast':
-                    if val.ty == 'literal': val = typed(val, e[2])
-                    elif val.ty in ('u64', 'u128'): val = Value(e[2], val.data % 2**(64 if e[2] == 'u64' else 128))
+                    target_ty = e[2]
+                    if val.ty == 'literal': val = typed(val, target_ty)
+                    elif val.ty in ('u32', 'u64', 'u128'):
+                        src_w, dst_w = _int_width(val.ty), _int_width(target_ty)
+                        val = Value(target_ty, val.data if dst_w >= src_w else (val.data % 2**dst_w))
                     else: raise Unsupported('integer cast required')
                 elif k == 'not': val = Value('bool', z3.Not(typed(val, 'bool').data))
                 out.append((g, val))
@@ -483,8 +591,17 @@ class Interpreter:
                 if val.ty == 'return': out.append((g, val)); continue
                 if k == 'if':
                     condition = typed(val, 'bool').data
-                    out += self.evaluate(e[2], env, z3.And(g, condition))
-                    out += self.evaluate(e[3], env, z3.And(g, z3.Not(condition)))
+                    tp = self.evaluate(e[2], env, z3.And(g, condition))
+                    fp = self.evaluate(e[3], env, z3.And(g, z3.Not(condition)))
+                    if (
+                        len(tp) == 1
+                        and len(fp) == 1
+                        and tp[0][1].ty == fp[0][1].ty
+                        and tp[0][1].ty in ('u32', 'u64', 'u128', 'bool')
+                    ):
+                        out.append((g, Value(tp[0][1].ty, z3.If(condition, tp[0][1].data, fp[0][1].data))))
+                    else:
+                        out += tp + fp
                 else:
                     if val.ty not in ('some', 'none'): raise Unsupported('Option pattern required')
                     local = dict(env)
@@ -514,6 +631,20 @@ class Interpreter:
                         condition = typed(a, 'bool').data
                         out += [(z3.And(h, condition), Value('some', b)), (z3.And(h, z3.Not(condition)), Value('none'))]
                         continue
+                    if op in ('<<', '>>'):
+                        a_typed = typed(a, b.ty) if a.ty == 'literal' and b.ty in ('u32', 'u64', 'u128') else a
+                        if a_typed.ty not in ('u32', 'u64', 'u128'):
+                            raise Unsupported('shift LHS requires explicit integer type')
+                        w = _int_width(a_typed.ty)
+                        mod_w = 1 << w
+                        shift_expr = z3.IntVal(b.data) if b.ty == 'literal' else b.data
+                        ys = z3.simplify(shift_expr)
+                        if not z3.is_int_value(ys) or not 0 <= ys.as_long() < w:
+                            raise Unsupported('shift requires constant shift amount within type width')
+                        factor = 1 << ys.as_long()
+                        res = (a_typed.data * factor) % mod_w if op == '<<' else (a_typed.data / factor)
+                        out.append((h, Value(a_typed.ty, res)))
+                        continue
                     a1, b1, modulus = pair(a, b); x, y = a1.data, b1.data
                     if op in ('checked_add', 'checked_sub'):
                         result = x+y if op == 'checked_add' else x-y
@@ -521,13 +652,24 @@ class Interpreter:
                         out += [(z3.And(h, ok), Value('some', Value(a1.ty, result))),
                                 (z3.And(h, z3.Not(ok)), Value('none'))]
                     elif op == 'checked_mul':
-                        xs, ys = z3.simplify(x), z3.simplify(y)
-                        if not (z3.is_int_value(xs) or z3.is_int_value(ys)):
-                            raise Unsupported('nonlinear multiplication')
                         result = x*y
                         ok = z3.And(result >= 0, result < modulus)
                         out += [(z3.And(h, ok), Value('some', Value(a1.ty, result))),
                                 (z3.And(h, z3.Not(ok)), Value('none'))]
+                    elif op in ('overflowing_add', 'overflowing_sub', 'overflowing_mul'):
+                        if op == 'overflowing_add':
+                            raw = x + y
+                            wrapped = z3.If(raw >= modulus, raw - modulus, raw)
+                            ovf = raw >= modulus
+                        elif op == 'overflowing_sub':
+                            wrapped = z3.If(x >= y, x - y, x + modulus - y)
+                            ovf = x < y
+                        else:
+                            raw = x * y
+                            wrapped = raw % modulus
+                            ovf = raw >= modulus
+                        tup = Value(('tuple', [a1.ty, 'bool']), [Value(a1.ty, wrapped), Value('bool', ovf)])
+                        out.append((h, tup))
                     elif op in ('checked_div', 'checked_rem'):
                         ys = z3.simplify(y)
                         if not z3.is_int_value(ys): raise Unsupported('division/modulo requires constant divisor')
@@ -537,12 +679,20 @@ class Interpreter:
                             res = x / ys if op == 'checked_div' else x % ys
                             out.append((h, Value('some', Value(a1.ty, res))))
                     elif op in ('+', '-', 'wrapping_add', 'wrapping_sub'):
-                        out.append((h, Value(a1.ty, ((x+y) if op in ('+', 'wrapping_add') else (x-y)) % modulus)))
+                        if op in ('+', 'wrapping_add'):
+                            raw = x + y
+                            wrapped = z3.If(raw >= modulus, raw - modulus, raw)
+                        else:
+                            wrapped = z3.If(x >= y, x - y, x + modulus - y)
+                        out.append((h, Value(a1.ty, wrapped)))
                     elif op in ('*', 'wrapping_mul'):
-                        xs, ys = z3.simplify(x), z3.simplify(y)
-                        if not (z3.is_int_value(xs) or z3.is_int_value(ys)):
-                            raise Unsupported('nonlinear multiplication')
                         out.append((h, Value(a1.ty, (x*y) % modulus)))
+                    elif op == '&':
+                        out.append((h, Value(a1.ty, _bitand_z3(x, y) % modulus)))
+                    elif op == '|':
+                        out.append((h, Value(a1.ty, _bitor_z3(x, y) % modulus)))
+                    elif op == '^':
+                        out.append((h, Value(a1.ty, _bitxor_z3(x, y) % modulus)))
                     elif op in ('/', '%', 'div_ceil'):
                         ys = z3.simplify(y)
                         if not z3.is_int_value(ys): raise Unsupported('division/modulo requires constant divisor')
@@ -563,9 +713,13 @@ class Interpreter:
 
 
 def check(source, problem='authorization'):
-    is_settlement = (problem == 'settlement' or problem.startswith('settlement-'))
+    is_extended = (
+        problem == 'settlement'
+        or problem.startswith('settlement-')
+        or problem in ('goldilocks', 'whirlpool', 'plonky3', 'succinct', 'openpql', 'ruint')
+    )
     consts, structs, funcs, names, body = Parser(
-        source, allow_u128=not is_settlement, allow_modules=is_settlement
+        source, allow_u128=not is_extended, allow_modules=is_extended
     ).program()
     const_env = {}
     boot_interp = Interpreter(structs=structs, funcs=funcs, const_env=const_env)
@@ -601,7 +755,7 @@ def check(source, problem='authorization'):
     result = query(counterexample, variables)
     prop = ('Some iff mathematical amount+fee<=balance; Some.total_debit=amount+fee'
             if problem == 'authorization' else
-            'Some iff mathematical settlement debit<=balance; Some.total_debit=settlement debit')
+            f'Some iff mathematical {problem} debit<=balance; Some.total_debit={problem} debit')
     result.update(backend='bounded Rust subset / Z3 4.13.3; exact full u64 input domain', paths=len(paths),
                   property=prop)
     return result

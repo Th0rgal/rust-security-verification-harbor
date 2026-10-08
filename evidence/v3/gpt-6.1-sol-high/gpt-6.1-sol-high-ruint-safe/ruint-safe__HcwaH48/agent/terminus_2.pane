@@ -1,0 +1,2244 @@
+[?2004hroot@29632b6f993a:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@29632b6f993a:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@29632b6f993a:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mg10 {
+    pub const MG10_DIVISOR: u64 = 0x8003u64;
+    pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+    pub const LIMB_MASK: u64 = 0xFFFFu64;
+    pub const SUB_BIAS: u64 = 0xC000_0000u64;
+
+    /// Möller-Granlund 2-by-1 normalized division (`alloy-rs/ruint` `src/algorithms/div/small.rs`)
+    /// for fixed normalized divisor `D = 0x8003 = 32771` and reciprocal
+    /// `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65524`.
+    /// Given `u1 < D` and `u0 < 2^16`, returns `floor((u1 * 2^16 + u0) / D)`.
+    #[inline]
+    pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+        let q_full: u64 = (u1 * MG10_RECIPROCAL) + (u1 << 16u64) + u0 + (1u64 << 16u64);
+
+        let q1: u64 = q_full >> 16u64;
+        let q0: u64 = q_full & LIMB_MASK;
+        let r: u64 = (SUB_BIAS + u0 - q1 * MG10_DIVISOR) & LIMB_MASK;
+
+        let (q_corr, r_corr) = if q0 < r {
+            (q1 - 1u64, (r + MG10_DIVISOR) & LIMB_MASK)
+        } else {
+            (q1, r)
+        };
+
+        if r_corr >= MG10_DIVISOR {
+            q_corr + 1u64
+        } else {
+            q_corr
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mg10;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RuintQuote {
+        pub u1: u64,
+        pub u0: u64,
+        pub quotient: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<RuintQuote> {
+        let u1: u64 = fee % mg10::MG10_DIVISOR;
+        let u0: u64 = amount & mg10::LIMB_MASK;
+        let quotient: u64 = mg10::div_2x1_mg10(u1, u0);
+        let total_debit: u64 = (amount >> 1u64) + quotient;
+        Some(RuintQuote {
+            u1,
+            u0,
+            quotient,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: RuintQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Ruint Möller-Granlund 2-by-1 normalized division settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `D = 32771` (`0x8003`), `B = 2^16 = 65536`
+/// - `u1 = fee mod D`, `u0 = amount mod B`
+/// - `quotient = floor((u1 * B + u0) / D)`
+/// - `total_debit = floor(amount / 2) + quotient`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::RuintQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn exact_multiple_of_divisor() {
+        // u1 = 1, u0 = 0 -> u = 65536 -> floor(65536 / 32771) = 1
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn two_limb_dividend_matches_policy() {
+        // amount = 32771 (u0 = D), fee = 10 (u1 = 10):
+        // u = 10 * 65536 + 32771 = 688131 -> q = 688131 / 32771 = 20
+        // total_debit = (32771 / 2) + 20 = 16385 + 20 = 16405
+        assert_eq!(
+            authorize(16_405, 32_771, 10),
+            Some(Authorization {
+                total_debit: 16_405
+            })
+        );
+    }
+}
+[?2004hroot@29632b6f993a:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004lnamespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def mg10Divisor : UInt64 := 0x8003
+def mg10Reciprocal : UInt64 := 0xFFF4
+def limbMask : UInt64 := 0xFFFF
+def subBias : UInt64 := 0xC0000000
+
+structure RuintQuote where
+  u1 : UInt64
+  u0 : UInt64
+  quotient : UInt64
+  totalDebit : UInt64
+
+def div2x1Mg10 (u1 u0 : UInt64) : UInt64 :=
+  let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+  let q1 := qFull >>> 16
+  let q0 := qFull &&& limbMask
+  let r := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+  let (qCorr, rCorr) :=
+    if q0 < r then
+      (q1 - 1, (r + mg10Divisor) &&& limbMask)
+    else
+      (q1, r)
+  if mg10Divisor ≤ rCorr then
+    qCorr + 1
+  else
+    qCorr
+
+def buildQuote (amount fee : UInt64) : Option RuintQuote :=
+  let u1 := fee % mg10Divisor
+  let u0 := amount &&& limbMask
+  let quotient := div2x1Mg10 u1 u0
+  let totalDebit := (amount >>> 1) + quotient
+  some {
+    u1 := u1,
+    u0 := u0,
+    quotient := quotient,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : RuintQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@29632b6f993a:/workspace# cat /workspace/lean/check.py; ls -la /workspace/lean; ls -la /workspace/submission
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+total 180
+drwxr-xr-x 1 root root   4096 Oct  8 11:16 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2049 Oct  8 11:16 SecurityChallenge.lean
+-rw-r--r-- 1 root root 158104 Oct  8 11:16 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  7 08:20 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+total 24
+drwxr-xr-x 1 root root 4096 Oct  8 11:16 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  8 11:16 [01;34msrc[0m
+[?2004hroot@29632b6f993a:/workspace# cat /workspace/submission/{Spec,Audit,Proof}.lean; ls -la /workspace/submission/src; which lean; lean --version; cat /workspace/challenge/Cargo.toml
+[?2004limport SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+total 8
+drwxr-xr-x 2 root root 4096 Oct  8 11:16 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  8 11:16 [01;34m..[0m
+/opt/lean/bin/lean
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@29632b6f993a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> import random
+[?2004l[?2004h> D=32771; B=65536
+[?2004l[?2004h> random.seed(0)
+[?2004l[?2004h> def test(u1,u0):
+[?2004l[?2004h>     qfull=u1*65524+u1*B+u0+B
+[?2004l[?2004h>     q1=qfull>>16; q0=qfull&65535
+[?2004l[?2004h>     r=(0xC0000000+u0-q1*D)&65535
+[?2004l[?2004h>     qc,rc=(q1-1,(r+D)&65535) if q0<r else (q1,r)
+[?2004l[?2004h>     q=qc+1 if rc>=D else qc
+[?2004l[?2004h>     expected=(u1*B+u0)//D
+[?2004l[?2004h>     if q!=expected:
+[?2004l[?2004h>         print('MISMATCH',u1,u0,'got',q,'expected',expected,'q0',q0,'r',r,'q1',q1)
+[?2004l[?2004h>         return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> for u1 in [0,1,2,D//2,D-2,D-1]:
+[?2004l[?2004h>     for u0 in range(B):
+[?2004l[?2004h>         if test(u1,u0): raise SystemExit
+[?2004l[?2004h> for _ in range(2000000):
+[?2004l[?2004h>     if test(random.randrange(D),random.randrange(B)): break
+[?2004l[?2004h> else: print('No mismatch in sampled inputs')
+[?2004l[?2004h> PY
+[?2004lNo mismatch in sampled inputs
+[?2004hroot@29632b6f993a:/workspace# ls /opt/rvb-deps; cat /workspace/lean/Signature.lean; find /opt/lean/src/lean -iname '*UInt*' -o -iname '*BitVec*' | head -30
+[?2004l[0m[01;34mpackages[0m  requirements-verifier.txt
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/Normalize/IntToBitVec.lean
+/opt/lean/src/lean/Lean/Meta/Tactic/Simp/BuiltinSimprocs/UInt.lean
+/opt/lean/src/lean/Lean/Meta/Tactic/Simp/BuiltinSimprocs/BitVec.lean
+/opt/lean/src/lean/Init/GrindInstances/Ring/UInt.lean
+/opt/lean/src/lean/Init/GrindInstances/Ring/BitVec.lean
+/opt/lean/src/lean/Init/Data/Range/Polymorphic/UInt.lean
+/opt/lean/src/lean/Init/Data/Range/Polymorphic/BitVec.lean
+/opt/lean/src/lean/Init/Data/Range/Polymorphic/Internal/SignedBitVec.lean
+/opt/lean/src/lean/Init/Data/BitVec
+/opt/lean/src/lean/Init/Data/UInt
+/opt/lean/src/lean/Init/Data/Ord/UInt.lean
+/opt/lean/src/lean/Init/Data/Ord/BitVec.lean
+/opt/lean/src/lean/Init/Data/UInt.lean
+/opt/lean/src/lean/Init/Data/BitVec.lean
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean
+[?2004hroot@29632b6f993a:/workspace# ls /opt/rvb-deps/packages; grep -nE 'toNat_(add|sub|mul|shift|and|mod)|toNat_lt|lt_iff|le_iff|and.*(mod|mask)' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -100; grep -nE 'and.*(mod|two_pow|mask)|mod.*and' /opt/lean/src/lean/Init/Data/BitVec/Lemmas.lean | head -50
+[?2004l[0m[01;34mCli[0m  [01;34mLeanSearchClient[0m  [01;34mQq[0m  [01;34maeneas[0m  [01;34maesop[0m  [01;34mbatteries[0m  [01;34mhax[0m  [01;34mimportGraph[0m  [01;34mmathlib[0m  [01;34mplausible[0m  [01;34mproofwidgets[0m
+65:  @[int_toBitVec] theorem le_iff_toBitVec_le {a b : $typeName} : a ≤ b ↔ a.toBitVec ≤ b.toBitVec := .rfl
+67:  @[int_toBitVec] theorem lt_iff_toBitVec_lt {a b : $typeName} : a < b ↔ a.toBitVec < b.toBitVec := .rfl
+69:  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+71:  theorem lt_iff_toNat_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+74:    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+77:    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+79:  @[simp] protected theorem le_refl (a : $typeName) : a ≤ a := by simp [le_iff_toBitVec_le]
+134:    simpa [lt_iff_toBitVec_lt] using h
+138:  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+140:  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+142:  @[simp] protected theorem toNat_mul (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.toNat_mul  ..
+144:  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+148:  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+150:  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+152:  open $typeName (toNat_mod toNat_lt_size) in
+153:  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+156:    · rw [toNat_mod, toNat_ofNat_of_lt' h2]
+159:      · apply toNat_lt_size
+163:    simp only [lt_iff_toBitVec_lt, mod_def]
+190:  lt_iff _ _ := by
+197:    simp [Nat.mod_eq_of_lt x.toNat_lt_size]
+279:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+280:theorem UInt8.ofNat_lt_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+281:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+283:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+284:theorem UInt8.ofNat_le_iff {n : UInt8} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+285:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+288:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+289:theorem UInt16.ofNat_lt_iff {n : UInt16} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+290:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+292:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+293:theorem UInt16.ofNat_le_iff {n : UInt16} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+294:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+297:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+298:theorem UInt32.ofNat_lt_iff {n : UInt32} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+299:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+301:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+302:theorem UInt32.ofNat_le_iff {n : UInt32} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+303:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+306:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+307:theorem UInt64.ofNat_lt_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+308:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+310:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+311:theorem UInt64.ofNat_le_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+312:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+315:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+316:theorem USize.ofNat_lt_iff {n : USize} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+317:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+319:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+320:theorem USize.ofNat_le_iff {n : USize} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+321:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+329:@[simp] theorem UInt8.toNat_lt (n : UInt8) : n.toNat < 2 ^ 8 := n.toFin.isLt
+330:@[simp] theorem UInt16.toNat_lt (n : UInt16) : n.toNat < 2 ^ 16 := n.toFin.isLt
+331:@[simp] theorem UInt32.toNat_lt (n : UInt32) : n.toNat < 2 ^ 32 := n.toFin.isLt
+332:@[simp] theorem UInt64.toNat_lt (n : UInt64) : n.toNat < 2 ^ 64 := n.toFin.isLt
+345:theorem USize.toNat_lt_two_pow_numBits (n : USize) : n.toNat < 2 ^ System.Platform.numBits := n.toFin.isLt
+346:@[simp] theorem USize.toNat_lt (n : USize) : n.toNat < 2 ^ 64 := Nat.lt_of_lt_of_le n.toFin.isLt size_le
+350:theorem UInt8.toNat_lt_usizeSize (n : UInt8) : n.toNat < USize.size :=
+351:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+352:theorem UInt16.toNat_lt_usizeSize (n : UInt16) : n.toNat < USize.size :=
+353:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+354:theorem UInt32.toNat_lt_usizeSize (n : UInt32) : n.toNat < USize.size :=
+355:  Nat.lt_of_lt_of_le n.toNat_lt (by cases USize.size_eq <;> simp_all)
+380:@[simp] theorem UInt8.toNat_mod_size (n : UInt8) : n.toNat % UInt8.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+381:@[simp] theorem UInt8.toNat_mod_uInt16Size (n : UInt8) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+382:@[simp] theorem UInt8.toNat_mod_uInt32Size (n : UInt8) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+383:@[simp] theorem UInt8.toNat_mod_uInt64Size (n : UInt8) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+384:@[simp] theorem UInt8.toNat_mod_uSizeSize (n : UInt8) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+386:@[simp] theorem UInt16.toNat_mod_size (n : UInt16) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+387:@[simp] theorem UInt16.toNat_mod_uInt32Size (n : UInt16) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+388:@[simp] theorem UInt16.toNat_mod_uInt64Size (n : UInt16) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+389:@[simp] theorem UInt16.toNat_mod_uSizeSize (n : UInt16) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+391:@[simp] theorem UInt32.toNat_mod_size (n : UInt32) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+392:@[simp] theorem UInt32.toNat_mod_uInt64Size (n : UInt32) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+393:@[simp] theorem UInt32.toNat_mod_uSizeSize (n : UInt32) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_usizeSize
+395:@[simp] theorem UInt64.toNat_mod_size (n : UInt64) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+397:@[simp] theorem USize.toNat_mod_size (n : USize) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_size
+398:@[simp] theorem USize.toNat_mod_uInt64Size (n : USize) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+476:@[simp] theorem UInt8.ofNatLT_toNat (n : UInt8) : UInt8.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+477:@[simp] theorem UInt16.ofNatLT_uInt8ToNat (n : UInt8) : UInt16.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt16 := (rfl)
+478:@[simp] theorem UInt32.ofNatLT_uInt8ToNat (n : UInt8) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt32 := (rfl)
+479:@[simp] theorem UInt64.ofNatLT_uInt8ToNat (n : UInt8) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+480:@[simp] theorem USize.ofNatLT_uInt8ToNat (n : UInt8) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+482:@[simp] theorem UInt16.ofNatLT_toNat (n : UInt16) : UInt16.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+483:@[simp] theorem UInt32.ofNatLT_uInt16ToNat (n : UInt16) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt32 := (rfl)
+484:@[simp] theorem UInt64.ofNatLT_uInt16ToNat (n : UInt16) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+485:@[simp] theorem USize.ofNatLT_uInt16ToNat (n : UInt16) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+487:@[simp] theorem UInt32.ofNatLT_toNat (n : UInt32) : UInt32.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+488:@[simp] theorem UInt64.ofNatLT_uInt32ToNat (n : UInt32) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+489:@[simp] theorem USize.ofNatLT_uInt32ToNat (n : UInt32) : USize.ofNatLT n.toNat n.toNat_lt_usizeSize = n.toUSize := (rfl)
+491:@[simp] theorem UInt64.ofNatLT_toNat (n : UInt64) : UInt64.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+493:@[simp] theorem USize.ofNatLT_toNat (n : USize) : USize.ofNatLT n.toNat n.toNat_lt_size = n := (rfl)
+494:@[simp] theorem UInt64.ofNatLT_uSizeToNat (n : USize) : UInt64.ofNatLT n.toNat n.toNat_lt = n.toUInt64 := (rfl)
+663:  rw [UInt8.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+667:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+669:  rw [UInt16.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+673:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+676:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+678:  rw [UInt32.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+682:  exact Nat.lt_trans (n.toNat_lt) (by decide)
+1461:  rw_mod_cast [Int.bmod_def, BitVec.toInt, toNat_and, Nat.mod_eq_of_lt
+1462:    (Nat.and_lt_two_pow x.toNat (BitVec.isLt y))]
+1468:  exact (Nat.mod_eq_of_lt <| Nat.and_lt_two_pow _ y.isLt).symm
+1552:  eq_of_toNat_eq (by simp [Nat.and_mod_two_pow])
+2686:and we compute a modulo by `2^v`.
+4418:theorem umod_eq_and {x y : BitVec 1} : x % y = x &&& (~~~y) := by
+4477:  simp only [msb_umod, Bool.and_eq_false_imp, Bool.or_eq_false_iff, beq_eq_false_iff_ne,
+4604:  we have that for two integers `x` and `y`: `x/y = q ↔ x.ediv y = q ↔ r = x.emod y`
+4605:  and in particular: `-1/y = q ↔ -1.ediv y = q ↔ r = -1.emod y`.
+5075:        show (w + 1 + n - m) < (w + 1) by omega, Nat.mod_eq_of_lt, Bool.true_and]
+5080:      · simp [h, h₁, decide_true, Bool.true_and, Nat.mod_eq_of_lt hr]
+[?2004hroot@29632b6f993a:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- The exact settlement debit, computed in mathematical natural numbers. -/
+[?2004l[?2004h> def settlementDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 + ((fee.toNat % 32771) * 65536 + amount.toNat % 65536) / 32771
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Authorize exactly the affordable payments and report their exact debit. -/
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := settlementDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output _ amount fee totalDebit := totalDebit.toNat = settlementDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@29632b6f993a:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@29632b6f993a:/workspace# grep -nE 'toNat_(and|shift)|shift.*toNat' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean; grep -R -nE 'theorem.*(and_two_pow|and.*sub_one|and.*ones)' /opt/lean/src/lean/Init/Data/Nat/ | head -30; sed -n '120,150p' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean; grep -nE 'toNat.*(shift|and)' /opt/lean/src/lean/Init/Data/BitVec/Lemmas.lean | head -30
+[?2004l/opt/lean/src/lean/Init/Data/Nat/Power2/Lemmas.lean:34:theorem and_sub_one_testBit_log2 {n : Nat} (h : n ≠ 0) (hpow2 : ¬n.isPowerOfTwo) :
+/opt/lean/src/lean/Init/Data/Nat/Power2/Lemmas.lean:48:theorem and_sub_one_eq_zero_iff_isPowerOfTwo {n : Nat} (h : n ≠ 0) :
+/opt/lean/src/lean/Init/Data/Nat/Power2/Lemmas.lean:60:theorem ne_zero_and_sub_one_eq_zero_iff_isPowerOfTwo {n : Nat} :
+/opt/lean/src/lean/Init/Data/Nat/Bitwise/Lemmas.lean:231:theorem testBit_of_two_pow_le_and_two_pow_add_one_gt {n i : Nat}
+/opt/lean/src/lean/Init/Data/Nat/Bitwise/Lemmas.lean:532:@[simp] theorem and_two_pow_sub_one_eq_mod (x n : Nat) : x &&& 2^n - 1 = x % 2^n := by
+/opt/lean/src/lean/Init/Data/Nat/Bitwise/Lemmas.lean:538:theorem and_two_pow_sub_one_of_lt_two_pow {x : Nat} (lt : x < 2^n) : x &&& 2^n - 1 = x := by
+
+  open $typeName (toBitVec_eq_of_eq) in
+  protected theorem ne_of_toBitVec_ne {a b : $typeName} (h : a.toBitVec ≠ b.toBitVec) : a ≠ b :=
+    fun h' => absurd (toBitVec_eq_of_eq h') h
+
+  open $typeName (ne_of_toBitVec_ne toBitVec_ne_of_ne) in
+  @[int_toBitVec]
+  protected theorem ne_iff_toBitVec_ne {a b : $typeName} : a ≠ b ↔ a.toBitVec ≠ b.toBitVec :=
+    Iff.intro toBitVec_ne_of_ne ne_of_toBitVec_ne
+
+  open $typeName (ne_of_toBitVec_ne) in
+  protected theorem ne_of_lt {a b : $typeName} (h : a < b) : a ≠ b := by
+    apply ne_of_toBitVec_ne
+    apply BitVec.ne_of_lt
+    simpa [lt_iff_toBitVec_lt] using h
+
+  @[simp] protected theorem toNat_zero : (0 : $typeName).toNat = 0 := Nat.zero_mod _
+
+  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+
+  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+
+  @[simp] protected theorem toNat_mul (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.toNat_mul  ..
+
+  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+
+  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+
+  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+
+  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+598:-- Activate `toInt_eq_toNat_of_msb` if we have already seen both `x.toInt` and `x.toNat`
+1456:@[simp, grind =] theorem toNat_and (x y : BitVec v) :
+1461:  rw_mod_cast [Int.bmod_def, BitVec.toInt, toNat_and, Nat.mod_eq_of_lt
+1552:  eq_of_toNat_eq (by simp [Nat.and_mod_two_pow])
+1856:@[simp, bitvec_to_nat, grind =] theorem toNat_shiftLeft {x : BitVec v} :
+1862:  rw [toInt_eq_toNat_bmod, toNat_shiftLeft, Nat.shiftLeft_eq]
+1880:  simp only [toNat_shiftLeft, Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft, ge_iff_le]
+1888:  simp only [toNat_shiftLeft, Nat.testBit_mod_two_pow, Nat.testBit_shiftLeft, ge_iff_le]
+1931:  · simp only [toNat_ofNatLT, toNat_shiftLeft, toNat_setWidth']
+1938:theorem toNat_shiftLeftZeroExtend {x : BitVec w} :
+1942:  · simp only [shiftLeftZeroExtend_eq, toNat_shiftLeft, toNat_setWidth]
+1993:    rw [shiftLeftZeroExtend_eq, toFin_shiftLeft, toNat_setWidth, Nat.mod_eq_of_lt (by omega), Nat.shiftLeft_eq]
+2076:@[simp, bitvec_to_nat, grind =] theorem toNat_ushiftRight (x : BitVec n) (i : Nat) :
+2085:  simp [getElem_eq_testBit_toNat, toNat_ushiftRight, Nat.testBit_shiftRight, getLsbD]
+2113:theorem toNat_ushiftRight_lt (x : BitVec w) (n : Nat) (hn : n ≤ w) :
+2115:  rw [toNat_ushiftRight, Nat.shiftRight_eq_div_pow, Nat.div_lt_iff_lt_mul]
+2125:  simp only [toNat_eq, toNat_ushiftRight, toNat_ofNat, Nat.zero_mod]
+2137:  simp only [toNat_ushiftRight, ite_eq_left_iff, Nat.not_lt]
+2140:  · have h1 := Nat.mul_lt_mul_of_pos_left (toNat_ushiftRight_lt x n hn) Nat.two_pos
+2141:    simp only [toNat_ushiftRight, Nat.zero_lt_succ, Nat.mul_lt_mul_left] at h1
+2221:  simp [BitVec.toNat_eq, Nat.shiftRight_eq_div_pow, Nat.lt_two_pow_self, Nat.div_eq_of_lt]
+2237:  simp only [hxbound, ↓reduceIte, toNat_ushiftRight]
+2257:    simp only [hxbound, ↓reduceIte, toNat_ofInt, toNat_not, toNat_ushiftRight]
+2407:theorem toNat_sshiftRight_of_msb_true {x : BitVec w} {n : Nat} (h : x.msb = true) :
+2411:theorem toNat_sshiftRight_of_msb_false {x : BitVec w} {n : Nat} (h : x.msb = false) :
+2415:theorem toNat_sshiftRight {x : BitVec w} {n : Nat} :
+2421:  · simp [toNat_sshiftRight_of_msb_true, h]
+2423:    simp [toNat_sshiftRight_of_msb_false, h]
+2428:  simp only [val_toFin, toNat_sshiftRight, h, ↓reduceIte, Fin.val_ofNat]
+2437:  simp only [val_toFin, toNat_sshiftRight, h, Bool.false_eq_true, ↓reduceIte, Fin.val_ofNat]
+[?2004hroot@29632b6f993a:/workspace# grep -nE '(and_def|shiftLeft_def|shiftRight_def|toBitVec_shift|toBitVec_and)' /opt/lean/src/lean/Init/Data/UInt/{Basic,Lemmas}.lean | head -60; ls /opt/rvb-deps/packages/mathlib/.lake/build/lib/lean/Mathlib/Tactic/Omega.olean
+[?2004lls: cannot access '/opt/rvb-deps/packages/mathlib/.lake/build/lib/lean/Mathlib/Tactic/Omega.olean': No such file or directory
+[?2004hroot@29632b6f993a:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   have maskNat (x : UInt64) : (x &&& (65535 : UInt64)).toNat = x.toNat % 65536 := by
+[?2004l[?2004h>     change (x.toBitVec &&& (65535 : UInt64).toBitVec).toNat = _
+[?2004l[?2004h>     rw [BitVec.toNat_and]
+[?2004l[?2004h>     change x.toNat &&& (2^16 - 1) = _
+[?2004l[?2004h>     rw [Nat.and_two_pow_sub_one_eq_mod]
+[?2004l[?2004h>   have shrNat (x : UInt64) (n : UInt64) :
+[?2004l[?2004h>       (x >>> n).toNat = x.toNat / 2^(n.toNat % 64) := by
+[?2004l[?2004h>     change (x.toBitVec >>> (n.toNat % 64)).toNat = _
+[?2004l[?2004h>     rw [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
+[?2004l[?2004h>   have shlNat (x : UInt64) (n : UInt64) :
+[?2004l[?2004h>       (x <<< n).toNat = (x.toNat * 2^(n.toNat % 64)) % 2^64 := by
+[?2004l[?2004h>     change (x.toBitVec <<< (n.toNat % 64)).toNat = _
+[?2004l[?2004h>     rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
+[?2004l[?2004h>   have divCorrect (u1 u0 : UInt64) (h1 : u1.toNat < 32771) (h0 : u0.toNat < 65536) :
+[?2004l[?2004h>       (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771 := by
+[?2004l[?2004h>     unfold div2x1Mg10
+[?2004l[?2004h>     dsimp only
+[?2004l[?2004h>     split <;> split <;>
+[?2004l[?2004h>       simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_sub,
+[?2004l[?2004h>         maskNat, shrNat, shlNat, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le,
+[?2004l[?2004h>         mg10Divisor, mg10Reciprocal, limbMask, subBias] at *
+[?2004l[?2004h>     all_goals norm_num at *
+[?2004l[?2004h>     all_goals omega
+[?2004l[?2004h>   exact False.elim (by contradiction)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:5:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:9:1: error: unexpected token 'def'; expected term
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@29632b6f993a:/workspace# sed -i '/^\/--/d' /workspace/submission/Spec.lean; sed -i '1i import Mathlib.Tactic.NormNum' /workspace/submission/Proof.lean; python3 /workspace/lean/check.py
+[?2004lCandidateProof.lean:17:54: error: unsolved goals
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+x n : UInt64
+⊢ x.toBitVec.toNat / 2 ^ (n.toNat % 64) = x.toNat / 2 ^ (n.toNat % 64)
+CandidateProof.lean:21:63: error: unsolved goals
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+x n : UInt64
+⊢ x.toBitVec.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64 = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+CandidateProof.lean:33:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  o ≥ 0
+  0 ≤ o - 18446744073709551616*p ≤ 18446744073709551615
+  0 ≤ m ≤ 18446744073709551616
+  -18446744073709551616 ≤ l - 18446744073709551616*n ≤ -1
+  k - l + 18446744073709551616*n ≥ 18446744073709551617
+  i ≥ 0
+  g ≥ 0
+  f ≥ 0
+  e ≥ 0
+  c ≥ 0
+  c - 65536*d - e - f - g + 65536*h - o + 18446744073709551616*p ≥ -18446744073709551615
+  0 ≤ b ≤ 65535
+  0 ≤ b + e + f + g - 65536*h ≤ 65535
+  -18446744073709551616 ≤ b + c - 65536*d - o + 18446744073709551616*p ≤ -18446744073709486081
+  b + c - 65536*j - o + 18446744073709551616*p ≥ -18446744073709551616
+  -18446744073709551616 ≤ b + c + i - 65536*j - o + 18446744073709551616*p ≤ -18446744073709486081
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*k ≤ 32770
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(UInt64.toNat 3221225472)
+ d := ↑(18446744073709551616 -
+        (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+                  UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+                18446744073709551616 /
+              2 ^ (UInt64.toNat 16 % 64) *
+            UInt64.toNat 32771 %
+          18446744073709551616 +
+      (UInt64.toNat 3221225472 + u0.toNat)) /
+  65536
+ e := ↑u1.toNat * ↑(UInt64.toNat 65524)
+ f := ↑u1.toNat * ↑(2 ^ (UInt64.toNat 16 % 64))
+ g := ↑(UInt64.toNat 1) * ↑(2 ^ (UInt64.toNat 16 % 64))
+ h := ↑(u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+      UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) /
+  65536
+ i := ↑(UInt64.toNat 32771)
+ j := ↑(18446744073709551616 -
+          (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+                    UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+                  18446744073709551616 /
+                2 ^ (UInt64.toNat 16 % 64) *
+              UInt64.toNat 32771 %
+            18446744073709551616 +
+        (UInt64.toNat 3221225472 + u0.toNat) +
+      UInt64.toNat 32771) /
+  65536
+ k := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ l := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+        UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+      18446744073709551616) /
+  ↑(2 ^ (UInt64.toNat 16 % 64))
+ m := ↑(UInt64.toNat 1)
+ n := ↑(18446744073709551616 - UInt64.toNat 1 +
+        (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+              UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+            18446744073709551616 /
+          2 ^ (UInt64.toNat 16 % 64) +
+      UInt64.toNat 1) /
+  18446744073709551616
+ o := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+          UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+        18446744073709551616 /
+      2 ^ (UInt64.toNat 16 % 64)) *
+  ↑(UInt64.toNat 32771)
+ p := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+            UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+          18446744073709551616 /
+        2 ^ (UInt64.toNat 16 % 64) *
+      UInt64.toNat 32771) /
+  18446744073709551616
+CandidateProof.lean:33:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  o ≥ 0
+  0 ≤ o - 18446744073709551616*p ≤ 18446744073709551615
+  0 ≤ n ≤ 18446744073709551616
+  -18446744073709551616 ≤ l - 18446744073709551616*m - n ≤ -1
+  k - l + 18446744073709551616*m + n ≥ 18446744073709551617
+  i ≥ 0
+  g ≥ 0
+  f ≥ 0
+  e ≥ 0
+  c ≥ 0
+  c - 65536*d - e - f - g + 65536*h - o + 18446744073709551616*p ≥ -18446744073709551615
+  0 ≤ b ≤ 65535
+  0 ≤ b + e + f + g - 65536*h ≤ 65535
+  -18446744073709551616 ≤ b + c - 65536*d - o + 18446744073709551616*p ≤ -18446744073709486081
+  b + c - 65536*j - o + 18446744073709551616*p ≤ -18446744073709551617
+  -18446744073709551616 ≤ b + c + i - 65536*j - o + 18446744073709551616*p ≤ -18446744073709486081
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*k ≤ 32770
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(UInt64.toNat 3221225472)
+ d := ↑(18446744073709551616 -
+        (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+                  UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+                18446744073709551616 /
+              2 ^ (UInt64.toNat 16 % 64) *
+            UInt64.toNat 32771 %
+          18446744073709551616 +
+      (UInt64.toNat 3221225472 + u0.toNat)) /
+  65536
+ e := ↑u1.toNat * ↑(UInt64.toNat 65524)
+ f := ↑u1.toNat * ↑(2 ^ (UInt64.toNat 16 % 64))
+ g := ↑(UInt64.toNat 1) * ↑(2 ^ (UInt64.toNat 16 % 64))
+ h := ↑(u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+      UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) /
+  65536
+ i := ↑(UInt64.toNat 32771)
+ j := ↑(18446744073709551616 -
+          (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+                    UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+                  18446744073709551616 /
+                2 ^ (UInt64.toNat 16 % 64) *
+              UInt64.toNat 32771 %
+            18446744073709551616 +
+        (UInt64.toNat 3221225472 + u0.toNat) +
+      UInt64.toNat 32771) /
+  65536
+ k := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ l := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+        UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+      18446744073709551616) /
+  ↑(2 ^ (UInt64.toNat 16 % 64))
+ m := ↑(18446744073709551616 - UInt64.toNat 1 +
+      (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+            UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+          18446744073709551616 /
+        2 ^ (UInt64.toNat 16 % 64)) /
+  18446744073709551616
+ n := ↑(UInt64.toNat 1)
+ o := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+          UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+        18446744073709551616 /
+      2 ^ (UInt64.toNat 16 % 64)) *
+  ↑(UInt64.toNat 32771)
+ p := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+            UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+          18446744073709551616 /
+        2 ^ (UInt64.toNat 16 % 64) *
+      UInt64.toNat 32771) /
+  18446744073709551616
+CandidateProof.lean:33:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  n ≥ 0
+  0 ≤ n - 18446744073709551616*o ≤ 18446744073709551615
+  l ≥ 0
+  0 ≤ k + l - 18446744073709551616*m ≤ 18446744073709551615
+  j - k - l + 18446744073709551616*m ≥ 1
+  i ≥ 0
+  g ≥ 0
+  e ≥ 0
+  d ≥ 0
+  c ≥ 0
+  c + d + e - 65536*f - g + 65536*h + n - 18446744073709551616*o ≥ 18446744073709551616
+  0 ≤ b ≤ 65535
+  b + g - 65536*h - i - n + 18446744073709551616*o ≥ -18446744073709551616
+  -18446744073709551616 ≤ b + g - 65536*h - n + 18446744073709551616*o ≤ -18446744073709486081
+  0 ≤ b + c + d + e - 65536*f ≤ 65535
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*j ≤ 32770
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑u1.toNat * ↑(UInt64.toNat 65524)
+ d := ↑u1.toNat * ↑(2 ^ (UInt64.toNat 16 % 64))
+ e := ↑(UInt64.toNat 1) * ↑(2 ^ (UInt64.toNat 16 % 64))
+ f := ↑(u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+      UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) /
+  65536
+ g := ↑(UInt64.toNat 3221225472)
+ h := ↑(18446744073709551616 -
+        (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+                  UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+                18446744073709551616 /
+              2 ^ (UInt64.toNat 16 % 64) *
+            UInt64.toNat 32771 %
+          18446744073709551616 +
+      (UInt64.toNat 3221225472 + u0.toNat)) /
+  65536
+ i := ↑(UInt64.toNat 32771)
+ j := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ k := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+        UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+      18446744073709551616) /
+  ↑(2 ^ (UInt64.toNat 16 % 64))
+ l := ↑(UInt64.toNat 1)
+ m := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+            UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+          18446744073709551616 /
+        2 ^ (UInt64.toNat 16 % 64) +
+      UInt64.toNat 1) /
+  18446744073709551616
+ n := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+          UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+        18446744073709551616 /
+      2 ^ (UInt64.toNat 16 % 64)) *
+  ↑(UInt64.toNat 32771)
+ o := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+            UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+          18446744073709551616 /
+        2 ^ (UInt64.toNat 16 % 64) *
+      UInt64.toNat 32771) /
+  18446744073709551616
+CandidateProof.lean:33:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  l ≥ 0
+  0 ≤ l - 18446744073709551616*m ≤ 18446744073709551615
+  j - k ≥ 1
+  i ≥ 0
+  g ≥ 0
+  e ≥ 0
+  d ≥ 0
+  c ≥ 0
+  c + d + e - 65536*f - g + 65536*h + l - 18446744073709551616*m ≥ 18446744073709551616
+  0 ≤ b ≤ 65535
+  b + g - 65536*h - i - l + 18446744073709551616*m ≤ -18446744073709551617
+  -18446744073709551616 ≤ b + g - 65536*h - l + 18446744073709551616*m ≤ -18446744073709486081
+  0 ≤ b + c + d + e - 65536*f ≤ 65535
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*j ≤ 32770
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑u1.toNat * ↑(UInt64.toNat 65524)
+ d := ↑u1.toNat * ↑(2 ^ (UInt64.toNat 16 % 64))
+ e := ↑(UInt64.toNat 1) * ↑(2 ^ (UInt64.toNat 16 % 64))
+ f := ↑(u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+      UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) /
+  65536
+ g := ↑(UInt64.toNat 3221225472)
+ h := ↑(18446744073709551616 -
+        (u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+                  UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+                18446744073709551616 /
+              2 ^ (UInt64.toNat 16 % 64) *
+            UInt64.toNat 32771 %
+          18446744073709551616 +
+      (UInt64.toNat 3221225472 + u0.toNat)) /
+  65536
+ i := ↑(UInt64.toNat 32771)
+ j := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ k := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+        UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+      18446744073709551616) /
+  ↑(2 ^ (UInt64.toNat 16 % 64))
+ l := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+          UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+        18446744073709551616 /
+      2 ^ (UInt64.toNat 16 % 64)) *
+  ↑(UInt64.toNat 32771)
+ m := ↑((u1.toNat * UInt64.toNat 65524 + u1.toNat * 2 ^ (UInt64.toNat 16 % 64) + u0.toNat +
+            UInt64.toNat 1 * 2 ^ (UInt64.toNat 16 % 64)) %
+          18446744073709551616 /
+        2 ^ (UInt64.toNat 16 % 64) *
+      UInt64.toNat 32771) /
+  18446744073709551616
+CandidateProof.lean:34:23: error: Tactic `contradiction` failed
+
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+shlNat : ∀ (x n : UInt64), (x <<< n).toNat = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+divCorrect :
+  ∀ (u1 u0 : UInt64),
+    u1.toNat < 32771 → u0.toNat < 65536 → (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771
+⊢ False
+[?2004hroot@29632b6f993a:/workspace# grep -n 'toNat_ofNat\|toNat_toBitVec' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -25; python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'
+[?2004l[?2004h> s=open(p).read().replace('rw [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]','rw [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]\n    rfl').replace('rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]','rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]\n    rfl').replace('all_goals norm_num at *','all_goals simp [UInt64.toNat_ofNat] at *\n    all_goals norm_num at *')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l43:  @[simp] theorem toNat_ofNat' {n : Nat} : (ofNat n).toNat = n % 2 ^ $bits := BitVec.toNat_ofNat ..
+46:  theorem toNat_ofNat {n : Nat} : toNat (no_index (OfNat.ofNat n)) = n % 2 ^ $bits := toNat_ofNat'
+48:  @[simp] theorem toNat_ofNatLT {n : Nat} {h : n < size} : (ofNatLT n h).toNat = n := BitVec.toNat_ofNatLT ..
+52:  @[simp] theorem toNat_toBitVec (x : $typeName) : x.toBitVec.toNat = x.toNat := (rfl)
+60:  theorem toNat_ofNat_of_lt' {n : Nat} (h : n < size) : (ofNat n).toNat = n := by
+61:    rw [toNat, toBitVec_ofNat', BitVec.toNat_ofNat, Nat.mod_eq_of_lt h]
+62:  theorem toNat_ofNat_of_lt {n : Nat} (h : n < size) : toNat (OfNat.ofNat n) = n :=
+63:    toNat_ofNat_of_lt' h
+156:    · rw [toNat_mod, toNat_ofNat_of_lt' h2]
+250:@[simp] theorem USize.toNat_ofNat32 {n : Nat} {h : n < 4294967296} : (ofNat32 n h).toNat = n := (rfl)
+257:theorem USize.toNat_ofNat_of_lt_32 {n : Nat} (h : n < 4294967296) : toNat (ofNat n) = n :=
+258:  toNat_ofNat_of_lt (Nat.lt_of_lt_of_le h USize.le_size)
+279:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+281:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+283:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+285:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+288:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+290:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+292:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+294:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+297:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+299:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+301:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+303:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+306:  rw [lt_iff_toNat_lt, toNat_ofNat_of_lt' h]
+[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -100 /workspace/proof-check.log
+[?2004lCandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551616 ≤ g - 18446744073709551616*h ≤ -1
+  0 ≤ 32771*g - 18446744073709551616*j ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551617
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*c - 32771*g + 18446744073709551616*j ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 65536*e - 32771*g + 18446744073709551616*j ≤ -18446744076930744324
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a + 65536*c - 65536*d + 32771*g - 18446744073709551616*j ≤ 18446744076930777087
+  0 ≤ 131060*a + b - 65536*d ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g - 18446744073709551616*i ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*i ≤ 18446744073709486079
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ d := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616) / 65536
+ h := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 +
+      1) /
+  18446744073709551616
+ i := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771) /
+  18446744073709551616
+CandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551615 ≤ g - 18446744073709551616*h ≤ 0
+  0 ≤ 32771*g - 18446744073709551616*j ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551616
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*c - 32771*g + 18446744073709551616*j ≤ -18446744076930711553
+  -18446744076930809859 ≤ b - 65536*e - 32771*g + 18446744073709551616*j ≤ -18446744076930777089
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a + 65536*c - 65536*d + 32771*g - 18446744073709551616*j ≤ 18446744076930777087
+  0 ≤ 131060*a + b - 65536*d ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g - 18446744073709551616*i ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*i ≤ 18446744073709486079
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ d := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616) / 65536
+ h := ↑(18446744073709551615 +
+      (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536) /
+  18446744073709551616
+ i := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771) /
+  18446744073709551616
+CandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  f ≥ 0
+  -1 ≤ f - 18446744073709551616*g ≤ 18446744073709551614
+  0 ≤ 32771*f - 18446744073709551616*i ≤ 18446744073709551615
+  e - f + 18446744073709551616*g ≥ 2
+  0 ≤ b ≤ 65535
+  -18446744076930744317 ≤ b - 65536*d - 32771*f + 18446744073709551616*i ≤ -18446744076930711553
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*e ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*f - 18446744073709551616*i ≥ 18446744076930777088
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*f - 18446744073709551616*h ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*h ≤ 18446744073709486079
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+[?2004hroot@29632b6f993a:/workspace# head -120 /workspace/proof-check.log; ps -o pid,etime,pcpu,args -C lean
+[?2004lCandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551616 ≤ g - 18446744073709551616*h ≤ -1
+  0 ≤ 32771*g - 18446744073709551616*j ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551617
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*c - 32771*g + 18446744073709551616*j ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 65536*e - 32771*g + 18446744073709551616*j ≤ -18446744076930744324
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a + 65536*c - 65536*d + 32771*g - 18446744073709551616*j ≤ 18446744076930777087
+  0 ≤ 131060*a + b - 65536*d ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g - 18446744073709551616*i ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*i ≤ 18446744073709486079
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ d := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616) / 65536
+ h := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 +
+      1) /
+  18446744073709551616
+ i := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771) /
+  18446744073709551616
+CandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551615 ≤ g - 18446744073709551616*h ≤ 0
+  0 ≤ 32771*g - 18446744073709551616*j ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551616
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*c - 32771*g + 18446744073709551616*j ≤ -18446744076930711553
+  -18446744076930809859 ≤ b - 65536*e - 32771*g + 18446744073709551616*j ≤ -18446744076930777089
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a + 65536*c - 65536*d + 32771*g - 18446744073709551616*j ≤ 18446744076930777087
+  0 ≤ 131060*a + b - 65536*d ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g - 18446744073709551616*i ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*i ≤ 18446744073709486079
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ d := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616) / 65536
+ h := ↑(18446744073709551615 +
+      (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536) /
+  18446744073709551616
+ i := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771) /
+  18446744073709551616
+CandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  f ≥ 0
+  -1 ≤ f - 18446744073709551616*g ≤ 18446744073709551614
+  0 ≤ 32771*f - 18446744073709551616*i ≤ 18446744073709551615
+  e - f + 18446744073709551616*g ≥ 2
+  0 ≤ b ≤ 65535
+  -18446744076930744317 ≤ b - 65536*d - 32771*f + 18446744073709551616*i ≤ -18446744076930711553
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*e ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*f - 18446744073709551616*i ≥ 18446744076930777088
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*f - 18446744073709551616*h ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*h ≤ 18446744073709486079
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ f := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616) / 65536
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 + 1) /
+  18446744073709551616
+ h := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 18446744073709551616
+ i := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) % 18446744073709551616 / 65536 * 32771) /
+  18446744073709551616
+CandidateProof.lean:36:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  f ≥ 0
+  0 ≤ 32771*f - 18446744073709551616*h ≤ 18446744073709551615
+  e - f ≥ 1
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*d - 32771*f + 18446744073709551616*h ≤ -18446744076930744318
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*e ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*f - 18446744073709551616*h ≥ 18446744076930777088
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*f - 18446744073709551616*g ≤ -1
+  -65536 ≤ 131060*a + b - 18446744073709551616*g ≤ 18446744073709486079
+where
+    PID     ELAPSED %CPU COMMAND
+[?2004hroot@29632b6f993a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'; s=open(p).read(); s=s.replace('    unfold div2x1Mg10','''    have hFull : u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536 < 18446744073709551616 := by omega
+[?2004l[?2004h>     have hQ : (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 ≤ 65535 := by omega
+[?2004l[?2004h>     have hQpos : 1 ≤ (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 := by omega
+[?2004l[?2004h>     have hProd : (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 < 18446744073709551616 := by omega
+[?2004l[?2004h>     unfold div2x1Mg10'''); s=s.replace('    all_goals omega','    all_goals simp only [Nat.mod_eq_of_lt hFull, Nat.mod_eq_of_lt hProd] at *\n    all_goals omega'); open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -80 /workspace/proof-check.log
+[?2004lCandidateProof.lean:31:119: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551616 ≤ g - 18446744073709551616*h ≤ -1
+  0 ≤ 32771*g - 18446744073709551616*i ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551617
+  -1 ≤ c ≤ 65534
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*d - 32771*g + 18446744073709551616*i ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 65536*e - 32771*g + 18446744073709551616*i ≤ -18446744076930744324
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*g - 18446744073709551616*i ≤ 18446744076930777087
+  131060*a + b ≤ 18446744073709486079
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ h := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 + 1) /
+  18446744073709551616
+ i := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 18446744073709551616
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551615 ≤ g - 18446744073709551616*h ≤ 0
+  0 ≤ 32771*g - 18446744073709551616*i ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551616
+  -1 ≤ c ≤ 65534
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*d - 32771*g + 18446744073709551616*i ≤ -18446744076930711553
+  -18446744076930809859 ≤ b - 65536*e - 32771*g + 18446744073709551616*i ≤ -18446744076930777089
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*g - 18446744073709551616*i ≤ 18446744076930777087
+  131060*a + b ≤ 18446744073709486079
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ h := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) / 18446744073709551616
+ i := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 18446744073709551616
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  f ≥ 0
+  -1 ≤ f - 18446744073709551616*g ≤ 18446744073709551614
+  0 ≤ 32771*f - 18446744073709551616*h ≤ 18446744073709551615
+  e - f + 18446744073709551616*g ≥ 2
+  -1 ≤ c ≤ 65534
+  0 ≤ b ≤ 65535
+  -18446744076930744317 ≤ b - 65536*d - 32771*f + 18446744073709551616*h ≤ -18446744076930711553
+  0 ≤ a ≤ 32770
+[?2004hroot@29632b6f993a:/workspace# head -100 /workspace/proof-check.log
+[?2004lCandidateProof.lean:31:119: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551616 ≤ g - 18446744073709551616*h ≤ -1
+  0 ≤ 32771*g - 18446744073709551616*i ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551617
+  -1 ≤ c ≤ 65534
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*d - 32771*g + 18446744073709551616*i ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 65536*e - 32771*g + 18446744073709551616*i ≤ -18446744076930744324
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*g - 18446744073709551616*i ≤ 18446744076930777087
+  131060*a + b ≤ 18446744073709486079
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ h := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 + 1) /
+  18446744073709551616
+ i := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 18446744073709551616
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -18446744073709551615 ≤ g - 18446744073709551616*h ≤ 0
+  0 ≤ 32771*g - 18446744073709551616*i ≤ 18446744073709551615
+  f - g + 18446744073709551616*h ≥ 18446744073709551616
+  -1 ≤ c ≤ 65534
+  0 ≤ b ≤ 65535
+  -18446744076930777088 ≤ b - 65536*d - 32771*g + 18446744073709551616*i ≤ -18446744076930711553
+  -18446744076930809859 ≤ b - 65536*e - 32771*g + 18446744073709551616*i ≤ -18446744076930777089
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*f ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*g - 18446744073709551616*i ≤ 18446744076930777087
+  131060*a + b ≤ 18446744073709486079
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*g ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(18446744073709551616 -
+          (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+        (3221225472 + u0.toNat) +
+      32771) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ h := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) / 18446744073709551616
+ i := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 18446744073709551616
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  f ≥ 0
+  -1 ≤ f - 18446744073709551616*g ≤ 18446744073709551614
+  0 ≤ 32771*f - 18446744073709551616*h ≤ 18446744073709551615
+  e - f + 18446744073709551616*g ≥ 2
+  -1 ≤ c ≤ 65534
+  0 ≤ b ≤ 65535
+  -18446744076930744317 ≤ b - 65536*d - 32771*f + 18446744073709551616*h ≤ -18446744076930711553
+  0 ≤ a ≤ 32770
+  0 ≤ 65536*a + b - 32771*e ≤ 32770
+  131060*a - 65536*c + 65536*d + 32771*f - 18446744073709551616*h ≥ 18446744076930777088
+  131060*a + b ≤ 18446744073709486079
+  0 ≤ 131060*a + b - 65536*c ≤ 65535
+  -65536 ≤ 131060*a + b - 65536*f ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat) / 65536
+ d := ↑(18446744073709551616 -
+        (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 % 18446744073709551616 +
+      (3221225472 + u0.toNat)) /
+  65536
+ e := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ f := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 + 1) / 18446744073709551616
+ h := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 18446744073709551616
+CandidateProof.lean:41:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  f ≥ 0
+[?2004hroot@29632b6f993a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'; s=open(p).read().replace('by\n  have maskNat','set_option maxRecDepth 4096 in\nset_option maxHeartbeats 2000000 in\nby\n  have maskNat',1).replace('    all_goals simp [UInt64.toNat_ofNat] at *\n    all_goals norm_num at *','    all_goals simp only [UInt64.toNat_ofNat, Nat.reduceMod, Nat.reducePow, Nat.one_mul] at *'); open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -70 /workspace/proof-check.log
+[?2004lCandidateProof.lean:33:119: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:43:23: error: Tactic `contradiction` failed
+
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+shlNat : ∀ (x n : UInt64), (x <<< n).toNat = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+divCorrect :
+  ∀ (u1 u0 : UInt64),
+    u1.toNat < 32771 → u0.toNat < 65536 → (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771
+⊢ False
+[?2004hroot@29632b6f993a:/workspace# head -100 /workspace/proof-check.log; ps -o pid,etime,pcpu,args -C lean
+[?2004lCandidateProof.lean:33:119: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:41:14: error: `simp` made no progress
+CandidateProof.lean:43:23: error: Tactic `contradiction` failed
+
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+shlNat : ∀ (x n : UInt64), (x <<< n).toNat = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+divCorrect :
+  ∀ (u1 u0 : UInt64),
+    u1.toNat < 32771 → u0.toNat < 65536 → (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771
+⊢ False
+    PID     ELAPSED %CPU COMMAND
+[?2004hroot@29632b6f993a:/workspace# nl -ba /workspace/submission/Proof.lean; python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'; s=open(p).read().replace('65536 * 32771 < 18446744073709551616 := by omega','65536 * 32771 < 18446744073709551616 := by\n      exact lt_of_le_of_lt (Nat.mul_le_mul_right 32771 hQ) (by decide)'); s=s.replace('all_goals simp only','all_goals try simp only'); open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l     1	import Mathlib.Tactic.NormNum
+     2	set_option maxRecDepth 4096 in
+     3	set_option maxHeartbeats 2000000 in
+     4	by
+     5	  have maskNat (x : UInt64) : (x &&& (65535 : UInt64)).toNat = x.toNat % 65536 := by
+     6	    change (x.toBitVec &&& (65535 : UInt64).toBitVec).toNat = _
+     7	    rw [BitVec.toNat_and]
+     8	    change x.toNat &&& (2^16 - 1) = _
+     9	    rw [Nat.and_two_pow_sub_one_eq_mod]
+    10	  have shrNat (x : UInt64) (n : UInt64) :
+    11	      (x >>> n).toNat = x.toNat / 2^(n.toNat % 64) := by
+    12	    change (x.toBitVec >>> (n.toNat % 64)).toNat = _
+    13	    rw [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
+    14	    rfl
+    15	  have shlNat (x : UInt64) (n : UInt64) :
+    16	      (x <<< n).toNat = (x.toNat * 2^(n.toNat % 64)) % 2^64 := by
+    17	    change (x.toBitVec <<< (n.toNat % 64)).toNat = _
+    18	    rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
+    19	    rfl
+    20	  have divCorrect (u1 u0 : UInt64) (h1 : u1.toNat < 32771) (h0 : u0.toNat < 65536) :
+    21	      (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771 := by
+    22	    have hFull : u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536 < 18446744073709551616 := by omega
+    23	    have hQ : (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 ≤ 65535 := by omega
+    24	    have hQpos : 1 ≤ (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 := by omega
+    25	    have hProd : (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 < 18446744073709551616 := by omega
+    26	    unfold div2x1Mg10
+    27	    dsimp only
+    28	    split <;> split <;>
+    29	      simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_sub,
+    30	        maskNat, shrNat, shlNat, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le,
+    31	        mg10Divisor, mg10Reciprocal, limbMask, subBias] at *
+    32	    all_goals simp only [UInt64.toNat_ofNat, Nat.reduceMod, Nat.reducePow, Nat.one_mul] at *
+    33	    all_goals simp only [Nat.mod_eq_of_lt hFull, Nat.mod_eq_of_lt hProd] at *
+    34	    all_goals omega
+    35	  exact False.elim (by contradiction)
+[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -100 /workspace/proof-check.log
+[?2004lCandidateProof.lean:43:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  l ≥ 0
+  l - o - 18446744073709551616*p - 18446744073709551616*q ≤ -18446744073709551617
+  -18446744073709551615 ≤ l - 18446744073709551616*p ≤ 0
+  -18446744073709551616 ≤ l - 18446744073709551616*p - 18446744073709551616*q ≤ -1
+  0 ≤ 32771*l - 18446744073709551616*r ≤ 18446744073709551615
+  1 ≤ c ≤ 65535
+  0 ≤ b ≤ 65535
+  -3221225472 ≤ b - 18446744073709551616*d ≤ 18446744070488326143
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l - 18446744073709551616*m - 65536*n + 18446744073709551616*r ≤ -18446744076930744324
+  -18446744076930809859 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l - 18446744073709551616*m + 18446744073709551616*r ≤ -3221258244
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l + 18446744073709551616*r ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 32771*l + 18446744073709551616*r ≤ -3221225473
+  0 ≤ a ≤ 32770
+  0 ≤ a - 281474976710656*h ≤ 281474976710655
+  0 ≤ 16381*a - 4611686018427387904*g ≤ 4611686018427387903
+  0 ≤ 32765*a - 4611686018427387904*g - 4611686018427387904*h - 4611686018427387904*i ≤ 4611686018427387903
+  0 ≤ 65536*a + b - 32771*o ≤ 32770
+  131060*a + 18446744073709551616*d + 18446744073709551616*e + 65536*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k - 32765*l - 18446744073709551616*r ≤ 18446744076930711551
+  131060*a + b ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 65536*c ≤ -1
+  0 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j ≤ 18446744073709551615
+  -65536 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k - 65536*l ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ d := ↑(3221225472 + u0.toNat) / 18446744073709551616
+ e := ↑(18446744073709551616 -
+        (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                      u0.toNat) %
+                    18446744073709551616 +
+                  65536) %
+                18446744073709551616 /
+              65536 *
+            32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat) % 18446744073709551616) /
+  18446744073709551616
+ f := ↑((18446744073709551616 -
+          (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                        u0.toNat) %
+                      18446744073709551616 +
+                    65536) %
+                  18446744073709551616 /
+                65536 *
+              32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ g := ↑(u1.toNat * 65524) / 18446744073709551616
+ h := ↑(u1.toNat * 65536) / 18446744073709551616
+ i := ↑(u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+      u0.toNat) /
+  18446744073709551616
+ k := ↑(((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+          u0.toNat) %
+        18446744073709551616 +
+      65536) /
+  18446744073709551616
+ l := ↑((((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+            u0.toNat) %
+          18446744073709551616 +
+        65536) %
+      18446744073709551616) /
+  65536
+ m := ↑((18446744073709551616 -
+              (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) %
+                              18446744073709551616 +
+                            u0.toNat) %
+                          18446744073709551616 +
+                        65536) %
+                      18446744073709551616 /
+                    65536 *
+                  32771 %
+                18446744073709551616 +
+            (3221225472 + u0.toNat) % 18446744073709551616) %
+          18446744073709551616 %
+        65536 +
+      32771) /
+  18446744073709551616
+ n := ↑(((18446744073709551616 -
+                (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) %
+                                18446744073709551616 +
+                              u0.toNat) %
+                            18446744073709551616 +
+                          65536) %
+                        18446744073709551616 /
+                      65536 *
+                    32771 %
+                  18446744073709551616 +
+              (3221225472 + u0.toNat) % 18446744073709551616) %
+            18446744073709551616 %
+          65536 +
+        32771) %
+      18446744073709551616) /
+[?2004hroot@29632b6f993a:/workspace# head -80 /workspace/proof-check.log; python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean';s=open(p).read();s=s.replace('/ 65536 * 32771 < 18446744073709551616 := by omega','/ 65536 * 32771 < 18446744073709551616 := by\n      exact lt_of_le_of_lt (Nat.mul_le_mul_right 32771 hQ) (by decide)');s=s.replace('    all_goals try simp only [Nat.mod_eq_of_lt hFull, Nat.mod_eq_of_lt hProd] at *','    all_goals try simp only [Nat.mod_eq_of_lt hFull, Nat.mod_eq_of_lt hProd]');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004lCandidateProof.lean:43:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  l ≥ 0
+  l - o - 18446744073709551616*p - 18446744073709551616*q ≤ -18446744073709551617
+  -18446744073709551615 ≤ l - 18446744073709551616*p ≤ 0
+  -18446744073709551616 ≤ l - 18446744073709551616*p - 18446744073709551616*q ≤ -1
+  0 ≤ 32771*l - 18446744073709551616*r ≤ 18446744073709551615
+  1 ≤ c ≤ 65535
+  0 ≤ b ≤ 65535
+  -3221225472 ≤ b - 18446744073709551616*d ≤ 18446744070488326143
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l - 18446744073709551616*m - 65536*n + 18446744073709551616*r ≤ -18446744076930744324
+  -18446744076930809859 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l - 18446744073709551616*m + 18446744073709551616*r ≤ -3221258244
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l + 18446744073709551616*r ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 32771*l + 18446744073709551616*r ≤ -3221225473
+  0 ≤ a ≤ 32770
+  0 ≤ a - 281474976710656*h ≤ 281474976710655
+  0 ≤ 16381*a - 4611686018427387904*g ≤ 4611686018427387903
+  0 ≤ 32765*a - 4611686018427387904*g - 4611686018427387904*h - 4611686018427387904*i ≤ 4611686018427387903
+  0 ≤ 65536*a + b - 32771*o ≤ 32770
+  131060*a + 18446744073709551616*d + 18446744073709551616*e + 65536*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k - 32765*l - 18446744073709551616*r ≤ 18446744076930711551
+  131060*a + b ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 65536*c ≤ -1
+  0 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j ≤ 18446744073709551615
+  -65536 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k - 65536*l ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ d := ↑(3221225472 + u0.toNat) / 18446744073709551616
+ e := ↑(18446744073709551616 -
+        (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                      u0.toNat) %
+                    18446744073709551616 +
+                  65536) %
+                18446744073709551616 /
+              65536 *
+            32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat) % 18446744073709551616) /
+  18446744073709551616
+ f := ↑((18446744073709551616 -
+          (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                        u0.toNat) %
+                      18446744073709551616 +
+                    65536) %
+                  18446744073709551616 /
+                65536 *
+              32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ g := ↑(u1.toNat * 65524) / 18446744073709551616
+ h := ↑(u1.toNat * 65536) / 18446744073709551616
+ i := ↑(u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+      u0.toNat) /
+  18446744073709551616
+ k := ↑(((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+          u0.toNat) %
+        18446744073709551616 +
+      65536) /
+  18446744073709551616
+ l := ↑((((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+            u0.toNat) %
+          18446744073709551616 +
+        65536) %
+      18446744073709551616) /
+  65536
+ m := ↑((18446744073709551616 -
+              (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) %
+                              18446744073709551616 +
+                            u0.toNat) %
+                          18446744073709551616 +
+                        65536) %
+                      18446744073709551616 /
+                    65536 *
+                  32771 %
+                18446744073709551616 +
+[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -80 /workspace/proof-check.log
+[?2004lCandidateProof.lean:43:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  l ≥ 0
+  l - o - 18446744073709551616*p - 18446744073709551616*q ≤ -18446744073709551617
+  -18446744073709551615 ≤ l - 18446744073709551616*p ≤ 0
+  -18446744073709551616 ≤ l - 18446744073709551616*p - 18446744073709551616*q ≤ -1
+  0 ≤ 32771*l - 18446744073709551616*r ≤ 18446744073709551615
+  1 ≤ c ≤ 65535
+  0 ≤ b ≤ 65535
+  -3221225472 ≤ b - 18446744073709551616*d ≤ 18446744070488326143
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l - 18446744073709551616*m - 65536*n + 18446744073709551616*r ≤ -18446744076930744324
+  -18446744076930809859 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l - 18446744073709551616*m + 18446744073709551616*r ≤ -3221258244
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 65536*f - 32771*l + 18446744073709551616*r ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 18446744073709551616*d - 18446744073709551616*e - 32771*l + 18446744073709551616*r ≤ -3221225473
+  0 ≤ a ≤ 32770
+  0 ≤ a - 281474976710656*h ≤ 281474976710655
+  0 ≤ 16381*a - 4611686018427387904*g ≤ 4611686018427387903
+  0 ≤ 32765*a - 4611686018427387904*g - 4611686018427387904*h - 4611686018427387904*i ≤ 4611686018427387903
+  0 ≤ 65536*a + b - 32771*o ≤ 32770
+  131060*a + 18446744073709551616*d + 18446744073709551616*e + 65536*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k - 32765*l - 18446744073709551616*r ≤ 18446744076930711551
+  131060*a + b ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 65536*c ≤ -1
+  0 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j ≤ 18446744073709551615
+  -65536 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 18446744073709551616*k - 65536*l ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ d := ↑(3221225472 + u0.toNat) / 18446744073709551616
+ e := ↑(18446744073709551616 -
+        (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                      u0.toNat) %
+                    18446744073709551616 +
+                  65536) %
+                18446744073709551616 /
+              65536 *
+            32771 %
+          18446744073709551616 +
+      (3221225472 + u0.toNat) % 18446744073709551616) /
+  18446744073709551616
+ f := ↑((18446744073709551616 -
+          (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                        u0.toNat) %
+                      18446744073709551616 +
+                    65536) %
+                  18446744073709551616 /
+                65536 *
+              32771 %
+            18446744073709551616 +
+        (3221225472 + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ g := ↑(u1.toNat * 65524) / 18446744073709551616
+ h := ↑(u1.toNat * 65536) / 18446744073709551616
+ i := ↑(u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) / 18446744073709551616
+ j := ↑((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+      u0.toNat) /
+  18446744073709551616
+ k := ↑(((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+          u0.toNat) %
+        18446744073709551616 +
+      65536) /
+  18446744073709551616
+ l := ↑((((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+            u0.toNat) %
+          18446744073709551616 +
+        65536) %
+      18446744073709551616) /
+  65536
+ m := ↑((18446744073709551616 -
+              (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) %
+                              18446744073709551616 +
+                            u0.toNat) %
+                          18446744073709551616 +
+                        65536) %
+                      18446744073709551616 /
+                    65536 *
+                  32771 %
+                18446744073709551616 +
+[?2004hroot@29632b6f993a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean';s=open(p).read().replace('    all_goals try simp only [Nat.mod_eq_of_lt hFull, Nat.mod_eq_of_lt hProd]','    all_goals simp (disch := omega) only [Nat.mod_eq_of_lt] at *');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -80 /workspace/proof-check.log
+[?2004lCandidateProof.lean:42:14: error: Tactic `simp` failed with a nested error:
+maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:44:23: error: Tactic `contradiction` failed
+
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+shlNat : ∀ (x n : UInt64), (x <<< n).toNat = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+divCorrect :
+  ∀ (u1 u0 : UInt64),
+    u1.toNat < 32771 → u0.toNat < 65536 → (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771
+⊢ False
+[?2004hroot@29632b6f993a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean';s=open(p).read().replace('    all_goals simp (disch := omega) only [Nat.mod_eq_of_lt] at *','    have unwrap (n : Nat) (h : n < 18446744073709551616) : n % 18446744073709551616 = n := Nat.mod_eq_of_lt h\n    all_goals simp (disch := omega) only [unwrap] at *');open(p,'w').write(s) M[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[K)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -80 /workspace/proof-check.log
+[?2004lCandidateProof.lean:43:14: error: Tactic `simp` failed with a nested error:
+maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:45:23: error: Tactic `contradiction` failed
+
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+shlNat : ∀ (x n : UInt64), (x <<< n).toNat = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+divCorrect :
+  ∀ (u1 u0 : UInt64),
+    u1.toNat < 32771 → u0.toNat < 65536 → (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771
+⊢ False
+[?2004hroot@29632b6f993a:/workspace# head -100 /workspace/proof-check.log; nl -ba /workspace/submission/Proof.lean | tail -30
+[?2004lCandidateProof.lean:43:14: error: Tactic `simp` failed with a nested error:
+maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+CandidateProof.lean:45:23: error: Tactic `contradiction` failed
+
+maskNat : ∀ (x : UInt64), (x &&& 65535).toNat = x.toNat % 65536
+shrNat : ∀ (x n : UInt64), (x >>> n).toNat = x.toNat / 2 ^ (n.toNat % 64)
+shlNat : ∀ (x n : UInt64), (x <<< n).toNat = x.toNat * 2 ^ (n.toNat % 64) % 2 ^ 64
+divCorrect :
+  ∀ (u1 u0 : UInt64),
+    u1.toNat < 32771 → u0.toNat < 65536 → (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771
+⊢ False
+     8	    change x.toNat &&& (2^16 - 1) = _
+     9	    rw [Nat.and_two_pow_sub_one_eq_mod]
+    10	  have shrNat (x : UInt64) (n : UInt64) :
+    11	      (x >>> n).toNat = x.toNat / 2^(n.toNat % 64) := by
+    12	    change (x.toBitVec >>> (n.toNat % 64)).toNat = _
+    13	    rw [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]
+    14	    rfl
+    15	  have shlNat (x : UInt64) (n : UInt64) :
+    16	      (x <<< n).toNat = (x.toNat * 2^(n.toNat % 64)) % 2^64 := by
+    17	    change (x.toBitVec <<< (n.toNat % 64)).toNat = _
+    18	    rw [BitVec.toNat_shiftLeft, Nat.shiftLeft_eq]
+    19	    rfl
+    20	  have divCorrect (u1 u0 : UInt64) (h1 : u1.toNat < 32771) (h0 : u0.toNat < 65536) :
+    21	      (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771 := by
+    22	    have hFull : u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536 < 18446744073709551616 := by omega
+    23	    have hQ : (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 ≤ 65535 := by omega
+    24	    have hQpos : 1 ≤ (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 := by omega
+    25	    have hProd : (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771 < 18446744073709551616 := by
+    26	      exact lt_of_le_of_lt (Nat.mul_le_mul_right 32771 hQ) (by decide)
+    27	    unfold div2x1Mg10
+    28	    dsimp only
+    29	    split <;> split <;>
+    30	      simp only [UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_sub,
+    31	        maskNat, shrNat, shlNat, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le,
+    32	        mg10Divisor, mg10Reciprocal, limbMask, subBias] at *
+    33	    all_goals try simp only [UInt64.toNat_ofNat, Nat.reduceMod, Nat.reducePow, Nat.one_mul] at *
+    34	    have unwrap (n : Nat) (h : n < 18446744073709551616) : n % 18446744073709551616 = n := Nat.mod_eq_of_lt h
+    35	    all_goals simp (disch := omega) only [unwrap] at *
+    36	    all_goals omega
+    37	  exact False.elim (by contradiction)
+[?2004hroot@29632b6f993a:/workspace# grep -nE 'theorem (add_mod_mod|mod_add_mod|mod_mod_of_dvd|mod_mod)' /opt/lean/src/lean/Init/Data/Nat/{Div/Lemmas,Mod/Lemmas}.lean; grep -R -n 'theorem.*mod.*mod' /opt/lean/src/lean/Init/Data/Nat/Div/ | head -30
+[?2004l[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K26[m[K[36m[K:[m[K[01;31m[Ktheorem mod_add_mod[m[K_lt (a b : Nat) {c : Nat} (h : 0 < c) : a % c + b % c < 2 * c - 1 := by
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K31[m[K[36m[K:[m[K[01;31m[Ktheorem mod_add_mod[m[K_eq {a b c : Nat} : a % c + b % c = (a + b) % c + if a % c + b % c < c then 0 else c := by
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K185[m[K[36m[K:[m[K[01;31m[Ktheorem mod_add_mod[m[K_lt_of_add_mod_eq_sub_one (w : 0 < c) (h : (a + b) % c = c - 1) : a % c + b % c < c := by
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K213[m[K[36m[K:[m[K[01;31m[Ktheorem mod_mod[m[K_eq_mod_of_lt_right {a b c : Nat} (ha : a < c) : (a % b) % c = a % b :=
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K216[m[K[36m[K:[m[K[01;31m[Ktheorem mod_mod[m[K_eq_mod_mod_mod {a b c : Nat} (ha : a < c) (hb : b < c) :
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K220[m[K[36m[K:[m[K[01;31m[Ktheorem mod_mod[m[K_eq_mod_mod_of_dvd {a b c : Nat} (h : b ∣ c) : a % b % c = a % c % b := by
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K225[m[K[36m[K:[m[K[01;31m[Ktheorem mod_mod_of_dvd[m[K' {a b c : Nat} (h : b ∣ c) : a % b % c = a % b := by
+[35m[K/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean[m[K[36m[K:[m[K[32m[K228[m[K[36m[K:[m[K[01;31m[Ktheorem mod_mod[m[K_eq_mod_mod_mod_of_dvd {a b c : Nat} (hb : b ∣ c) :
+grep: /opt/lean/src/lean/Init/Data/Nat/Mod/Lemmas.lean: No such file or directory
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:128:protected theorem modCore_eq (x y : Nat) : Nat.modCore x y =
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:146:protected theorem modCore_eq_mod (n m : Nat) : Nat.modCore n m = n % m := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:197:theorem mod_eq_sub_mod {a b : Nat} (h : a ≥ b) : a % b = (a - b) % b :=
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:202:@[simp] protected theorem sub_mod_add_mod_cancel (a b : Nat) [NeZero a] : a - b % a + b % a = a := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:256:theorem mod_eq_sub_mul_div {x k : Nat} : x % k = x - k * (x / k) := mod_def _ _
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:26:theorem mod_add_mod_lt (a b : Nat) {c : Nat} (h : 0 < c) : a % c + b % c < 2 * c - 1 := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:31:theorem mod_add_mod_eq {a b c : Nat} : a % c + b % c = (a + b) % c + if a % c + b % c < c then 0 else c := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:185:theorem mod_add_mod_lt_of_add_mod_eq_sub_one (w : 0 < c) (h : (a + b) % c = c - 1) : a % c + b % c < c := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:209:theorem div_mod_eq_mod_div_mod {a b c : Nat} (ha : a < c) (hb : b < c) :
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:213:theorem mod_mod_eq_mod_of_lt_right {a b c : Nat} (ha : a < c) : (a % b) % c = a % b :=
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:216:theorem mod_mod_eq_mod_mod_mod {a b c : Nat} (ha : a < c) (hb : b < c) :
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:220:theorem mod_mod_eq_mod_mod_of_dvd {a b c : Nat} (h : b ∣ c) : a % b % c = a % c % b := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:225:theorem mod_mod_of_dvd' {a b c : Nat} (h : b ∣ c) : a % b % c = a % b := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:228:theorem mod_mod_eq_mod_mod_mod_of_dvd {a b c : Nat} (hb : b ∣ c) :
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:235:theorem mod_eq_mod_iff {x y z : Nat} :
+[?2004hroot@29632b6f993a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean';s=open(p).read();start=s.index('  have divCorrect');s=s[:start]+'''  have addExact (x y : UInt64) (h : x.toNat + y.toNat < 2^64) :
+[?2004l[?2004h>       (x+y).toNat = x.toNat + y.toNat := by
+[?2004l[?2004h>     rw [UInt64.toNat_add, Nat.mod_eq_of_lt h]
+[?2004l[?2004h>   have mulExact (x y : UInt64) (h : x.toNat * y.toNat < 2^64) :
+[?2004l[?2004h>       (x*y).toNat = x.toNat * y.toNat := by
+[?2004l[?2004h>     rw [UInt64.toNat_mul, Nat.mod_eq_of_lt h]
+[?2004l[?2004h>   have divCorrect (u1 u0 : UInt64) (h1 : u1.toNat < 32771) (h0 : u0.toNat < 65536) :
+[?2004l[?2004h>       (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771 := by
+[?2004l[?2004h>     let p := u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536
+[?2004l[?2004h>     let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+[?2004l[?2004h>     have hm : (u1 * mg10Reciprocal).toNat = u1.toNat * 65524 := by
+[?2004l[?2004h>       rw [UInt64.toNat_mul]
+[?2004l[?2004h>       change (u1.toNat * 65524) % 18446744073709551616 = _
+[?2004l[?2004h>       apply Nat.mod_eq_of_lt; omega
+[?2004l[?2004h>     have hs : (u1 <<< 16).toNat = u1.toNat * 65536 := by
+[?2004l[?2004h>       rw [shlNat]
+[?2004l[?2004h>       change (u1.toNat * 65536) % 18446744073709551616 = _
+[?2004l[?2004h>       apply Nat.mod_eq_of_lt; omega
+[?2004l[?2004h>     have hc : ((1 : UInt64) <<< 16).toNat = 65536 := by decide
+[?2004l[?2004h>     have hab : ((u1 * mg10Reciprocal) + (u1 <<< 16)).toNat = u1.toNat * 65524 + u1.toNat * 65536 := by
+[?2004l[?2004h>       rw [addExact _ _ (by rw [hm, hs]; norm_num; omega), hm, hs]
+[?2004l[?2004h>     have habc : ((u1 * mg10Reciprocal) + (u1 <<< 16) + u0).toNat = u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat := by
+[?2004l[?2004h>       rw [addExact _ _ (by rw [hab]; norm_num; omega), hab]
+[?2004l[?2004h>     have hp : qFull.toNat = p := by
+[?2004l[?2004h>       dsimp [qFull]
+[?2004l[?2004h>       rw [addExact _ _ (by rw [habc, hc]; norm_num; omega), habc, hc]
+[?2004l[?2004h>     let q1 := qFull >>> (16 : UInt64)
+[?2004l[?2004h>     have hq1 : q1.toNat = p / 65536 := by
+[?2004l[?2004h>       dsimp [q1]; rw [shrNat, hp]; rfl
+[?2004l[?2004h>     have hqBound : 1 ≤ q1.toNat ∧ q1.toNat ≤ 65535 := by
+[?2004l[?2004h>       rw [hq1]; dsimp [p]; omega
+[?2004l[?2004h>     have hqProd : (q1 * mg10Divisor).toNat = q1.toNat * 32771 := by
+[?2004l[?2004h>       rw [UInt64.toNat_mul]
+[?2004l[?2004h>       change (q1.toNat * 32771) % 18446744073709551616 = _
+[?2004l[?2004h>       apply Nat.mod_eq_of_lt; omega
+[?2004l[?2004h>     have hb : (subBias + u0).toNat = 3221225472 + u0.toNat := by
+[?2004l[?2004h>       rw [UInt64.toNat_add]
+[?2004l[?2004h>       change (3221225472 + u0.toNat) % 18446744073709551616 = _
+[?2004l[?2004h>       apply Nat.mod_eq_of_lt; omega
+[?2004l[?2004h>     have hrSub : (subBias + u0 - q1 * mg10Divisor).toNat = 3221225472 + u0.toNat - q1.toNat * 32771 := by
+[?2004l[?2004h>       rw [UInt64.toNat_sub_of_le _ _ (by rw [UInt64.le_iff_toNat_le, hb, hqProd]; omega), hb, hqProd]
+[?2004l[?2004h>     change (let q0 := qFull &&& limbMask
+[?2004l[?2004h>             let r := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+[?2004l[?2004h>             let (qc, rc) := if q0 < r then (q1 - 1, (r + mg10Divisor) &&& limbMask) else (q1, r)
+[?2004l[?2004h>             if mg10Divisor ≤ rc then qc + 1 else qc).toNat = _
+[?2004l[?2004h>     dsimp only
+[?2004l[?2004h>     split <;> split
+[?2004l[?2004h>     all_goals simp only [limbMask, maskNat, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le,
+[?2004l[?2004h>       UInt64.toNat_add, UInt64.toNat_sub, hp, hq1, hrSub, mg10Divisor,
+[?2004l[?2004h>       UInt64.toNat_ofNat, Nat.reduceMod, Nat.reducePow] at *
+[?2004l[?2004h>     all_goals dsimp [p] at *
+[?2004l[?2004h>     all_goals omega
+[?2004l[?2004h>   exact False.elim (by contradiction)
+[?2004l[?2004h> ''';open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -100 /workspace/proof-check.log
+[?2004lCandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ d - 65536*e ≤ 65535
+  -32771 ≤ d - 65536*e - 18446744073709551616*f ≤ 18446744073709518844
+  0 ≤ d - 65536*e - 18446744073709551616*f - 65536*g ≤ 32764
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - h - 18446744073709551616*i - 18446744073709551616*j ≤ -18446744073709551617
+  -18446744073709551615 ≤ b - 18446744073709551616*i ≤ 0
+  -18446744073709551616 ≤ b - 18446744073709551616*i - 18446744073709551616*j ≤ -1
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + d - 32771*h ≤ 3221258242
+  131060*a - 32765*b + 65536*e ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + d ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + d ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ e := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ f := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+          18446744073709551616 %
+        65536 +
+      32771) /
+  18446744073709551616
+ g := ↑(((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+            18446744073709551616 %
+          65536 +
+        32771) %
+      18446744073709551616) /
+  65536
+ h := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ i := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) / 18446744073709551616
+ j := ↑((18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) %
+        18446744073709551616 +
+      1) /
+  18446744073709551616
+CandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ d - 65536*e ≤ 65535
+  -32771 ≤ d - 65536*e - 18446744073709551616*f ≤ 18446744073709518844
+  -32771 ≤ d - 65536*e - 18446744073709551616*f - 65536*g ≤ -1
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - h - 18446744073709551616*i ≤ -18446744073709551616
+  -18446744073709551615 ≤ b - 18446744073709551616*i ≤ 0
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + d - 32771*h ≤ 3221258242
+  131060*a - 32765*b + 65536*e ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + d ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + d ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ e := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ f := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+          18446744073709551616 %
+        65536 +
+      32771) /
+  18446744073709551616
+ g := ↑(((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+            18446744073709551616 %
+          65536 +
+        32771) %
+      18446744073709551616) /
+  65536
+ h := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ i := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) / 18446744073709551616
+CandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  32771 ≤ d - 65536*e ≤ 65535
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - f - 18446744073709551616*g ≤ -2
+  -1 ≤ b - 18446744073709551616*g ≤ 18446744073709551614
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+[?2004hroot@29632b6f993a:/workspace# head -120 /workspace/proof-check.log
+[?2004lCandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ d - 65536*e ≤ 65535
+  -32771 ≤ d - 65536*e - 18446744073709551616*f ≤ 18446744073709518844
+  0 ≤ d - 65536*e - 18446744073709551616*f - 65536*g ≤ 32764
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - h - 18446744073709551616*i - 18446744073709551616*j ≤ -18446744073709551617
+  -18446744073709551615 ≤ b - 18446744073709551616*i ≤ 0
+  -18446744073709551616 ≤ b - 18446744073709551616*i - 18446744073709551616*j ≤ -1
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + d - 32771*h ≤ 3221258242
+  131060*a - 32765*b + 65536*e ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + d ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + d ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ e := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ f := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+          18446744073709551616 %
+        65536 +
+      32771) /
+  18446744073709551616
+ g := ↑(((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+            18446744073709551616 %
+          65536 +
+        32771) %
+      18446744073709551616) /
+  65536
+ h := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ i := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) / 18446744073709551616
+ j := ↑((18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) %
+        18446744073709551616 +
+      1) /
+  18446744073709551616
+CandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ d - 65536*e ≤ 65535
+  -32771 ≤ d - 65536*e - 18446744073709551616*f ≤ 18446744073709518844
+  -32771 ≤ d - 65536*e - 18446744073709551616*f - 65536*g ≤ -1
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - h - 18446744073709551616*i ≤ -18446744073709551616
+  -18446744073709551615 ≤ b - 18446744073709551616*i ≤ 0
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + d - 32771*h ≤ 3221258242
+  131060*a - 32765*b + 65536*e ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + d ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + d ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ e := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ f := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+          18446744073709551616 %
+        65536 +
+      32771) /
+  18446744073709551616
+ g := ↑(((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+            18446744073709551616 %
+          65536 +
+        32771) %
+      18446744073709551616) /
+  65536
+ h := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ i := ↑(18446744073709551615 + (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536) / 18446744073709551616
+CandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  32771 ≤ d - 65536*e ≤ 65535
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - f - 18446744073709551616*g ≤ -2
+  -1 ≤ b - 18446744073709551616*g ≤ 18446744073709551614
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + d - 32771*f ≤ 3221258242
+  131060*a - 32765*b + 65536*e ≥ 3221159936
+  3221159936 ≤ 131060*a - 32765*b + d ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + d ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ e := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑((u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 + 1) / 18446744073709551616
+CandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+[?2004hroot@29632b6f993a:/workspace# head -30 /workspace/proof-check.log; python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean';s=open(p).read();s=s.replace('    all_goals simp only [limbMask, maskNat, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le,','    all_goals simp only [limbMask, maskNat, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, hp, hrSub, hq1] at *\n    all_goals simp only [UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le,');open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004lCandidateProof.lean:79:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ d ≤ 18446744073709551615
+  0 ≤ d - 65536*e ≤ 65535
+  -32771 ≤ d - 65536*e - 18446744073709551616*f ≤ 18446744073709518844
+  0 ≤ d - 65536*e - 18446744073709551616*f - 65536*g ≤ 32764
+  c ≥ 0
+  1 ≤ b ≤ 65535
+  0 ≤ b ≤ 562898418531920
+  b ≤ 562898418531920
+  b - h - 18446744073709551616*i - 18446744073709551616*j ≤ -18446744073709551617
+  -18446744073709551615 ≤ b - 18446744073709551616*i ≤ 0
+  -18446744073709551616 ≤ b - 18446744073709551616*i - 18446744073709551616*j ≤ -1
+  3221225472 ≤ 32771*b + d ≤ 3221291007
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + d - 32771*h ≤ 3221258242
+  131060*a - 32765*b + 65536*e ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + d ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + d ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ e := ↑((18446744073709551616 - (q1 * 32771).toNat + (subBias.toNat + u0.toNat) % 18446744073709551616) %
+      18446744073709551616) /
+  65536
+[?2004hroot@29632b6f993a:/workspace# python3 /workspace/lean/check.py > /workspace/proof-check.log 2>&1; head -70 /workspace/proof-check.log
+[?2004lCandidateProof.lean:80:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  -18446744073709551615 ≤ j - 18446744073709551616*k ≤ 0
+  -18446744073709551616 ≤ j - 18446744073709551616*k - 18446744073709551616*l ≤ -1
+  i - j + 18446744073709551616*k + 18446744073709551616*l ≥ 18446744073709551617
+  f ≥ 0
+  -32771 ≤ f - 18446744073709551616*g ≤ 18446744073709518844
+  0 ≤ f - 18446744073709551616*g - 65536*h ≤ 32764
+  e ≥ 0
+  c ≥ 0
+  0 ≤ c - 65536*d ≤ 65535
+  1 ≤ b ≤ 65535
+  b ≥ 0
+  3221225472 ≤ 32771*b + c ≤ 3221291007
+  0 ≤ 32771*b + c ≤ 18446744073709551615
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + c - 32771*i ≤ 3221258242
+  131060*a - 32765*b + 65536*d ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + c ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + c ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 65536
+ e := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ f := ↑(subBias + u0 - q1 * 32771 &&& 65535).toNat
+ g := ↑((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) / 18446744073709551616
+ h := ↑(((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) % 18446744073709551616) / 65536
+ i := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ j := ↑q1.toNat
+ k := ↑(18446744073709551615 + q1.toNat) / 18446744073709551616
+ l := ↑((18446744073709551615 + q1.toNat) % 18446744073709551616 + 1) / 18446744073709551616
+CandidateProof.lean:80:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  -18446744073709551615 ≤ j - 18446744073709551616*k ≤ 0
+  i - j + 18446744073709551616*k ≥ 18446744073709551616
+  f ≥ 0
+  -32771 ≤ f - 18446744073709551616*g ≤ 18446744073709518844
+  -32771 ≤ f - 18446744073709551616*g - 65536*h ≤ -1
+  e ≥ 0
+  c ≥ 0
+  0 ≤ c - 65536*d ≤ 65535
+  1 ≤ b ≤ 65535
+  b ≥ 0
+  3221225472 ≤ 32771*b + c ≤ 3221291007
+  0 ≤ 32771*b + c ≤ 18446744073709551615
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + c - 32771*i ≤ 3221258242
+  131060*a - 32765*b + 65536*d ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + c ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + c ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 65536
+ e := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ f := ↑(subBias + u0 - q1 * 32771 &&& 65535).toNat
+ g := ↑((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) / 18446744073709551616
+ h := ↑(((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) % 18446744073709551616) / 65536
+ i := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+[?2004hroot@29632b6f993a:/workspace# head -100 /workspace/proof-check.log
+[?2004lCandidateProof.lean:80:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  -18446744073709551615 ≤ j - 18446744073709551616*k ≤ 0
+  -18446744073709551616 ≤ j - 18446744073709551616*k - 18446744073709551616*l ≤ -1
+  i - j + 18446744073709551616*k + 18446744073709551616*l ≥ 18446744073709551617
+  f ≥ 0
+  -32771 ≤ f - 18446744073709551616*g ≤ 18446744073709518844
+  0 ≤ f - 18446744073709551616*g - 65536*h ≤ 32764
+  e ≥ 0
+  c ≥ 0
+  0 ≤ c - 65536*d ≤ 65535
+  1 ≤ b ≤ 65535
+  b ≥ 0
+  3221225472 ≤ 32771*b + c ≤ 3221291007
+  0 ≤ 32771*b + c ≤ 18446744073709551615
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + c - 32771*i ≤ 3221258242
+  131060*a - 32765*b + 65536*d ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + c ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + c ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 65536
+ e := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ f := ↑(subBias + u0 - q1 * 32771 &&& 65535).toNat
+ g := ↑((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) / 18446744073709551616
+ h := ↑(((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) % 18446744073709551616) / 65536
+ i := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ j := ↑q1.toNat
+ k := ↑(18446744073709551615 + q1.toNat) / 18446744073709551616
+ l := ↑((18446744073709551615 + q1.toNat) % 18446744073709551616 + 1) / 18446744073709551616
+CandidateProof.lean:80:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  j ≥ 0
+  -18446744073709551615 ≤ j - 18446744073709551616*k ≤ 0
+  i - j + 18446744073709551616*k ≥ 18446744073709551616
+  f ≥ 0
+  -32771 ≤ f - 18446744073709551616*g ≤ 18446744073709518844
+  -32771 ≤ f - 18446744073709551616*g - 65536*h ≤ -1
+  e ≥ 0
+  c ≥ 0
+  0 ≤ c - 65536*d ≤ 65535
+  1 ≤ b ≤ 65535
+  b ≥ 0
+  3221225472 ≤ 32771*b + c ≤ 3221291007
+  0 ≤ 32771*b + c ≤ 18446744073709551615
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + c - 32771*i ≤ 3221258242
+  131060*a - 32765*b + 65536*d ≤ 3221159935
+  3221159936 ≤ 131060*a - 32765*b + c ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + c ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 65536
+ e := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ f := ↑(subBias + u0 - q1 * 32771 &&& 65535).toNat
+ g := ↑((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) / 18446744073709551616
+ h := ↑(((subBias + u0 - q1 * 32771 &&& 65535).toNat + 32771) % 18446744073709551616) / 65536
+ i := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ j := ↑q1.toNat
+ k := ↑(18446744073709551615 + q1.toNat) / 18446744073709551616
+CandidateProof.lean:80:14: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 0
+  -1 ≤ g - 18446744073709551616*h ≤ 18446744073709551614
+  f - g + 18446744073709551616*h ≥ 2
+  e ≥ 0
+  c ≥ 0
+  32771 ≤ c - 65536*d ≤ 65535
+  1 ≤ b ≤ 65535
+  b ≥ 0
+  3221225472 ≤ 32771*b + c ≤ 3221291007
+  0 ≤ 32771*b + c ≤ 18446744073709551615
+  0 ≤ a ≤ 32770
+  a ≥ 0
+  a ≥ 0
+  0 ≤ a ≤ 140750374436972
+  3221225472 ≤ 65536*a + 32771*b + c - 32771*f ≤ 3221258242
+  131060*a - 32765*b + 65536*d ≥ 3221159936
+  3221159936 ≤ 131060*a - 32765*b + c ≤ 3221225471
+  3221225472 ≤ 131060*a + 32771*b + c ≤ 18446744076930777087
+where
+ a := ↑u1.toNat
+ b := ↑(u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536
+ c := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771)
+ d := ↑(3221225472 + u0.toNat - (u1.toNat * 65524 + u1.toNat * 65536 + u0.toNat + 65536) / 65536 * 32771) / 65536
+ e := ↑(subBias.toNat + u0.toNat) / 18446744073709551616
+ f := ↑(u1.toNat * 65536 + u0.toNat) / 32771
+ g := ↑q1.toNat
+[?2004hroot@29632b6f993a:/workspace# 

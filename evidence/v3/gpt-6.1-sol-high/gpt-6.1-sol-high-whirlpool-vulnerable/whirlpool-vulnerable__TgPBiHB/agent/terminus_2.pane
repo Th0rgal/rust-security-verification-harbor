@@ -1,0 +1,798 @@
+[?2004hroot@42dc7d7cff85:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@42dc7d7cff85:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@42dc7d7cff85:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod u128_math {
+    pub const LIMB_BASE: u64 = 0x1_0000_0000u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+    pub const FEE_RATE_MUL_VALUE: u64 = 1_000_000u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct U128Words {
+        pub w0: u64,
+        pub w1: u64,
+        pub w2: u64,
+        pub w3: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivStep {
+        pub quot: u64,
+        pub rem: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivResult {
+        pub q0: u64,
+        pub q1: u64,
+        pub q2: u64,
+        pub q3: u64,
+        pub rem: u64,
+    }
+
+    #[inline]
+    pub fn split_u128(amount: u64, fee: u64) -> U128Words {
+        U128Words {
+            w0: amount & LIMB_MASK,
+            w1: amount >> LIMB_SHIFT,
+            w2: fee & LIMB_MASK,
+            w3: fee >> LIMB_SHIFT,
+        }
+    }
+
+    #[inline]
+    pub fn div_step(rem: u64, word: u64) -> DivStep {
+        let num: u64 = rem * LIMB_BASE + word;
+        DivStep {
+            quot: num / FEE_RATE_MUL_VALUE,
+            rem: num % FEE_RATE_MUL_VALUE,
+        }
+    }
+
+    #[inline]
+    pub fn div_word_chain(words: U128Words) -> DivResult {
+        let step3: DivStep = div_step(0u64, words.w3);
+        let step2: DivStep = div_step(step3.rem, words.w2);
+        let step1: DivStep = div_step(step2.rem, words.w1);
+        let step0: DivStep = div_step(step1.rem, words.w0);
+        DivResult {
+            q0: step0.quot,
+            q1: step1.quot,
+            q2: step2.quot,
+            q3: step3.quot,
+            rem: step0.rem,
+        }
+    }
+
+    #[inline]
+    pub fn round_up_quotient(div: DivResult) -> U128Words {
+        let inc: u64 = if div.rem > 0u64 { 1u64 } else { 0u64 };
+        let s0: u64 = div.q0 + inc;
+        let r0: u64 = s0 & LIMB_MASK;
+        let c0: u64 = s0 >> LIMB_SHIFT;
+        let s1: u64 = div.q1 + c0;
+        let r1: u64 = s1 & LIMB_MASK;
+        let s2: u64 = div.q2;
+        let r2: u64 = s2 & LIMB_MASK;
+        let c2: u64 = s2 >> LIMB_SHIFT;
+        let r3: u64 = div.q3 + c2;
+        U128Words {
+            w0: r0,
+            w1: r1,
+            w2: r2,
+            w3: r3,
+        }
+    }
+
+    #[inline]
+    pub fn try_into_u64(words: U128Words) -> Option<u64> {
+        if words.w2 != 0u64 || words.w3 != 0u64 {
+            None
+        } else {
+            Some(words.w1 * LIMB_BASE + words.w0)
+        }
+    }
+
+    #[inline]
+    pub fn div_round_up_fee(amount: u64, fee: u64) -> Option<u64> {
+        let words: U128Words = split_u128(amount, fee);
+        let div: DivResult = div_word_chain(words);
+        let rounded: U128Words = round_up_quotient(div);
+        try_into_u64(rounded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::u128_math;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WhirlpoolQuote {
+        pub principal_share: u64,
+        pub gross_fee: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<WhirlpoolQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let gross_fee: u64 = u128_math::div_round_up_fee(amount, fee)?;
+        let total_debit: u64 = principal_share.checked_add(gross_fee)?;
+        Some(WhirlpoolQuote {
+            principal_share,
+            gross_fee,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: WhirlpoolQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a concentrated-liquidity Whirlpool swap debit against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `principal_share = floor(amount / 2)`
+/// - `gross_fee = ceil((amount + fee * 2^64) / 1_000_000)`
+/// - `total_debit = principal_share + gross_fee`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::WhirlpoolQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn rounds_up_fractional_fee() {
+        // amount = 100, fee = 0:
+        // principal_share = 50, gross_fee = ceil(100 / 1_000_000) = 1 -> total = 51
+        assert_eq!(authorize(51, 100, 0), Some(Authorization { total_debit: 51 }));
+        assert_eq!(authorize(50, 100, 0), None);
+    }
+
+    #[test]
+    fn multi_word_carry_across_q0_boundary() {
+        // Choose X = 1_000_000 * 0xFFFF_FFFF + 1 = 4_294_967_295_000_001 (fee = 0):
+        // gross_fee = 0x1_0000_0000 = 4_294_967_296
+        // principal_share = 2_147_483_647_500_000
+        let amount: u64 = 4_294_967_295_000_001u64;
+        let expected: u64 = (amount / 2) + 4_294_967_296u64;
+        assert_eq!(
+            authorize(expected, amount, 0),
+            Some(Authorization {
+                total_debit: expected
+            })
+        );
+    }
+}
+[?2004hroot@42dc7d7cff85:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def limbBase : UInt64 := 4294967296
+def feeRateMulValue : UInt64 := 1000000
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure U128Words where
+  w0 : UInt64
+  w1 : UInt64
+  w2 : UInt64
+  w3 : UInt64
+
+structure DivStep where
+  quot : UInt64
+  rem : UInt64
+
+structure DivResult where
+  q0 : UInt64
+  q1 : UInt64
+  q2 : UInt64
+  q3 : UInt64
+  rem : UInt64
+
+def splitU128 (amount fee : UInt64) : U128Words :=
+  { w0 := amount % limbBase, w1 := amount / limbBase, w2 := fee % limbBase, w3 := fee / limbBase }
+
+def divStep (rem word : UInt64) : DivStep :=
+  let num := limbBase * rem + word
+  { quot := num / feeRateMulValue, rem := num % feeRateMulValue }
+
+def divWordChain (words : U128Words) : DivResult :=
+  let step3 := divStep 0 words.w3
+  let step2 := divStep step3.rem words.w2
+  let step1 := divStep step2.rem words.w1
+  let step0 := divStep step1.rem words.w0
+  { q0 := step0.quot, q1 := step1.quot, q2 := step2.quot, q3 := step3.quot, rem := step0.rem }
+
+def roundUpQuotient (div : DivResult) : U128Words :=
+  let inc : UInt64 := if 0 < div.rem then 1 else 0
+  let s0 := inc + div.q0
+  let r0 := s0 % limbBase
+  let c0 := s0 / limbBase
+  let s1 := c0 + div.q1
+  let r1 := s1 % limbBase
+  let s2 := div.q2
+  let r2 := s2 % limbBase
+  let c2 := s2 / limbBase
+  let r3 := c2 + div.q3
+  { w0 := r0, w1 := r1, w2 := r2, w3 := r3 }
+
+def tryIntoU64 (words : U128Words) : Option UInt64 :=
+  if words.w2 = 0 ∧ words.w3 = 0 then
+    some (limbBase * words.w1 + words.w0)
+  else
+    none
+
+def divRoundUpFee (amount fee : UInt64) : Option UInt64 :=
+  let words := splitU128 amount fee
+  let div := divWordChain words
+  let rounded := roundUpQuotient div
+  tryIntoU64 rounded
+
+structure WhirlpoolQuote where
+  principalShare : UInt64
+  grossFee : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option WhirlpoolQuote :=
+  let principalShare := amount / principalDivisor
+  match divRoundUpFee amount fee with
+  | some grossFee =>
+    if grossFee ≤ u64Max - principalShare then
+      some {
+        principalShare := principalShare,
+        grossFee := grossFee,
+        totalDebit := principalShare + grossFee
+      }
+    else
+      none
+  | none => none
+
+def verifyAffordability (balance : UInt64) (quote : WhirlpoolQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@42dc7d7cff85:/workspace# ls -la /workspace /workspace/lean /workspace/submission; cat /workspace/lean/check.py; cat /workspace/challenge/Cargo.toml
+[?2004l/workspace:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:11 [01;34m..[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34mchallenge[0m
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34mharness[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34mlean[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34msubmission[0m
+
+/workspace/lean:
+total 264
+drwxr-xr-x 1 root root   4096 Oct  7 07:02 [01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   3392 Oct  7 06:59 SecurityChallenge.lean
+-rw-r--r-- 1 root root 245672 Oct  7 07:02 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  6 11:24 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34msrc[0m
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@42dc7d7cff85:/workspace# cat /workspace/lean/SecurityChallenge.lean; cat /workspace/submission/{Spec,Audit,Proof}.lean; ls -l /workspace/submission/src; tail -35 /workspace/challenge/src/lib.rs
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def limbBase : UInt64 := 4294967296
+def feeRateMulValue : UInt64 := 1000000
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure U128Words where
+  w0 : UInt64
+  w1 : UInt64
+  w2 : UInt64
+  w3 : UInt64
+
+structure DivStep where
+  quot : UInt64
+  rem : UInt64
+
+structure DivResult where
+  q0 : UInt64
+  q1 : UInt64
+  q2 : UInt64
+  q3 : UInt64
+  rem : UInt64
+
+def splitU128 (amount fee : UInt64) : U128Words :=
+  { w0 := amount % limbBase, w1 := amount / limbBase, w2 := fee % limbBase, w3 := fee / limbBase }
+
+def divStep (rem word : UInt64) : DivStep :=
+  let num := limbBase * rem + word
+  { quot := num / feeRateMulValue, rem := num % feeRateMulValue }
+
+def divWordChain (words : U128Words) : DivResult :=
+  let step3 := divStep 0 words.w3
+  let step2 := divStep step3.rem words.w2
+  let step1 := divStep step2.rem words.w1
+  let step0 := divStep step1.rem words.w0
+  { q0 := step0.quot, q1 := step1.quot, q2 := step2.quot, q3 := step3.quot, rem := step0.rem }
+
+def roundUpQuotient (div : DivResult) : U128Words :=
+  let inc : UInt64 := if 0 < div.rem then 1 else 0
+  let s0 := inc + div.q0
+  let r0 := s0 % limbBase
+  let c0 := s0 / limbBase
+  let s1 := c0 + div.q1
+  let r1 := s1 % limbBase
+  let s2 := div.q2
+  let r2 := s2 % limbBase
+  let c2 := s2 / limbBase
+  let r3 := c2 + div.q3
+  { w0 := r0, w1 := r1, w2 := r2, w3 := r3 }
+
+def tryIntoU64 (words : U128Words) : Option UInt64 :=
+  if words.w2 = 0 ∧ words.w3 = 0 then
+    some (limbBase * words.w1 + words.w0)
+  else
+    none
+
+def divRoundUpFee (amount fee : UInt64) : Option UInt64 :=
+  let words := splitU128 amount fee
+  let div := divWordChain words
+  let rounded := roundUpQuotient div
+  tryIntoU64 rounded
+
+structure WhirlpoolQuote where
+  principalShare : UInt64
+  grossFee : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option WhirlpoolQuote :=
+  let principalShare := amount / principalDivisor
+  match divRoundUpFee amount fee with
+  | some grossFee =>
+    if grossFee ≤ u64Max - principalShare then
+      some {
+        principalShare := principalShare,
+        grossFee := grossFee,
+        totalDebit := principalShare + grossFee
+      }
+    else
+      none
+  | none => none
+
+def verifyAffordability (balance : UInt64) (quote : WhirlpoolQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+total 0
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn rounds_up_fractional_fee() {
+        // amount = 100, fee = 0:
+        // principal_share = 50, gross_fee = ceil(100 / 1_000_000) = 1 -> total = 51
+        assert_eq!(authorize(51, 100, 0), Some(Authorization { total_debit: 51 }));
+        assert_eq!(authorize(50, 100, 0), None);
+    }
+
+    #[test]
+    fn multi_word_carry_across_q0_boundary() {
+        // Choose X = 1_000_000 * 0xFFFF_FFFF + 1 = 4_294_967_295_000_001 (fee = 0):
+        // gross_fee = 0x1_0000_0000 = 4_294_967_296
+        // principal_share = 2_147_483_647_500_000
+        let amount: u64 = 4_294_967_295_000_001u64;
+        let expected: u64 = (amount / 2) + 4_294_967_296u64;
+        assert_eq!(
+            authorize(expected, amount, 0),
+            Some(Authorization {
+                total_debit: expected
+            })
+        );
+    }
+}
+[?2004hroot@42dc7d7cff85:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> import json
+[?2004l[?2004h> s=Path('/workspace/submission')
+[?2004l[?2004h> a=2**64-999999
+[?2004l[?2004h> b=a//2
+[?2004l[?2004h> print('balance',b,'amount',a,'fee',999999,'exact debit',b+2**64)
+[?2004l[?2004h> (s/'Spec.lean').write_text('''import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Exact settlement debit, computed without any word-size truncation.
+[?2004l[?2004h> def settlementDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 +
+[?2004l[?2004h>     (amount.toNat + fee.toNat * 18446744073709551616 + 999999) / 1000000
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := settlementDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     settlementDebit amount fee ≤ balance.toNat ∧
+[?2004l[?2004h>     totalDebit.toNat = settlementDebit amount fee
+[?2004l[?2004h> ''')
+[?2004l[?2004h> (s/'Audit.lean').write_text('''import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Rounding discards the carry out of the second 32-bit limb.
+[?2004l[?2004h> def verdict : AuditVerdict := .vulnerable
+[?2004l[?2004h> ''')
+[?2004l[?2004h> (s/'Proof.lean').write_text(f'''by
+[?2004l[?2004h>   change ¬ Conforms candidateSpec challengeAuthorize
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have accepted : challengeAuthorize {b} {a} 999999 = some {b} := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   have rejected : ¬ candidateSpec.accepts {b} {a} 999999 := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   exact rejected ((h.1 {b} {a} 999999).mp ⟨{b}, accepted⟩)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> (s/'counterexample.json').write_text(json.dumps(dict(balance=b,amount=a,fee=999999),indent=2)+'\n')
+[?2004l[?2004h> text=Path('/workspace/challenge/src/lib.rs').read_text()
+[?2004l[?2004h> text=text.replace('        let s2: u64 = div.q2;', '        // Propagate the rounding carry through every limb, including w1.\n        let c1: u64 = s1 >> LIMB_SHIFT;\n        let s2: u64 = div.q2 + c1;')
+[?2004l[?2004h> (s/'src/lib.rs').write_text(text)
+[?2004l[?2004h> PY
+[?2004lbalance 9223372036854275808 amount 18446744073708551617 fee 999999 exact debit 27670116110563827424
+[?2004hroot@42dc7d7cff85:/workspace# python3 /workspace/lean/check.py
+[?2004lcd /workspace/challenge && cargo test
+CandidateProof.lean:14:4: error: failed to synthesize
+  Decidable ¬candidateSpec.accepts 9223372036854275808 18446744073708551617 999999
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+[?2004hroot@42dc7d7cff85:/workspace# cd /workspace/challenge && cargo test
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+[1m[32m     Running[0m unittests src/lib.rs (target/debug/deps/settlement_gate-66f23bc290c8a00c)
+
+running 3 tests
+test tests::rounds_up_fractional_fee ... [32mok[m
+test tests::multi_word_carry_across_q0_boundary ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@42dc7d7cff85:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p=Path('/workspace/submission/Proof.lean')
+[?2004l[?2004h> s=p.read_text().replace('have rejected : ¬ candidateSpec.accepts 9223372036854275808 18446744073708551617 999999 := by\n    decide', 'have rejected : ¬ candidateSpec.accepts 9223372036854275808 18446744073708551617 999999 := by\n    change ¬ settlementDebit 18446744073708551617 999999 ≤ (9223372036854275808 : UInt64).toNat\n    decide')
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> p=Path('/workspace/submission/src/lib.rs')
+[?2004l[?2004h> s=p.read_text()
+[?2004l[?2004h> pos=s.rfind('\n}')
+[?2004l[?2004h> s=s[:pos]+'''
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn carry_into_third_limb_rejects_unrepresentable_fee() {
+[?2004l[?2004h>         let amount = 18_446_744_073_708_551_617u64;
+[?2004l[?2004h>         let fee = 999_999u64;
+[?2004l[?2004h>         let balance = 9_223_372_036_854_275_808u64;
+[?2004l[?2004h>         assert_eq!(u128_math::div_round_up_fee(amount, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(balance, amount, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(u64::MAX, amount, fee), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> '''+s[pos:]
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@42dc7d7cff85:/workspace/challenge# python3 /workspace/lean/check.py
+[?2004lrustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/repaired-authorization-tests && /tmp/repaired-authorization-tests
+[?2004hroot@42dc7d7cff85:/workspace/challenge# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/repaired-authorization-tests && /tmp/repaired-authorization-tests
+[?2004l
+running 4 tests
+test tests::carry_into_third_limb_rejects_unrepresentable_fee ... [32mok[m
+test tests::multi_word_carry_across_q0_boundary ... [32mok[m
+test tests::rounds_up_fractional_fee ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@42dc7d7cff85:/workspace/challenge# cat > /tmp/authorization-reference-check.rs <<'RS'
+[?2004l[?2004h> mod repaired { include!("/workspace/submission/src/lib.rs"); }
+[?2004l[?2004h> fn check(balance: u64, amount: u64, fee: u64) {
+[?2004l[?2004h>     let x = (amount as u128) + ((fee as u128) << 64);
+[?2004l[?2004h>     let gross_fee = x / 1_000_000 + if x % 1_000_000 == 0 { 0 } else { 1 };
+[?2004l[?2004h>     let debit = (amount as u128) / 2 + gross_fee;
+[?2004l[?2004h>     let expected = if debit <= balance as u128 { Some(debit as u64) } else { None };
+[?2004l[?2004h>     assert_eq!(repaired::authorize(balance, amount, fee).map(|a| a.total_debit), expected,
+[?2004l[?2004h>         "balance={balance}, amount={amount}, fee={fee}");
+[?2004l[?2004h> }
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let values = [0, 1, 2, 999_998, 999_999, 1_000_000, 1_000_001,
+[?2004l[?2004h>         4_294_967_295, 4_294_967_296, 4_294_967_297,
+[?2004l[?2004h>         18_446_744_073_708_551_616, 18_446_744_073_708_551_617,
+[?2004l[?2004h>         u64::MAX - 1, u64::MAX];
+[?2004l[?2004h>     for b in values { for a in values { for f in values { check(b, a, f); } } }
+[?2004l[?2004h>     let mut seed = 1u64;
+[?2004l[?2004h>     for i in 0..200_000 {
+[?2004l[?2004h>         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+[?2004l[?2004h>         let amount = seed;
+[?2004l[?2004h>         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+[?2004l[?2004h>         let fee = if i % 2 == 0 { seed % 1_000_001 } else { seed };
+[?2004l[?2004h>         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+[?2004l[?2004h>         check(seed, amount, fee);
+[?2004l[?2004h>         let x = amount as u128 + ((fee as u128) << 64);
+[?2004l[?2004h>         let debit = amount as u128 / 2 + x / 1_000_000 + if x % 1_000_000 == 0 { 0 } else { 1 };
+[?2004l[?2004h>         if debit <= u64::MAX as u128 {
+[?2004l[?2004h>             check(debit as u64, amount, fee);
+[?2004l[?2004h>             if debit > 0 { check((debit - 1) as u64, amount, fee); }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("Boundary and randomized u128 reference comparisons passed");
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@42dc7d7cff85:/workspace/challenge# rustc --edition=2021 -O /tmp/authorization-reference-check.rs -o /tmp/authorization-reference-check && /tmp/authorization-reference-check
+[?2004l[0m[1m[38;5;9merror[E0432][0m[0m[1m: unresolved import `crate::Authorization`[0m
+[0m   [0m[0m[1m[38;5;12m--> [0m[0m/workspace/submission/src/lib.rs:110:9[0m
+[0m    [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;12m110[0m[0m [0m[0m[1m[38;5;12m|[0m[0m [0m[0m    use crate::Authorization;[0m
+[0m    [0m[0m[1m[38;5;12m|[0m[0m         [0m[0m[1m[38;5;9m^^^^^^^^^^^^^^^^^^^^[0m[0m [0m[0m[1m[38;5;9mno `Authorization` in the root[0m
+[0m    [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;14mhelp[0m[0m: consider importing this struct instead[0m
+[0m    [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;12m110[0m[0m [0m[0m[1m[38;5;12m| [0m[0m    use [0m[0m[38;5;10mcrate::repaired::Authorization[0m[0m;[0m
+[0m    [0m[0m[1m[38;5;12m|[0m[0m         [0m[0m[38;5;10m~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~[0m
+
+[0m[1m[38;5;9merror[E0432][0m[0m[1m: unresolved import `crate::u128_math`[0m
+[0m   [0m[0m[1m[38;5;12m--> [0m[0m/workspace/submission/src/lib.rs:111:9[0m
+[0m    [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;12m111[0m[0m [0m[0m[1m[38;5;12m|[0m[0m [0m[0m    use crate::u128_math;[0m
+[0m    [0m[0m[1m[38;5;12m|[0m[0m         [0m[0m[1m[38;5;9m^^^^^^^^^^^^^^^^[0m[0m [0m[0m[1m[38;5;9mno `u128_math` in the root[0m
+[0m    [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;14mhelp[0m[0m: consider importing this module instead[0m
+[0m    [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;12m111[0m[0m [0m[0m[1m[38;5;12m| [0m[0m    use [0m[0m[38;5;10mcrate::repaired::u128_math[0m[0m;[0m
+[0m    [0m[0m[1m[38;5;12m|[0m[0m         [0m[0m[38;5;10m~~~~~~~~~~~~~~~~~~~~~~~~~~[0m
+
+[0m[1m[38;5;9merror[0m[0m[1m: aborting due to 2 previous errors[0m
+
+[0m[1mFor more information about this error, try `rustc --explain E0432`.[0m
+[?2004hroot@42dc7d7cff85:/workspace/challenge# find /workspace/submission -maxdepth 2 -type f -print; cat /workspace/submission/Proof.lean; cat /workspace/submission/counterexample.json; diff -u /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs
+[?2004l/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src/lib.rs
+/workspace/submission/counterexample.json
+by
+  change ¬ Conforms candidateSpec challengeAuthorize
+  intro h
+  have accepted : challengeAuthorize 9223372036854275808 18446744073708551617 999999 = some 9223372036854275808 := by
+    decide
+  have rejected : ¬ candidateSpec.accepts 9223372036854275808 18446744073708551617 999999 := by
+    change ¬ settlementDebit 18446744073708551617 999999 ≤ (9223372036854275808 : UInt64).toNat
+    decide
+  exact rejected ((h.1 9223372036854275808 18446744073708551617 999999).mp ⟨9223372036854275808, accepted⟩)
+{
+  "balance": 9223372036854275808,
+  "amount": 18446744073708551617,
+  "fee": 999999
+}
+--- /workspace/challenge/src/lib.rs	2026-10-07 06:59:50.000000000 +0000
++++ /workspace/submission/src/lib.rs	2026-10-07 07:12:53.362658644 +0000
+@@ -74,7 +74,9 @@
+         let c0: u64 = s0 >> LIMB_SHIFT;
+         let s1: u64 = div.q1 + c0;
+         let r1: u64 = s1 & LIMB_MASK;
+-        let s2: u64 = div.q2;
++        // Propagate the rounding carry through every limb, including w1.
++        let c1: u64 = s1 >> LIMB_SHIFT;
++        let s2: u64 = div.q2 + c1;
+         let r2: u64 = s2 & LIMB_MASK;
+         let c2: u64 = s2 >> LIMB_SHIFT;
+         let r3: u64 = div.q3 + c2;
+@@ -186,4 +188,15 @@
+             })
+         );
+     }
++
++    #[test]
++    fn carry_into_third_limb_rejects_unrepresentable_fee() {
++        let amount = 18_446_744_073_708_551_617u64;
++        let fee = 999_999u64;
++        let balance = 9_223_372_036_854_275_808u64;
++        assert_eq!(u128_math::div_round_up_fee(amount, fee), None);
++        assert_eq!(authorize(balance, amount, fee), None);
++        assert_eq!(authorize(u64::MAX, amount, fee), None);
++    }
++
+ }
+[?2004hroot@42dc7d7cff85:/workspace/challenge# sed -i '1c include!("/workspace/submission/src/lib.rs");' /tmp/authorization-reference-check.rs
+[?2004l[?2004hroot@42dc7d7cff85:/workspace/challenge# sed -i 's/repaired::authorize/authorize/g' /tmp/authorization-reference-check.rs
+[?2004l[?2004hroot@42dc7d7cff85:/workspace/challenge# rustc --edition=2021 -O /tmp/authorization-reference-check.rs -o /tmp/authorization-reference-check && /tmp/authorization-reference-check
+[?2004lBoundary and randomized u128 reference comparisons passed
+[?2004hroot@42dc7d7cff85:/workspace/challenge# 

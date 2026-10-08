@@ -1,0 +1,496 @@
+[?2004hroot@c3220d0bc115:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@c3220d0bc115:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@c3220d0bc115:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mg10 {
+    pub const MG10_DIVISOR: u64 = 0x8003u64;
+    pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+    pub const LIMB_MASK: u64 = 0xFFFFu64;
+    pub const SUB_BIAS: u64 = 0xC000_0000u64;
+
+    /// Möller-Granlund 2-by-1 normalized division (`alloy-rs/ruint` `src/algorithms/div/small.rs`)
+    /// for fixed normalized divisor `D = 0x8003 = 32771` and reciprocal
+    /// `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65524`.
+    /// Given `u1 < D` and `u0 < 2^16`, returns `floor((u1 * 2^16 + u0) / D)`.
+    #[inline]
+    pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+        let q_full: u64 = (u1 * MG10_RECIPROCAL) + (u1 << 16u64) + u0 + (1u64 << 16u64);
+
+        let q1: u64 = q_full >> 16u64;
+        let q0: u64 = q_full & LIMB_MASK;
+        let r: u64 = (SUB_BIAS + u0 - q1 * MG10_DIVISOR) & LIMB_MASK;
+
+        if q0 < r {
+            q1 - 1u64
+        } else {
+            q1
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mg10;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RuintQuote {
+        pub u1: u64,
+        pub u0: u64,
+        pub quotient: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<RuintQuote> {
+        let u1: u64 = fee % mg10::MG10_DIVISOR;
+        let u0: u64 = amount & mg10::LIMB_MASK;
+        let quotient: u64 = mg10::div_2x1_mg10(u1, u0);
+        let total_debit: u64 = (amount >> 1u64) + quotient;
+        Some(RuintQuote {
+            u1,
+            u0,
+            quotient,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: RuintQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Ruint Möller-Granlund 2-by-1 normalized division settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `D = 32771` (`0x8003`), `B = 2^16 = 65536`
+/// - `u1 = fee mod D`, `u0 = amount mod B`
+/// - `quotient = floor((u1 * B + u0) / D)`
+/// - `total_debit = floor(amount / 2) + quotient`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::RuintQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn exact_multiple_of_divisor() {
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn two_limb_dividend_matches_policy() {
+        assert_eq!(
+            authorize(16_405, 32_771, 10),
+            Some(Authorization {
+                total_debit: 16_405
+            })
+        );
+    }
+}
+[?2004hroot@c3220d0bc115:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004lnamespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def mg10Divisor : UInt64 := 0x8003
+def mg10Reciprocal : UInt64 := 0xFFF4
+def limbMask : UInt64 := 0xFFFF
+def subBias : UInt64 := 0xC0000000
+
+structure RuintQuote where
+  u1 : UInt64
+  u0 : UInt64
+  quotient : UInt64
+  totalDebit : UInt64
+
+def div2x1Mg10 (u1 u0 : UInt64) : UInt64 :=
+  let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+  let q1 := qFull >>> 16
+  let q0 := qFull &&& limbMask
+  let r := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+  if q0 < r then
+    q1 - 1
+  else
+    q1
+
+def buildQuote (amount fee : UInt64) : Option RuintQuote :=
+  let u1 := fee % mg10Divisor
+  let u0 := amount &&& limbMask
+  let quotient := div2x1Mg10 u1 u0
+  let totalDebit := (amount >>> 1) + quotient
+  some {
+    u1 := u1,
+    u0 := u0,
+    quotient := quotient,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : RuintQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@c3220d0bc115:/workspace# ls -la /workspace/lean /workspace/submission; cat /workspace/lean/check.py
+[?2004l/workspace/lean:
+total 172
+drwxr-xr-x 1 root root   4096 Oct  8 11:16 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   1915 Oct  8 11:16 SecurityChallenge.lean
+-rw-r--r-- 1 root root 151336 Oct  8 11:16 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  7 08:20 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  8 11:16 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  8 11:16 [01;34msrc[0m
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+[?2004hroot@c3220d0bc115:/workspace# cat /workspace/submission/{Spec,Audit,Proof}.lean; ls -l /workspace/submission/src; cat /workspace/challenge/Cargo.toml; which lean; lean --version
+[?2004limport SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+total 0
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+/opt/lean/bin/lean
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[?2004hroot@c3220d0bc115:/workspace# python3 - <<'PY'
+[?2004l[?2004h> D=32771
+[?2004l[?2004h> for u1 in range(D):
+[?2004l[?2004h>     for u0 in (0, 1, 32770, 32771, 65534, 65535):
+[?2004l[?2004h>         qfull=u1*65524+u1*65536+u0+65536
+[?2004l[?2004h>         q1=qfull>>16
+[?2004l[?2004h>         q0=qfull&65535
+[?2004l[?2004h>         r=(0xC0000000+u0-q1*D)&65535
+[?2004l[?2004h>         actual=q1-1 if q0<r else q1
+[?2004l[?2004h>         expected=(u1*65536+u0)//D
+[?2004l[?2004h>         if actual!=expected:
+[?2004l[?2004h>             print(dict(u1=u1,u0=u0,actual=actual,expected=expected,q1=q1,q0=q0,r=r))
+[?2004l[?2004h>             raise SystemExit
+[?2004l[?2004h> print('No discrepancy in this sample')
+[?2004l[?2004h> PY
+[?2004l{'u1': 16384, 'u0': 65534, 'actual': 32766, 'expected': 32767, 'q1': 32766, 'q0': 65534, 'r': 32772}
+[?2004hroot@c3220d0bc115:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- The debit used by settlement, computed in exact natural-number arithmetic. -/
+[?2004l[?2004h> def settlementDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 +
+[?2004l[?2004h>     ((fee.toNat % 32771) * 65536 + amount.toNat % 65536) / 32771
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Every and only affordable settlement is authorized, for its exact debit. -/
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := settlementDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     settlementDebit amount fee ≤ balance.toNat ∧
+[?2004l[?2004h>     totalDebit.toNat = settlementDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c3220d0bc115:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- The reciprocal routine can underestimate the quotient by one.
+[?2004l[?2004h> def verdict : AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c3220d0bc115:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have run : SecurityChallenge.challengeAuthorize 65533 65534 16384 = some 65533 := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   have required := h.2 65533 65534 16384 65533 run
+[?2004l[?2004h>   have impossible : ¬ candidateSpec.output 65533 65534 16384 65533 := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   exact impossible required
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c3220d0bc115:/workspace# cat > /workspace/submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance":65533,"amount":65534,"fee":16384}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c3220d0bc115:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> s=Path('/workspace/challenge/src/lib.rs').read_text()
+[?2004l[?2004h> start=s.index('    /// Möller-Granlund')
+[?2004l[?2004h> end=s.index('\n}\n', start)
+[?2004l[?2004h> s=s[:start]+'''    /// Exact 2-by-1 normalized division for D = 32771.
+[?2004l[?2004h>     /// Given u1 < D and u0 < 65536, the dividend fits in u64.
+[?2004l[?2004h>     /// Returns floor((u1 * 65536 + u0) / D).
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+[?2004l[?2004h>         (u1 * 65536u64 + u0) / MG10_DIVISOR
+[?2004l[?2004h>     }
+[?2004l[?2004h> '''+s[end:]
+[?2004l[?2004h> Path('/workspace/submission/src/lib.rs').write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@c3220d0bc115:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:5:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:10:1: error: unexpected token 'def'; expected term
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@c3220d0bc115:/workspace# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-tests && /tmp/settlement-tests
+[?2004l
+running 3 tests
+test tests::exact_multiple_of_divisor ... [32mok[m
+test tests::two_limb_dividend_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@c3220d0bc115:/workspace# sed -i 's@/-- The debit used by settlement, computed in exact natural-number arithmetic. -/@-- The debit used by settlement, computed in exact natural-number arithmetic.@; s@/-- Every and only affordable settlement is authorized, for its exact debit. -/@-- Every and only affordable settlement is authorized, for its exact debit.@' /workspace/submission/Spec.lean
+[?2004l[?2004hroot@c3220d0bc115:/workspace# python3 /workspace/lean/check.py
+[?2004lpython3 - <<'PY'
+from pathlib import Path
+p=Path('/workspace/submission/src/lib.rs')
+s=p.read_text()
+pos=s.rfind('\n}')
+s=s[:pos]+'''
+
+    #[test]
+    fn reciprocal_underestimate_regression() {
+        assert_eq!(mg10::div_2x1_mg10(16384, 65534), 32767);
+        assert_eq!(authorize(65533, 65534, 16384), None);
+        assert_eq!(
+            authorize(65534, 65534, 16384),
+            Some(Authorization { total_debit: 65534 })
+        );
+    }
+
+    #[test]
+    fn maximum_amount_and_limb_values() {
+        // The largest two-limb dividend has quotient 65535.
+        assert_eq!(mg10::div_2x1_mg10(32770, 65535), 65535);
+        let amount = u64::MAX;
+        let fee = 32770;
+        let debit = (amount / 2) + 65535;
+        assert_eq!(authorize(debit - 1, amount, fee), None);
+        assert_eq!(authorize(debit, amount, fee), Some(Authorization { total_debit: debit }));
+        assert_eq!(authorize(u64::MAX, amount, fee), Some(Authorization { total_debit: debit }));
+    }
+'''+s[pos:]
+p.write_text(s)
+PY
+rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-tests && /tmp/settlement-tests
+CandidateProof.lean:15:4: error: failed to synthesize
+  Decidable ¬candidateSpec.output 65533 65534 16384 65533
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+[?2004hroot@c3220d0bc115:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p=Path('/workspace/submission/src/lib.rs')
+[?2004l[?2004h> s=p.read_text()
+[?2004l[?2004h> pos=s.rfind('\n}')
+[?2004l[?2004h> s=s[:pos]+'''
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn reciprocal_underestimate_regression() {
+[?2004l[?2004h>         assert_eq!(mg10::div_2x1_mg10(16384, 65534), 32767);
+[?2004l[?2004h>         assert_eq!(authorize(65533, 65534, 16384), None);
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(65534, 65534, 16384),
+[?2004l[?2004h>             Some(Authorization { total_debit: 65534 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn maximum_amount_and_limb_values() {
+[?2004l[?2004h>         // The largest two-limb dividend has quotient 65535.
+[?2004l[?2004h>         assert_eq!(mg10::div_2x1_mg10(32770, 65535), 65535);
+[?2004l[?2004h>         let amount = u64::MAX;
+[?2004l[?2004h>         let fee = 32770;
+[?2004l[?2004h>         let debit = (amount / 2) + 65535;
+[?2004l[?2004h>         assert_eq!(authorize(debit - 1, amount, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(debit, amount, fee), Some(Authorization { total_debit: debit }));
+[?2004l[?2004h>         assert_eq!(authorize(u64::MAX, amount, fee), Some(Authorization { total_debit: debit }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> '''+s[pos:]
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@c3220d0bc115:/workspace# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-tests && /tmp/settlement-tests
+[?2004l
+running 5 tests
+test tests::exact_multiple_of_divisor ... [32mok[m
+test tests::maximum_amount_and_limb_values ... [32mok[m
+test tests::reciprocal_underestimate_regression ... [32mok[m
+test tests::two_limb_dividend_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@c3220d0bc115:/workspace# sed -i '/have impossible :/,/exact impossible required/ s/^    decide$/    unfold candidateSpec settlementDebit\n    decide/' /workspace/submission/Proof.lean
+[?2004l[?2004hroot@c3220d0bc115:/workspace# python3 /workspace/lean/check.py
+[?2004lrustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-tests && /tmp/settlement-tests
+[?2004hroot@c3220d0bc115:/workspace# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/settlement-tests && /tmp/settlement-tests
+[?2004l
+running 5 tests
+test tests::exact_multiple_of_divisor ... [32mok[m
+test tests::maximum_amount_and_limb_values ... [32mok[m
+test tests::reciprocal_underestimate_regression ... [32mok[m
+test tests::two_limb_dividend_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@c3220d0bc115:/workspace# echo "Previous command exit status: $?"; find /workspace/submission -maxdepth 2 -type f -print; cat /workspace/submission/Proof.lean
+[?2004lPrevious command exit status: 0
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src/lib.rs
+/workspace/submission/counterexample.json
+by
+  change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+  intro h
+  have run : SecurityChallenge.challengeAuthorize 65533 65534 16384 = some 65533 := by
+    decide
+  have required := h.2 65533 65534 16384 65533 run
+  have impossible : ¬ candidateSpec.output 65533 65534 16384 65533 := by
+    unfold candidateSpec settlementDebit
+    decide
+  exact impossible required
+[?2004hroot@c3220d0bc115:/workspace# python3 /workspace/lean/check.py && echo 'Lean compilation check passed'
+[?2004lLean compilation check passed
+[?2004hroot@c3220d0bc115:/workspace# 

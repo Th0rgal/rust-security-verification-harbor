@@ -51,10 +51,6 @@ def run(cmd, cwd, timeout=120, *, env=None, sandbox=False, read_paths=()):
     def child():
         if sandbox:
             restrict(str(cwd), list(read_paths))
-            if os.getuid() == 0:
-                os.setgroups([]); os.setgid(65534); os.setuid(65534)
-    if sandbox and os.getuid() == 0:
-        os.chown(cwd, 65534, 65534)
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=stdout, stderr=stderr, env=env,
                                 start_new_session=True, preexec_fn=child if sandbox else None)
@@ -100,7 +96,7 @@ def read_problem(verifier):
     path = verifier/'problem.txt'
     if not path.exists(): return 'authorization'
     problem = path.read_text().strip()
-    if problem not in ('authorization', 'settlement', 'settlement-modular', 'settlement-engine'):
+    if problem not in spec.PROBLEMS:
         raise RuntimeError('invalid trusted problem')
     return problem
 
@@ -144,6 +140,40 @@ def check_patch(source, problem='authorization'):
                 (1660206966633860, 0, 18446744073709550000),
                 (1660206966643861, 10000, 18446744073709550000),
             ]
+        elif problem == 'goldilocks':
+            cases += [
+                (18446744069414584318, 0, 8589934592),
+                (18446744069414584320, 0, 4294967296),
+                (MAX, 1, 8589934592),
+            ]
+        elif problem == 'whirlpool':
+            cases += [
+                (MAX, 18446744073708551617, 999999),
+                (MAX, 18446744073708551616, 999999),
+            ]
+        elif problem == 'plonky3':
+            cases += [
+                (4294967297, 4294967297, 1069547520),
+                (2013265920, 0, 1069547520),
+            ]
+        elif problem == 'succinct':
+            cases += [
+                (128, 0, 128),
+                (384, 0, 128),
+                (3072, 0, 0x8080_8080_8080_8080),
+            ]
+        elif problem == 'openpql':
+            cases += [
+                (1, 2, MAX),
+                (2, 2, MAX),
+                (MAX // 2, 0, MAX),
+            ]
+        elif problem == 'ruint':
+            cases += [
+                (65533, 65535, 16384),
+                (65534, 65535, 16384),
+                (98301, 65534, 21845),
+            ]
         # Include an SMT counterexample, so a universal failure is reproduced in Rust.
         if 'counterexample' in universal:
             cases.append(tuple(universal['counterexample'][k] for k in ('balance','amount','fee')))
@@ -167,9 +197,38 @@ def check_patch(source, problem='authorization'):
 
 
 
-ALLOWED_IMPORTS = {'SecurityChallenge', 'Lean', 'Std', 'Lean.Elab.Tactic.Omega'}
+ALLOWED_IMPORT_PREFIXES = (
+    'SecurityChallenge',
+    'Lean',
+    'Std',
+    'Init',
+    'Mathlib',
+    'Batteries',
+    'Aesop',
+    'Qq',
+)
 
-def clean_source(text, imports):
+
+def _is_allowed_import(mod):
+    return any(mod == p or mod.startswith(p + '.') for p in ALLOWED_IMPORT_PREFIXES)
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def clean_source(text, allowed_prefixes=ALLOWED_IMPORT_PREFIXES):
     # Ignore nested Lean comments for policy checks. Lean still receives source
     # and is authoritative for syntax/type checking; this is not its parser.
     text = re.sub(r'--[^\n]*', '', text)
@@ -181,14 +240,20 @@ def clean_source(text, imports):
             else: pos+=1
         if depth: raise ValueError('unterminated Lean comment')
         text=text[:start]+' '+text[pos:]
+    extra_imports = []
     for line in text.splitlines():
         if line.strip().startswith('import '):
-            if any(x not in imports for x in line.split()[1:]): raise ValueError('forbidden Lean import')
+            mods = line.split()[1:]
+            if not mods or any(not any(m == p or m.startswith(p + '.') for p in allowed_prefixes) for m in mods):
+                raise ValueError('forbidden Lean import')
+            for m in mods:
+                if m not in extra_imports:
+                    extra_imports.append(m)
     # Additional imports cannot be smuggled inside another command.
     remaining=re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
     if re.search(r'\b(import|sorry|sorryAx|admit|axiom|unsafe|initialize|builtin_initialize|native_decide|implemented_by|extern|syntax|macro|elab)\b',remaining):
         raise ValueError('forbidden axiom/import/unsafe elaboration extension')
-    return text
+    return remaining, extra_imports
 
 class LeanSession:
     """Compile in isolation, freeze .olean files, independently replay kernels.
@@ -206,28 +271,30 @@ class LeanSession:
         if 'version 4.31.0,' not in version.stdout: raise RuntimeError('Lean 4.31.0 required')
         self.prefix=Path(self.lean).resolve().parent.parent
         self.problem=read_problem(verifier)
+        self.extra_lean_paths=_extra_lean_paths()
         self.frozen={}
 
     def stage(self,module,text,mode):
+        cleaned, extra_imports = clean_source(text)
+        import_block = ''.join(f'import {m}\n' for m in extra_imports if m != 'SecurityChallenge')
         if module=='CandidateProof':
-            cleaned=clean_source(text,ALLOWED_IMPORTS)
-            while cleaned.strip().startswith('import '):
-                _,_,cleaned=cleaned.strip().partition('\n')
             if re.search(r'\b(theorem|def|opaque|constant|namespace|section|end|export|attribute|set_option)\b',cleaned) or '#' in cleaned:
                 raise ValueError('Proof.lean must be a proof term')
-            text='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\nopen SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+cleaned+'\n)\n'
+            text='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'+import_block+'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+cleaned+'\n)\n'
         else:
-            clean_source(text,ALLOWED_IMPORTS)
-            text='import SecurityChallenge\n'+text
+            text='import SecurityChallenge\n'+import_block+cleaned+'\n'
         with tempfile.TemporaryDirectory(prefix='lean-native-') as raw:
             tmp=Path(raw)
             for name,data in self.frozen.items(): (tmp/name).write_bytes(data)
             (tmp/(module+'.lean')).write_text(text)
+            lean_path_entries = [str(self.api.resolve()), str(tmp)] + self.extra_lean_paths
             env={'PATH':str(Path(self.lean).parent)+':/usr/bin:/bin','HOME':str(tmp),
-                 'LEAN_PATH':str(self.api.resolve())+':'+str(tmp),'TMPDIR':str(tmp)}
+                 'LEAN_PATH':':'.join(lean_path_entries),'TMPDIR':str(tmp)}
             reads=[str(self.prefix),str(self.api.resolve()),'/usr/lib','/lib','/lib64','/dev/null','/dev/urandom']
+            if Path('/opt/rvb-deps').exists():
+                reads.append('/opt/rvb-deps')
             try:
-                compiled=run([self.lean,'-j1','-M2048','-o',module+'.olean',module+'.lean'],tmp,120,env=env,sandbox=True,read_paths=reads)
+                compiled=run([self.lean,'-j1','-M4096','-o',module+'.olean',module+'.lean'],tmp,120,env=env,sandbox=True,read_paths=reads)
             except subprocess.SubprocessError as exc:
                 raise RuntimeError('Lean sandbox infrastructure unavailable: '+str(exc)) from exc
             artifact=tmp/(module+'.olean')

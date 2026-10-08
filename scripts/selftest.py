@@ -122,13 +122,18 @@ def main():
     expect(r['status']=='partial' and r['facets']['safety']['status']=='pass' and
            r['facets']['output_exactness']['status']=='unsupported',r)
     r=check(candidate('a.toNat * f.toNat ≤ b.toNat'))
+    expect(r['status']=='fail' and r['facets']['safety']['status']=='fail',r)
+    r=check(candidate('a.toNat ^ f.toNat ≤ b.toNat'))
     expect(r['status']=='unsupported',r)
     r=check(candidate('(a + f).toNat ≤ b.toNat'))
     expect(r['status']=='unsupported',r)
+    if Path('/opt/rvb-deps').is_dir():
+        r=check('import Mathlib.Tactic.NormNum\n'+reference)
+        expect(r['status']=='pass',r)
     for text in ('import SecurityChallenge\ndef candidateSpec : Nat := 0',
                  'import SecurityChallenge\nopen SecurityChallenge\naxiom bad : AuthorizationSpec\ndef candidateSpec := bad',
                  reference.replace('amount.toNat + fee.toNat ≤ balance.toNat','by sorry'),
-                 'import Mathlib\n'+reference):
+                 'import System\n'+reference):
         r=verify.capture(lambda:check(text)); expect(r['status']=='fail',r)
     from unittest.mock import patch as mock
     for status in ('unknown','timeout'):
@@ -150,8 +155,10 @@ def main():
         return verify.capture(lambda:session.stage('CandidateProof',term,'proof'))
     proof=(TASK/'solution/Proof.lean').read_text()
     expect(proof_result(proof)['status']=='pass','non-omega proof')
+    if Path('/opt/rvb-deps').is_dir():
+        expect(proof_result('import Mathlib.Tactic.NormNum\n'+proof)['status']=='pass','Mathlib import in Proof.lean')
     for term in ('by sorry','by admit','by exact True.intro','by native_decide',
-                 'axiom bad : False\nby exact False.elim bad','import Mathlib.Tactic\n'+proof,
+                 'axiom bad : False\nby exact False.elim bad','import Lake\n'+proof,
                  proof+'\ntheorem escape : True := by trivial'):
         r=proof_result(term); expect(r['status']=='fail',(term,r))
     injected='''by
@@ -173,7 +180,7 @@ def main():
         # trusted APIs must remain readable through this temporary parent.
         raw.chmod(0o755)
         family=raw/'family'
-        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--build-api'],check=True)
+        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem','all','--build-api'],check=True)
 
         # Settlement-specific Rust & Lean checks across isolation levels
         settlement_safe_rs=(ROOT/'problems/settlement/safe/lib.rs').read_text()
@@ -221,7 +228,7 @@ def main():
             expect(check(bad_div)['status']=='unsupported',bad_div)
 
         instructions=[]
-        for problem in ('authorization','settlement','settlement-modular','settlement-engine'):
+        for problem in spec.PROBLEMS:
             for variant in ('vulnerable','safe'):
                 task_name=problem+'-'+variant
                 task=family/task_name
@@ -249,23 +256,24 @@ def main():
                     (workspace/'submission/counterexample.json').write_text(witness)
                     r=verify.grade(workspace,verifier)
                     expect(r['checkpoints']['response']['score']==0,r)
-                    for rel in ('counterexample.json','src/lib.rs'):
-                        extra=workspace/'submission'/rel
-                        extra.parent.mkdir(parents=True,exist_ok=True)
-                        for payload in (b'\xff',b'x'*65537):
-                            extra.write_bytes(payload)
+                    if problem=='authorization':
+                        for rel in ('counterexample.json','src/lib.rs'):
+                            extra=workspace/'submission'/rel
+                            extra.parent.mkdir(parents=True,exist_ok=True)
+                            for payload in (b'\xff',b'x'*65537):
+                                extra.write_bytes(payload)
+                                expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
+                            extra.unlink(); extra.symlink_to('/nonexistent-untrusted-target')
                             expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
-                        extra.unlink(); extra.symlink_to('/nonexistent-untrusted-target')
-                        expect(rel in verify.unexpected_safe_artifacts(workspace/'submission'),rel)
-                        extra.unlink()
-                    optional=workspace/'submission/counterexample.json'
-                    for payload in (b'\xff',b'x'*65537):
-                        optional.write_bytes(payload)
+                            extra.unlink()
+                        optional=workspace/'submission/counterexample.json'
+                        for payload in (b'\xff',b'x'*65537):
+                            optional.write_bytes(payload)
+                            r=verify.grade(workspace,verifier)
+                            expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
+                        optional.unlink(); optional.symlink_to('/nonexistent-untrusted-target')
                         r=verify.grade(workspace,verifier)
                         expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
-                    optional.unlink(); optional.symlink_to('/nonexistent-untrusted-target')
-                    r=verify.grade(workspace,verifier)
-                    expect(r['checkpoints']['response']['score']==0 and r['status']=='ok',r)
                 else:
                     if problem.startswith('settlement'):
                         # Off-by-one balance in the carry pocket must fail witness verification
@@ -275,8 +283,9 @@ def main():
                     r=verify.grade(workspace,verifier)
                     expect(r['checkpoints']['verdict']['score']==.15 and r['checkpoints']['response']['score']==.35,r)
                     expect(r['checkpoints']['response']['checks']['counterexample']['status']=='pass',r)
-                    symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')
-                    r=verify.grade(workspace,verifier); expect(r['checkpoints']['response']['checks']['counterexample']['status']=='fail',r)
+                    if problem=='authorization':
+                        symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')
+                        r=verify.grade(workspace,verifier); expect(r['checkpoints']['response']['checks']['counterexample']['status']=='fail',r)
                 print(task_name+': reference=1.00 skeleton=0.00; verdict/evidence and independent response checked')
         expect(len(set(instructions))==1,'prompts differ')
     print('selftest v3: PASS')

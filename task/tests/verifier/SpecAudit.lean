@@ -32,7 +32,7 @@ def node (op : String) (args : Array Json := #[]) : Json :=
 
 -- Serialize kernel Exprs, never candidate text. Unknown heads are unfolded
 -- only when definitional reduction makes progress, with a finite fuel budget.
-partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 512) : MetaM Json := do
+partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 2048) : MetaM Json := do
   if fuel == 0 then throwError "unsupported: normalization/expression budget"
   let e := e.consumeMData.headBeta
   let fn := e.getAppFn
@@ -43,10 +43,13 @@ partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 512) : MetaM Jso
     let input ← withTransparency .all (whnf args[0]!)
     if let some i := vars.findIdx? (· == input) then
       return Json.mkObj [("var", toJson i)]
-    let reduced ← whnf e
+    let reduced ← withTransparency .all (whnf e)
     if let .lit (.natVal n) := reduced then return Json.mkObj [("nat", toJson n)]
     throwError "unsupported: UInt64.toNat on a non-input expression"
   if let .lit (.natVal n) := e then return Json.mkObj [("nat", toJson n)]
+  if !e.hasFVar then
+    let reduced ← withTransparency .all (whnf e)
+    if let .lit (.natVal n) := reduced then return Json.mkObj [("nat", toJson n)]
   if name == some ``True then return node "true"
   if name == some ``False then return node "false"
   if name == some ``Nat.add && args.size == 2 then return node "add" #[← recur args[0]!, ← recur args[1]!]
@@ -54,10 +57,16 @@ partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 512) : MetaM Jso
   if name == some ``Nat.mul && args.size == 2 then return node "mul" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.div && args.size == 2 then return node "div" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.mod && args.size == 2 then return node "mod" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.pow && args.size == 2 then return node "pow" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.land && args.size == 2 then return node "bitand" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.lor && args.size == 2 then return node "bitor" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.xor && args.size == 2 then return node "bitxor" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.shiftLeft && args.size == 2 then return node "shl" #[← recur args[0]!, ← recur args[1]!]
+  if name == some ``Nat.shiftRight && args.size == 2 then return node "shr" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.le && args.size == 2 then return node "le" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Nat.lt && args.size == 2 then return node "lt" #[← recur args[0]!, ← recur args[1]!]
   if name == some ``Eq && args.size == 3 then
-    let typ ← whnf args[0]!
+    let typ ← withTransparency .all (whnf args[0]!)
     unless typ == mkConst ``Nat || typ == mkSort .zero do
       throwError "unsupported: equality outside Nat/Prop"
     return node "eq" #[← recur args[1]!, ← recur args[2]!]
@@ -76,13 +85,15 @@ partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 512) : MetaM Jso
   -- if into Decidable.rec and lose the supported conditional's head.
   if let .letE _ _ value body _ := fn then
     return ← recur (mkAppN (body.instantiate1 value) args)
-  if let some projected ← reduceProj? fn then
+  if let some projected ← withTransparency .all (reduceProj? fn) then
     return ← recur (mkAppN projected args)
   if let .const n levels := fn then
     if let some (.defnInfo info) := (← getEnv).find? n then
       return ← recur (mkAppN (info.value.instantiateLevelParams info.levelParams levels) args)
+    if let some unfolded ← withTransparency .all (unfoldDefinition? e) then
+      return ← recur unfolded
   if !e.hasFVar then
-    let reduced ← whnf e
+    let reduced ← withTransparency .all (whnf e)
     if reduced != e then return ← recur reduced
   throwError "unsupported expression head: {fn}"
 

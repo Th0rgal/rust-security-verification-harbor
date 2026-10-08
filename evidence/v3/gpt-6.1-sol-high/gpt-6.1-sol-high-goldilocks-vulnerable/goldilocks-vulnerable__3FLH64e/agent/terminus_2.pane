@@ -1,0 +1,600 @@
+[?2004hroot@09ad24aacc4a:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@09ad24aacc4a:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@09ad24aacc4a:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod field {
+    pub const GOLDILOCKS_MODULUS: u64 = 0xFFFF_FFFF_0000_0001u64;
+    pub const GOLDILOCKS_EPSILON: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TranscriptLimbs {
+        pub low: u64,
+        pub mid: u64,
+        pub high: u64,
+    }
+
+    #[inline]
+    pub fn split_transcript(amount: u64, fee: u64) -> TranscriptLimbs {
+        TranscriptLimbs {
+            low: amount,
+            mid: fee & GOLDILOCKS_EPSILON,
+            high: fee >> LIMB_SHIFT,
+        }
+    }
+
+    /// Fold the top 32-bit limb `high * 2^96` into `low` using `2^96 == -1 (mod P)`.
+    #[inline]
+    pub fn fold_high_limb(low: u64, high: u64) -> u64 {
+        let (low2, borrow) = low.overflowing_sub(high);
+        if borrow {
+            low2.wrapping_add(GOLDILOCKS_EPSILON)
+        } else {
+            low2
+        }
+    }
+
+    /// Fold the middle 32-bit limb `mid * 2^64` using `2^64 == 2^32 - 1 (mod P)`.
+    #[inline]
+    pub fn fold_mid_limb(low2: u64, mid: u64) -> u64 {
+        let product: u64 = mid * GOLDILOCKS_EPSILON;
+        let (sum1, carry1) = low2.overflowing_add(product);
+        if carry1 {
+            sum1.wrapping_add(GOLDILOCKS_EPSILON)
+        } else {
+            sum1
+        }
+    }
+
+    #[inline]
+    pub fn canonicalize(folded: u64) -> u64 {
+        if folded >= GOLDILOCKS_MODULUS {
+            folded - GOLDILOCKS_MODULUS
+        } else {
+            folded
+        }
+    }
+
+    /// Reduce the 128-bit integer `amount + fee * 2^64` modulo the Goldilocks
+    /// prime `P = 2^64 - 2^32 + 1 = 18446744069414584321` in pure `u64`.
+    #[inline]
+    pub fn reduce_128(amount: u64, fee: u64) -> u64 {
+        let limbs: TranscriptLimbs = split_transcript(amount, fee);
+        let low2: u64 = fold_high_limb(limbs.low, limbs.high);
+        let folded: u64 = fold_mid_limb(low2, limbs.mid);
+        canonicalize(folded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::field;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GoldilocksQuote {
+        pub principal_share: u64,
+        pub field_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<GoldilocksQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let field_surcharge: u64 = field::reduce_128(amount, fee);
+        let total_debit: u64 = principal_share.checked_add(field_surcharge)?;
+        Some(GoldilocksQuote {
+            principal_share,
+            field_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: GoldilocksQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Goldilocks rollup settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2^64 - 2^32 + 1 = 18446744069414584321` (Goldilocks prime)
+/// - `principal_share = floor(amount / 2)`
+/// - `field_surcharge = (amount + fee * 2^64) mod P`
+/// - `total_debit = principal_share + field_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::GoldilocksQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 100, fee = 1:
+        // principal_share = 50
+        // field_surcharge = (100 + 2^64) mod P = 100 + (2^32 - 1) = 4294967395
+        // total_debit = 4294967445
+        assert_eq!(
+            authorize(4_294_967_445, 100, 1),
+            Some(Authorization {
+                total_debit: 4_294_967_445
+            })
+        );
+        assert_eq!(authorize(4_294_967_444, 100, 1), None);
+    }
+
+    #[test]
+    fn canonicalizes_values_above_modulus() {
+        // amount = P + 10 = 18446744069414584331, fee = 0:
+        // principal_share = 9223372034707292165
+        // field_surcharge = 10
+        assert_eq!(
+            authorize(9_223_372_034_707_292_175, 18_446_744_069_414_584_331, 0),
+            Some(Authorization {
+                total_debit: 9_223_372_034_707_292_175
+            })
+        );
+    }
+}
+[?2004hroot@09ad24aacc4a:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def goldilocksModulus : UInt64 := 18446744069414584321
+def goldilocksEpsilon : UInt64 := 4294967295
+def limbBase : UInt64 := 4294967296
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure TranscriptLimbs where
+  low : UInt64
+  mid : UInt64
+  high : UInt64
+
+def splitTranscript (amount fee : UInt64) : TranscriptLimbs :=
+  { low := amount, mid := fee % limbBase, high := fee / limbBase }
+
+def foldHighLimb (low high : UInt64) : UInt64 :=
+  let low2 := low - high
+  if low < high then
+    goldilocksEpsilon + low2
+  else
+    low2
+
+def foldMidLimb (low2 mid : UInt64) : UInt64 :=
+  let product := goldilocksEpsilon * mid
+  let sum1 := low2 + product
+  if sum1 < low2 then
+    goldilocksEpsilon + sum1
+  else
+    sum1
+
+def canonicalize (folded : UInt64) : UInt64 :=
+  if goldilocksModulus ≤ folded then
+    folded - goldilocksModulus
+  else
+    folded
+
+def reduce128 (amount fee : UInt64) : UInt64 :=
+  let limbs := splitTranscript amount fee
+  let low2 := foldHighLimb limbs.low limbs.high
+  let folded := foldMidLimb low2 limbs.mid
+  canonicalize folded
+
+structure GoldilocksQuote where
+  principalShare : UInt64
+  fieldSurcharge : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option GoldilocksQuote :=
+  let principalShare := amount / principalDivisor
+  let fieldSurcharge := reduce128 amount fee
+  if fieldSurcharge ≤ u64Max - principalShare then
+    some {
+      principalShare := principalShare,
+      fieldSurcharge := fieldSurcharge,
+      totalDebit := principalShare + fieldSurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : GoldilocksQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@09ad24aacc4a:/workspace# ls -la /workspace/lean /workspace/submission; cat /workspace/lean/check.py
+[?2004l/workspace/lean:
+total 196
+drwxr-xr-x 1 root root   4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2761 Oct  7 06:59 SecurityChallenge.lean
+-rw-r--r-- 1 root root 175304 Oct  7 07:02 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  6 11:24 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34msrc[0m
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+[?2004hroot@09ad24aacc4a:/workspace# cat /workspace/lean/SecurityChallenge.lean; cat /workspace/submission/{Spec,Audit,Proof}.lean; cat /workspace/challenge/Cargo.toml; ls -la /workspace/submission/src
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def goldilocksModulus : UInt64 := 18446744069414584321
+def goldilocksEpsilon : UInt64 := 4294967295
+def limbBase : UInt64 := 4294967296
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure TranscriptLimbs where
+  low : UInt64
+  mid : UInt64
+  high : UInt64
+
+def splitTranscript (amount fee : UInt64) : TranscriptLimbs :=
+  { low := amount, mid := fee % limbBase, high := fee / limbBase }
+
+def foldHighLimb (low high : UInt64) : UInt64 :=
+  let low2 := low - high
+  if low < high then
+    goldilocksEpsilon + low2
+  else
+    low2
+
+def foldMidLimb (low2 mid : UInt64) : UInt64 :=
+  let product := goldilocksEpsilon * mid
+  let sum1 := low2 + product
+  if sum1 < low2 then
+    goldilocksEpsilon + sum1
+  else
+    sum1
+
+def canonicalize (folded : UInt64) : UInt64 :=
+  if goldilocksModulus ≤ folded then
+    folded - goldilocksModulus
+  else
+    folded
+
+def reduce128 (amount fee : UInt64) : UInt64 :=
+  let limbs := splitTranscript amount fee
+  let low2 := foldHighLimb limbs.low limbs.high
+  let folded := foldMidLimb low2 limbs.mid
+  canonicalize folded
+
+structure GoldilocksQuote where
+  principalShare : UInt64
+  fieldSurcharge : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option GoldilocksQuote :=
+  let principalShare := amount / principalDivisor
+  let fieldSurcharge := reduce128 amount fee
+  if fieldSurcharge ≤ u64Max - principalShare then
+    some {
+      principalShare := principalShare,
+      fieldSurcharge := fieldSurcharge,
+      totalDebit := principalShare + fieldSurcharge
+    }
+  else
+    none
+
+def verifyAffordability (balance : UInt64) (quote : GoldilocksQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+total 8
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34m..[0m
+[?2004hroot@09ad24aacc4a:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact settlement debit, without word-size truncation. -/
+[?2004l[?2004h> def policyDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 +
+[?2004l[?2004h>     (amount.toNat + fee.toNat * 18446744073709551616) % 18446744069414584321
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee =>
+[?2004l[?2004h>     policyDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun balance amount fee totalDebit =>
+[?2004l[?2004h>     policyDebit amount fee ≤ balance.toNat ∧
+[?2004l[?2004h>     totalDebit.toNat = policyDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have accepted : SecurityChallenge.challengeAuthorize 4294967294 0 4294967296 =
+[?2004l[?2004h>       some 4294967294 := by decide
+[?2004l[?2004h>   have unaffordable : ¬ candidateSpec.accepts 4294967294 0 4294967296 := by decide
+[?2004l[?2004h>   exact unaffordable ((h.1 4294967294 0 4294967296).mp ⟨4294967294, accepted⟩)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# cat > /workspace/submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance":4294967294,"amount":0,"fee":4294967296}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> s = Path('/workspace/challenge/src/lib.rs').read_text()
+[?2004l[?2004h> s = s.replace('low2.wrapping_add(GOLDILOCKS_EPSILON)', '// The borrow introduced 2^64; replace it with P = 2^64 - epsilon.\n            low2.wrapping_sub(GOLDILOCKS_EPSILON)')
+[?2004l[?2004h> s += '''
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod borrow_regression_tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn high_limb_borrow_uses_the_exact_surcharge() {
+[?2004l[?2004h>         let fee = 1u64 << 32;
+[?2004l[?2004h>         let debit = field::GOLDILOCKS_MODULUS - 1;
+[?2004l[?2004h>         assert_eq!(field::reduce_128(0, fee), debit);
+[?2004l[?2004h>         assert_eq!(authorize(4_294_967_294, 0, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(debit - 1, 0, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(debit, 0, fee), Some(Authorization { total_debit: debit }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> '''
+[?2004l[?2004h> Path('/workspace/submission/src/lib.rs').write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# python3 /workspace/lean/check.py
+[?2004ltestdir=$(mktemp -d /tmp/settlement-audit.XXXXXX); cp /workspace/challenge/Cargo.toml "$testdir/"; cp -r /workspace/submission/src "$testdir/"; cargo test --manifest-path "$testdir/Cargo.toml"
+CandidateSpec.lean:4:0: error: unexpected token '/'; expected command
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@09ad24aacc4a:/workspace# testdir=$(mktemp -d /tmp/settlement-audit.XXXXXX); cp /workspace/challenge/Cargo.toml "$testdir/"; cp -r /workspace/submission/src "$testdir/"; cargo test --manifest-path "$testdir/Cargo.toml"
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/settlement-audit.XtNbmm)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+[1m[32m     Running[0m unittests src/lib.rs (/tmp/settlement-audit.XtNbmm/target/debug/deps/settlement_gate-66f23bc290c8a00c)
+
+running 4 tests
+test borrow_regression_tests::high_limb_borrow_uses_the_exact_surcharge ... [32mok[m
+test tests::canonicalizes_values_above_modulus ... [32mok[m
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@09ad24aacc4a:/workspace# sed -i 's@/-- Exact settlement debit, without word-size truncation. -/@-- Exact settlement debit, without word-size truncation.@' /workspace/submission/Spec.lean
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateProof.lean:13:76: error: failed to synthesize
+  Decidable ¬candidateSpec.accepts 4294967294 0 4294967296
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+[?2004hroot@09ad24aacc4a:/workspace# find /workspace/submission -maxdepth 2 -type f -print; diff -u /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs
+[?2004l/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src/lib.rs
+/workspace/submission/counterexample.json
+--- /workspace/challenge/src/lib.rs	2026-10-07 06:59:50.000000000 +0000
++++ /workspace/submission/src/lib.rs	2026-10-07 07:13:32.431669222 +0000
+@@ -29,7 +29,8 @@
+     pub fn fold_high_limb(low: u64, high: u64) -> u64 {
+         let (low2, borrow) = low.overflowing_sub(high);
+         if borrow {
+-            low2.wrapping_add(GOLDILOCKS_EPSILON)
++            // The borrow introduced 2^64; replace it with P = 2^64 - epsilon.
++            low2.wrapping_sub(GOLDILOCKS_EPSILON)
+         } else {
+             low2
+         }
+@@ -156,3 +157,18 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod borrow_regression_tests {
++    use super::*;
++
++    #[test]
++    fn high_limb_borrow_uses_the_exact_surcharge() {
++        let fee = 1u64 << 32;
++        let debit = field::GOLDILOCKS_MODULUS - 1;
++        assert_eq!(field::reduce_128(0, fee), debit);
++        assert_eq!(authorize(4_294_967_294, 0, fee), None);
++        assert_eq!(authorize(debit - 1, 0, fee), None);
++        assert_eq!(authorize(debit, 0, fee), Some(Authorization { total_debit: debit }));
++    }
++}
+[?2004hroot@09ad24aacc4a:/workspace# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/workspace/submission/Proof.lean')
+[?2004l[?2004h> s = p.read_text().replace('have unaffordable : ¬ candidateSpec.accepts 4294967294 0 4294967296 := by decide', 'have unaffordable : ¬ candidateSpec.accepts 4294967294 0 4294967296 := by\n    unfold candidateSpec policyDebit\n    decide')
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# python3 /workspace/lean/check.py
+[?2004l[?2004hroot@09ad24aacc4a:/workspace# 

@@ -10,10 +10,11 @@ import tempfile
 import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
-PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine')
+CHALLENGE_PROBLEMS=('settlement-engine','goldilocks','whirlpool','plonky3','succinct','ruint')
+ALL_PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3','succinct','openpql','ruint')
 p=argparse.ArgumentParser()
 p.add_argument('--harbor',default='harbor')
-p.add_argument('--problem',choices=('all',)+PROBLEMS,default='all')
+p.add_argument('--problem',choices=('challenge','all')+ALL_PROBLEMS,default='challenge')
 p.add_argument('--output',type=Path,default=ROOT/'evidence/v3/harbor')
 a=p.parse_args()
 if a.output.exists(): raise SystemExit('use a fresh output directory')
@@ -22,7 +23,7 @@ subprocess.run(['docker','compose','version'],check=True)
 version=subprocess.check_output([a.harbor,'--version'],text=True).strip()
 if version!='0.9.0': raise SystemExit('Harbor 0.9.0 required')
 summary={'harbor_version':version,'trials':{}}
-selected=PROBLEMS if a.problem=='all' else (a.problem,)
+selected=CHALLENGE_PROBLEMS if a.problem=='challenge' else (ALL_PROBLEMS if a.problem=='all' else (a.problem,))
 with tempfile.TemporaryDirectory(prefix='lean-native-harbor-') as raw:
     family=Path(raw)/'family'
     subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem',a.problem],check=True)

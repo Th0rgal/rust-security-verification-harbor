@@ -42,21 +42,23 @@ inputs, and existence of an output for every accepted input. Lean compilation,
 independent kernel replay, type checks and a transitive axiom audit precede
 semantic analysis. Spec grading uses a bounded translator of elaborated Lean
 expressions to Z3: Nat constants, input UInt64.toNat, Nat +, truncated -,
-constant *, /, and %, =, <, ≤, And/Or/Not/Iff/implication, and nondependent if.
+*, constant /, %, constant-exponent ^, bitwise/shift operators, =, <, ≤,
+And/Or/Not/Iff/implication, and nondependent if.
 Auxiliary definitions are unfolded. Other expressions are reported unsupported,
 not semantically false.
-Imports allowed: SecurityChallenge, Lean, Std, Lean.Elab.Tactic.Omega.
+Imports allowed: SecurityChallenge, Lean, Std, Init, Mathlib, Batteries, Aesop, Qq (and submodules).
 Axioms allowed: propext, Classical.choice, Quot.sound. No sorry, added axioms,
 native_decide, unsafe/extern hooks or elaboration extensions.
 
 Rust repairs are analyzed universally on the full u64 input domain within the
 supported expression subset, then compiled and exercised concretely. Supported:
-inline modules, integer constants, plain structs and non-recursive helper
-functions (in multi-module crates), immutable lets/shadowing, if/else, if-let,
+inline modules, integer constants, plain structs, tuples and non-recursive helper
+functions (in multi-module crates), immutable/mutable/tuple lets, if/else, if-let,
 exhaustive Option matches, returns, ?, casts (when permitted by the crate
-contract), + / - / * / / / %, comparisons/booleans, div_ceil, checked/wrapping
-add/sub/mul, checked div/rem, saturating add/sub, then_some, Some/None and
-Authorization construction, built-in derives and #[cfg(test)] test modules.
+contract), + / - / * / / / % / & / | / ^ / << / >>, comparisons/booleans,
+div_ceil, checked/wrapping/overflowing add/sub/mul, checked div/rem, saturating
+add/sub, then_some, Some/None and Authorization construction, built-in derives
+and #[cfg(test)] test modules.
 Other production code is reported unsupported.
 
 Scores: specification 25%, justified verdict 15%, Lean evidence 25%, response

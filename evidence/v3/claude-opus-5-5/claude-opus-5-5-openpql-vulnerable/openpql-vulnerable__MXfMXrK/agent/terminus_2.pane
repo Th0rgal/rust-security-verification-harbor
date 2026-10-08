@@ -1,0 +1,530 @@
+[?2004hroot@f169bbf73552:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@f169bbf73552:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@f169bbf73552:/workspace# ls -R /workspace | head -50; cat /workspace/challenge/src/lib.rs
+[?2004l/workspace:
+challenge
+harness
+lean
+submission
+
+/workspace/challenge:
+Cargo.lock
+Cargo.toml
+src
+target
+
+/workspace/challenge/src:
+lib.rs
+
+/workspace/challenge/target:
+CACHEDIR.TAG
+release
+
+/workspace/challenge/target/release:
+build
+deps
+examples
+incremental
+
+/workspace/challenge/target/release/build:
+
+/workspace/challenge/target/release/deps:
+libsettlement_gate-0aba5e1fc59a671e.rlib
+libsettlement_gate-0aba5e1fc59a671e.rmeta
+settlement_gate-0aba5e1fc59a671e.d
+settlement_gate-ebd00f5d27994bc9
+settlement_gate-ebd00f5d27994bc9.d
+
+/workspace/challenge/target/release/examples:
+
+/workspace/challenge/target/release/incremental:
+
+/workspace/harness:
+checkpoint.py
+
+/workspace/lean:
+SecurityChallenge.lean
+SecurityChallenge.olean
+Signature.lean
+check.py
+lean-toolchain
+
+/workspace/submission:
+Audit.lean
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mixed_radix {
+    pub const RADIX_MASK: u64 = 0xFFFFu64;
+    pub const SHIFT_16: u64 = 16u64;
+    pub const SHIFT_32: u64 = 32u64;
+    pub const SHIFT_48: u64 = 48u64;
+
+    #[inline]
+    pub fn clamp_digit(a: u64, b: u64) -> u64 {
+        if a < b {
+            a
+        } else {
+            b - 1u64
+        }
+    }
+
+    /// Encode a 4-level mixed-radix coordinate `(d0, d1, d2, d3)` with radices
+    /// `(b0, b1, b2, b3)` in `[1, 65536]` extracted from `fee` (`waugh_indexer::MixedRadix`).
+    #[inline]
+    pub fn encode(amount: u64, fee: u64) -> u64 {
+        let b0: u64 = (fee & RADIX_MASK) + 1u64;
+        let b1: u64 = ((fee >> SHIFT_16) & RADIX_MASK) + 1u64;
+        let b2: u64 = ((fee >> SHIFT_32) & RADIX_MASK) + 1u64;
+        let b3: u64 = ((fee >> SHIFT_48) & RADIX_MASK) + 1u64;
+        let a0: u64 = amount & RADIX_MASK;
+        let a1: u64 = (amount >> SHIFT_16) & RADIX_MASK;
+        let a2: u64 = (amount >> SHIFT_32) & RADIX_MASK;
+        let a3: u64 = (amount >> SHIFT_48) & RADIX_MASK;
+        let d0: u64 = clamp_digit(a0, b0);
+        let d1: u64 = clamp_digit(a1, b1);
+        let d2: u64 = clamp_digit(a2, b2);
+        let d3: u64 = clamp_digit(a3, b3);
+        let o2: u64 = b3;
+        let o1: u64 = b2 * o2;
+        let o0: u64 = b1 * o1;
+        let raw_idx: u64 = d0 * o0 + d1 * o1 + d2 * o2 + d3;
+        let space_size: u64 = o0.wrapping_mul(b0);
+        if raw_idx < space_size {
+            raw_idx
+        } else {
+            0u64
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mixed_radix;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OpenPqlQuote {
+        pub principal_share: u64,
+        pub encoded_idx: u64,
+        pub index_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<OpenPqlQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let encoded_idx: u64 = mixed_radix::encode(amount, fee);
+        let index_surcharge: u64 = encoded_idx >> 1u64;
+        let total_debit: u64 = principal_share + index_surcharge;
+        Some(OpenPqlQuote {
+            principal_share,
+            encoded_idx,
+            index_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: OpenPqlQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize an OpenPQL 4-level mixed-radix settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - For `i in {0, 1, 2, 3}`:
+///   - `b_i = ((fee >> (16 * i)) & 0xFFFF) + 1` in `[1, 65536]`
+///   - `a_i = (amount >> (16 * i)) & 0xFFFF` in `[0, 65535]`
+///   - `d_i = min(a_i, b_i - 1)`
+/// - Suffix-product offsets: `o2 = b3`, `o1 = b2 * o2`, `o0 = b1 * o1`
+/// - `encoded_idx = d0 * o0 + d1 * o1 + d2 * o2 + d3`
+/// - `total_debit = floor(amount / 2) + floor(encoded_idx / 2)`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::OpenPqlQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_mixed_radix_coordinates_match_policy() {
+        let fee: u64 = 0x0003_0003_0003_0003;
+        let amount: u64 = 0x0001_0002_0001_0002;
+        assert_eq!(
+            authorize(140_741_783_355_469, amount, fee),
+            Some(Authorization {
+                total_debit: 140_741_783_355_469
+            })
+        );
+        assert_eq!(authorize(140_741_783_355_468, amount, fee), None);
+    }
+
+    #[test]
+    fn clamps_digits_to_radix_minus_one() {
+        assert_eq!(
+            authorize(50, 100, 0),
+            Some(Authorization { total_debit: 50 })
+        );
+    }
+}
+[?2004hroot@f169bbf73552:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def radixBase : UInt64 := 65536
+def shift16 : UInt64 := 65536
+def shift32 : UInt64 := 4294967296
+def shift48 : UInt64 := 281474976710656
+def halfDivisor : UInt64 := 2
+
+structure OpenPqlQuote where
+  principalShare : UInt64
+  encodedIdx : UInt64
+  indexSurcharge : UInt64
+  totalDebit : UInt64
+
+def clampDigit (a b : UInt64) : UInt64 :=
+  if a < b then a else b - 1
+
+def encodeMixedRadix (amount fee : UInt64) : UInt64 :=
+  let b0 := (fee % radixBase) + 1
+  let b1 := ((fee / shift16) % radixBase) + 1
+  let b2 := ((fee / shift32) % radixBase) + 1
+  let b3 := ((fee / shift48) % radixBase) + 1
+  let a0 := amount % radixBase
+  let a1 := (amount / shift16) % radixBase
+  let a2 := (amount / shift32) % radixBase
+  let a3 := (amount / shift48) % radixBase
+  let d0 := clampDigit a0 b0
+  let d1 := clampDigit a1 b1
+  let d2 := clampDigit a2 b2
+  let d3 := clampDigit a3 b3
+  let o2 := b3
+  let o1 := b2 * o2
+  let o0 := b1 * o1
+  let rawIdx := d0 * o0 + d1 * o1 + d2 * o2 + d3
+  let spaceSize := o0 * b0
+  if rawIdx < spaceSize then rawIdx else 0
+
+def buildQuote (amount fee : UInt64) : Option OpenPqlQuote :=
+  let principalShare := amount / halfDivisor
+  let encodedIdx := encodeMixedRadix amount fee
+  let indexSurcharge := encodedIdx / halfDivisor
+  let totalDebit := principalShare + indexSurcharge
+  some {
+    principalShare := principalShare,
+    encodedIdx := encodedIdx,
+    indexSurcharge := indexSurcharge,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : OpenPqlQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@f169bbf73552:/workspace# cat /workspace/lean/check.py; cat /workspace/lean/Signature.lean; cat /workspace/submission/Audit.lean; cat /workspace/challenge/Cargo.toml
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@f169bbf73552:/workspace# cd /workspace/submission && cat > Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- radix b_i = ((fee >> 16i) & 0xFFFF) + 1, in exact Nat arithmetic -/
+[?2004l[?2004h> def radixAt (fee : UInt64) (sh : Nat) : Nat := (fee.toNat / sh) % 65536 + 1
+[?2004l[?2004h> /-- coordinate a_i = (amount >> 16i) & 0xFFFF -/
+[?2004l[?2004h> def coordAt (amount : UInt64) (sh : Nat) : Nat := (amount.toNat / sh) % 65536
+[?2004l[?2004h> /-- d_i = min(a_i, b_i - 1) -/
+[?2004l[?2004h> def digitAt (amount fee : UInt64) (sh : Nat) : Nat :=
+[?2004l[?2004h>   if coordAt amount sh < radixAt fee sh then coordAt amount sh else radixAt fee sh - 1
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- exact mixed-radix index d0*o0 + d1*o1 + d2*o2 + d3 -/
+[?2004l[?2004h> def policyIdx (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   digitAt amount fee 1 * (radixAt fee 65536 * (radixAt fee 4294967296 * radixAt fee 281474976710656))
+[?2004l[?2004h>   + digitAt amount fee 65536 * (radixAt fee 4294967296 * radixAt fee 281474976710656)
+[?2004l[?2004h>   + digitAt amount fee 4294967296 * radixAt fee 281474976710656
+[?2004l[?2004h>   + digitAt amount fee 281474976710656
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- exact debit floor(amount/2) + floor(idx/2) -/
+[?2004l[?2004h> def policyTotal (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 + policyIdx amount fee / 2
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => policyTotal amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee total => total.toNat = policyTotal amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f169bbf73552:/workspace/submission# cat > Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /- fee = u64::MAX makes space_size = 65536^4 wrap to 0, zeroing the index. -/
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f169bbf73552:/workspace/submission# cat > Proof.lean <<'EOF'
+[?2004l[?2004h> fun h => by
+[?2004l[?2004h>   have hrun : challengeAuthorize 1 2 18446744073709551615 = some 1 := by decide
+[?2004l[?2004h>   have hacc := (h.1 1 2 18446744073709551615).mp ⟨1, hrun⟩
+[?2004l[?2004h>   have hnot : ¬ (policyTotal 2 18446744073709551615 ≤ (1 : UInt64).toNat) := by decide
+[?2004l[?2004h>   exact hnot hacc
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f169bbf73552:/workspace/submission# printf '{"balance": 1, "amount": 2, "fee": 18446744073709551615}\n' > counterexample.json
+[?2004l[?2004hroot@f169bbf73552:/workspace/submission# python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:5:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:7:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:9:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:13:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:20:1: error: unexpected token 'def'; expected term
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+EXIT=1
+[?2004hroot@f169bbf73552:/workspace/submission# cat > Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> -- radix b_i = ((fee >> 16i) & 0xFFFF) + 1, in exact Nat arithmetic
+[?2004l[?2004h> def radixAt (fee : UInt64) (sh : Nat) : Nat := (fee.toNat / sh) % 65536 + 1
+[?2004l[?2004h> -- coordinate a_i = (amount >> 16i) & 0xFFFF
+[?2004l[?2004h> def coordAt (amount : UInt64) (sh : Nat) : Nat := (amount.toNat / sh) % 65536
+[?2004l[?2004h> -- d_i = min(a_i, b_i - 1)
+[?2004l[?2004h> def digitAt (amount fee : UInt64) (sh : Nat) : Nat :=
+[?2004l[?2004h>   if coordAt amount sh < radixAt fee sh then coordAt amount sh else radixAt fee sh - 1
+[?2004l[?2004h> 
+[?2004l[?2004h> -- exact mixed-radix index d0*o0 + d1*o1 + d2*o2 + d3 (no wraparound)
+[?2004l[?2004h> def policyIdx (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   digitAt amount fee 1 * (radixAt fee 65536 * (radixAt fee 4294967296 * radixAt fee 281474976710656))
+[?2004l[?2004h>   + digitAt amount fee 65536 * (radixAt fee 4294967296 * radixAt fee 281474976710656)
+[?2004l[?2004h>   + digitAt amount fee 4294967296 * radixAt fee 281474976710656
+[?2004l[?2004h>   + digitAt amount fee 281474976710656
+[?2004l[?2004h> 
+[?2004l[?2004h> -- exact debit floor(amount/2) + floor(idx/2)
+[?2004l[?2004h> def policyTotal (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 + policyIdx amount fee / 2
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => policyTotal amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee total => total.toNat = policyTotal amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f169bbf73552:/workspace/submission# python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lEXIT=0
+[?2004hroot@f169bbf73552:/workspace/submission# cd /workspace/challenge && cp src/lib.rs /tmp/lib.rs.orig && python3 - <<'EOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> p='src/lib.rs'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> old='''        let raw_idx: u64 = d0 * o0 + d1 * o1 + d2 * o2 + d3;
+[?2004l[?2004h>         let space_size: u64 = o0.wrapping_mul(b0);
+[?2004l[?2004h>         if raw_idx < space_size {
+[?2004l[?2004h>             raw_idx
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             0u64
+[?2004l[?2004h>         }
+[?2004l[?2004h> '''
+[?2004l[?2004h> new='''        // d_i <= b_i - 1, so the exact index is at most b0*b1*b2*b3 - 1 <= 2^64 - 1:
+[?2004l[?2004h>         // every partial product/sum fits in u64. No wrapped range guard is needed
+[?2004l[?2004h>         // (the old `o0.wrapping_mul(b0)` guard wrapped to 0 when all radices were 65536).
+[?2004l[?2004h>         d0 * o0 + d1 * o1 + d2 * o2 + d3
+[?2004l[?2004h> '''
+[?2004l[?2004h> assert old in s
+[?2004l[?2004h> s=s.replace(old,new)
+[?2004l[?2004h> t_old='''    #[test]
+[?2004l[?2004h>     fn clamps_digits_to_radix_minus_one() {'''
+[?2004l[?2004h> t_new='''    #[test]
+[?2004l[?2004h>     fn full_radix_space_is_not_zeroed() {
+[?2004l[?2004h>         // fee = u64::MAX => all radices 65536; idx = 2 * 2^48, debit = 1 + 2^48
+[?2004l[?2004h>         assert_eq!(authorize(1, 2, u64::MAX), None);
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(u64::MAX, 2, u64::MAX),
+[?2004l[?2004h>             Some(Authorization { total_debit: 281_474_976_710_657 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(u64::MAX, u64::MAX, u64::MAX),
+[?2004l[?2004h>             Some(Authorization { total_debit: u64::MAX - 1 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn clamps_digits_to_radix_minus_one() {'''
+[?2004l[?2004h> assert t_old in s
+[?2004l[?2004h> s=s.replace(t_old,t_new)
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f169bbf73552:/workspace/challenge# cargo test --release 2>&1 | tail -15; cp src/lib.rs /workspace/submission/lib.rs; mkdir -p /workspace/submission/src && cp src/lib.rs /workspace/submission/src/lib.rs; ls -la /workspace/submission
+[?2004l
+running 4 tests
+test tests::clamps_digits_to_radix_minus_one ... ok
+test tests::full_radix_space_is_not_zeroed ... ok
+test tests::small_mixed_radix_coordinates_match_policy ... ok
+test tests::zero_payment_is_authorized ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+total 44
+drwxr-xr-x 1 root root 4096 Oct  8 11:13 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  187 Oct  8 11:10 Audit.lean
+-rw-r--r-- 1 root root  263 Oct  8 11:10 Proof.lean
+-rw-r--r-- 1 root root 1256 Oct  8 11:12 Spec.lean
+-rw-r--r-- 1 root root   57 Oct  8 11:10 counterexample.json
+-rw-r--r-- 1 root root 4897 Oct  8 11:13 lib.rs
+drwxr-xr-x 1 root root 4096 Oct  8 11:13 [01;34msrc[0m
+[?2004hroot@f169bbf73552:/workspace/challenge# cp /tmp/lib.rs.orig /workspace/challenge/src/lib.rs && cmp /tmp/lib.rs.orig /workspace/challenge/src/lib.rs && echo RESTORED; rm -f /workspace/submission/lib.rs; rm -rf /tmp/fixcheck && mkdir -p /tmp/fixcheck/src && cp /workspace/challenge/Cargo.toml /tmp/fixcheck/ && cp /workspace/submission/src/lib.rs /tmp/fixcheck/src/lib.rs && cd /tmp/fixcheck && cargo test 2>&1 | grep -E 'test |result|panicked|error'; cd /workspace; ls -R /workspace/submission; cat /workspace/submission/counterexample.json
+[?2004lRESTORED
+[01;31m[Ktest [m[Ktests::full_radix_space_is_not_zeroed ... ok
+[01;31m[Ktest [m[Ktests::clamps_digits_to_radix_minus_one ... ok
+[01;31m[Ktest [m[Ktests::small_mixed_radix_coordinates_match_policy ... ok
+[01;31m[Ktest [m[Ktests::zero_payment_is_authorized ... ok
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/workspace/submission:
+Audit.lean  Proof.lean  Spec.lean  counterexample.json  [0m[01;34msrc[0m
+
+/workspace/submission/src:
+lib.rs
+{"balance": 1, "amount": 2, "fee": 18446744073709551615}
+[?2004hroot@f169bbf73552:/workspace# 

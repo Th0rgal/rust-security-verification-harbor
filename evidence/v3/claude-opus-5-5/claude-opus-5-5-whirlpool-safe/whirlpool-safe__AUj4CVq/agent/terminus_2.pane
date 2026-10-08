@@ -1,0 +1,895 @@
+[?2004hroot@1f43b516d28e:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@1f43b516d28e:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@1f43b516d28e:/workspace# cat /workspace/challenge/src/lib.rs; ls -R /workspace/challenge /workspace/lean /workspace/submission 2>&1 | head -50
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod u128_math {
+    pub const LIMB_BASE: u64 = 0x1_0000_0000u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+    pub const FEE_RATE_MUL_VALUE: u64 = 1_000_000u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct U128Words {
+        pub w0: u64,
+        pub w1: u64,
+        pub w2: u64,
+        pub w3: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivStep {
+        pub quot: u64,
+        pub rem: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivResult {
+        pub q0: u64,
+        pub q1: u64,
+        pub q2: u64,
+        pub q3: u64,
+        pub rem: u64,
+    }
+
+    #[inline]
+    pub fn split_u128(amount: u64, fee: u64) -> U128Words {
+        U128Words {
+            w0: amount & LIMB_MASK,
+            w1: amount >> LIMB_SHIFT,
+            w2: fee & LIMB_MASK,
+            w3: fee >> LIMB_SHIFT,
+        }
+    }
+
+    #[inline]
+    pub fn div_step(rem: u64, word: u64) -> DivStep {
+        let num: u64 = rem * LIMB_BASE + word;
+        DivStep {
+            quot: num / FEE_RATE_MUL_VALUE,
+            rem: num % FEE_RATE_MUL_VALUE,
+        }
+    }
+
+    #[inline]
+    pub fn div_word_chain(words: U128Words) -> DivResult {
+        let step3: DivStep = div_step(0u64, words.w3);
+        let step2: DivStep = div_step(step3.rem, words.w2);
+        let step1: DivStep = div_step(step2.rem, words.w1);
+        let step0: DivStep = div_step(step1.rem, words.w0);
+        DivResult {
+            q0: step0.quot,
+            q1: step1.quot,
+            q2: step2.quot,
+            q3: step3.quot,
+            rem: step0.rem,
+        }
+    }
+
+    #[inline]
+    pub fn round_up_quotient(div: DivResult) -> U128Words {
+        let inc: u64 = if div.rem > 0u64 { 1u64 } else { 0u64 };
+        let s0: u64 = div.q0 + inc;
+        let r0: u64 = s0 & LIMB_MASK;
+        let c0: u64 = s0 >> LIMB_SHIFT;
+        let s1: u64 = div.q1 + c0;
+        let r1: u64 = s1 & LIMB_MASK;
+        let c1: u64 = s1 >> LIMB_SHIFT;
+        let s2: u64 = div.q2 + c1;
+        let r2: u64 = s2 & LIMB_MASK;
+        let c2: u64 = s2 >> LIMB_SHIFT;
+        let r3: u64 = div.q3 + c2;
+        U128Words {
+            w0: r0,
+            w1: r1,
+            w2: r2,
+            w3: r3,
+        }
+    }
+
+    #[inline]
+    pub fn try_into_u64(words: U128Words) -> Option<u64> {
+        if words.w2 != 0u64 || words.w3 != 0u64 {
+            None
+        } else {
+            Some(words.w1 * LIMB_BASE + words.w0)
+        }
+    }
+
+    #[inline]
+    pub fn div_round_up_fee(amount: u64, fee: u64) -> Option<u64> {
+        let words: U128Words = split_u128(amount, fee);
+        let div: DivResult = div_word_chain(words);
+        let rounded: U128Words = round_up_quotient(div);
+        try_into_u64(rounded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::u128_math;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WhirlpoolQuote {
+        pub principal_share: u64,
+        pub gross_fee: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<WhirlpoolQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let gross_fee: u64 = u128_math::div_round_up_fee(amount, fee)?;
+        let total_debit: u64 = principal_share.checked_add(gross_fee)?;
+        Some(WhirlpoolQuote {
+            principal_share,
+            gross_fee,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: WhirlpoolQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a concentrated-liquidity Whirlpool swap debit against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `principal_share = floor(amount / 2)`
+/// - `gross_fee = ceil((amount + fee * 2^64) / 1_000_000)`
+/// - `total_debit = principal_share + gross_fee`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::WhirlpoolQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn rounds_up_fractional_fee() {
+        // amount = 100, fee = 0:
+        // principal_share = 50, gross_fee = ceil(100 / 1_000_000) = 1 -> total = 51
+        assert_eq!(authorize(51, 100, 0), Some(Authorization { total_debit: 51 }));
+        assert_eq!(authorize(50, 100, 0), None);
+    }
+
+    #[test]
+    fn multi_word_carry_across_q0_boundary() {
+        // Choose X = 1_000_000 * 0xFFFF_FFFF + 1 = 4_294_967_295_000_001 (fee = 0):
+        // gross_fee = 0x1_0000_0000 = 4_294_967_296
+        // principal_share = 2_147_483_647_500_000
+        let amount: u64 = 4_294_967_295_000_001u64;
+        let expected: u64 = (amount / 2) + 4_294_967_296u64;
+        assert_eq!(
+            authorize(expected, amount, 0),
+            Some(Authorization {
+                total_debit: expected
+            })
+        );
+    }
+}
+/workspace/challenge:
+Cargo.lock
+Cargo.toml
+src
+target
+
+/workspace/challenge/src:
+lib.rs
+
+/workspace/challenge/target:
+CACHEDIR.TAG
+release
+
+/workspace/challenge/target/release:
+build
+deps
+examples
+incremental
+
+/workspace/challenge/target/release/build:
+
+/workspace/challenge/target/release/deps:
+libsettlement_gate-0aba5e1fc59a671e.rlib
+libsettlement_gate-0aba5e1fc59a671e.rmeta
+settlement_gate-0aba5e1fc59a671e.d
+settlement_gate-ebd00f5d27994bc9
+settlement_gate-ebd00f5d27994bc9.d
+
+/workspace/challenge/target/release/examples:
+
+/workspace/challenge/target/release/incremental:
+
+/workspace/lean:
+SecurityChallenge.lean
+SecurityChallenge.olean
+Signature.lean
+check.py
+lean-toolchain
+
+/workspace/submission:
+Audit.lean
+Proof.lean
+Spec.lean
+src
+
+/workspace/submission/src:
+[?2004hroot@1f43b516d28e:/workspace# cat /workspace/lean/SecurityChallenge.lean /workspace/lean/Signature.lean /workspace/lean/check.py /workspace/lean/lean-toolchain; cat /workspace/submission/*.lean; cat /workspace/challenge/Cargo.toml
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def limbBase : UInt64 := 4294967296
+def feeRateMulValue : UInt64 := 1000000
+def principalDivisor : UInt64 := 2
+def u64Max : UInt64 := 18446744073709551615
+
+structure U128Words where
+  w0 : UInt64
+  w1 : UInt64
+  w2 : UInt64
+  w3 : UInt64
+
+structure DivStep where
+  quot : UInt64
+  rem : UInt64
+
+structure DivResult where
+  q0 : UInt64
+  q1 : UInt64
+  q2 : UInt64
+  q3 : UInt64
+  rem : UInt64
+
+def splitU128 (amount fee : UInt64) : U128Words :=
+  { w0 := amount % limbBase, w1 := amount / limbBase, w2 := fee % limbBase, w3 := fee / limbBase }
+
+def divStep (rem word : UInt64) : DivStep :=
+  let num := limbBase * rem + word
+  { quot := num / feeRateMulValue, rem := num % feeRateMulValue }
+
+def divWordChain (words : U128Words) : DivResult :=
+  let step3 := divStep 0 words.w3
+  let step2 := divStep step3.rem words.w2
+  let step1 := divStep step2.rem words.w1
+  let step0 := divStep step1.rem words.w0
+  { q0 := step0.quot, q1 := step1.quot, q2 := step2.quot, q3 := step3.quot, rem := step0.rem }
+
+def roundUpQuotient (div : DivResult) : U128Words :=
+  let inc : UInt64 := if 0 < div.rem then 1 else 0
+  let s0 := inc + div.q0
+  let r0 := s0 % limbBase
+  let c0 := s0 / limbBase
+  let s1 := c0 + div.q1
+  let r1 := s1 % limbBase
+  let c1 := s1 / limbBase
+  let s2 := c1 + div.q2
+  let r2 := s2 % limbBase
+  let c2 := s2 / limbBase
+  let r3 := c2 + div.q3
+  { w0 := r0, w1 := r1, w2 := r2, w3 := r3 }
+
+def tryIntoU64 (words : U128Words) : Option UInt64 :=
+  if words.w2 = 0 ∧ words.w3 = 0 then
+    some (limbBase * words.w1 + words.w0)
+  else
+    none
+
+def divRoundUpFee (amount fee : UInt64) : Option UInt64 :=
+  let words := splitU128 amount fee
+  let div := divWordChain words
+  let rounded := roundUpQuotient div
+  tryIntoU64 rounded
+
+structure WhirlpoolQuote where
+  principalShare : UInt64
+  grossFee : UInt64
+  totalDebit : UInt64
+
+def buildQuote (amount fee : UInt64) : Option WhirlpoolQuote :=
+  let principalShare := amount / principalDivisor
+  match divRoundUpFee amount fee with
+  | some grossFee =>
+    if grossFee ≤ u64Max - principalShare then
+      some {
+        principalShare := principalShare,
+        grossFee := grossFee,
+        totalDebit := principalShare + grossFee
+      }
+    else
+      none
+  | none => none
+
+def verifyAffordability (balance : UInt64) (quote : WhirlpoolQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+leanprover/lean4:v4.31.0
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@1f43b516d28e:/workspace# mkdir -p /tmp/t && cd /tmp/t && cat > /workspace/submission/Spec.lean << 'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def totalDebitNat (a f : UInt64) : Nat :=
+[?2004l[?2004h>   a.toNat / 2 + (a.toNat + f.toNat * 18446744073709551616 + 999999) / 1000000
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts b a f := totalDebitNat a f ≤ b.toNat
+[?2004l[?2004h>   output b a f t := totalDebitNat a f ≤ b.toNat ∧ t.toNat = totalDebitNat a f
+[?2004l[?2004h> 
+[?2004l[?2004h> namespace CandidateAux
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem divStep_spec (r w : UInt64) (hr : r.toNat < 1000000) (hw : w.toNat < 4294967296) :
+[?2004l[?2004h>     (divStep r w).quot.toNat = (4294967296 * r.toNat + w.toNat) / 1000000 ∧
+[?2004l[?2004h>     (divStep r w).rem.toNat = (4294967296 * r.toNat + w.toNat) % 1000000 := by
+[?2004l[?2004h>   have h1 : (4294967296 : UInt64).toNat = 4294967296 := rfl
+[?2004l[?2004h>   have h2 : (1000000 : UInt64).toNat = 1000000 := rfl
+[?2004l[?2004h>   simp only [divStep, limbBase, feeRateMulValue, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>     UInt64.toNat_add, UInt64.toNat_mul, h1, h2]
+[?2004l[?2004h>   constructor <;> omega
+[?2004l[?2004h> 
+[?2004l[?2004h> end CandidateAux
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# printf 'import SecurityChallenge\nopen SecurityChallenge\n\ndef verdict : AuditVerdict := .safe\n' > /workspace/submission/Audit.lean
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# printf 'by\n  sorry\n' > /workspace/submission/Proof.lean
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# (echo 'import SecurityChallenge'; tail -n +2 /workspace/submission/Spec.lean) > S.lean; time LEAN_PATH=/workspace/lean lean S.lean
+[?2004lS.lean:20:18: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  15625*c - 288230376151711744*d - 288230376151711744*e - 15625*f ≤ -1
+  0 ≤ b ≤ 4294967295
+  0 ≤ a ≤ 999999
+  0 ≤ a - 4294967296*d ≤ 4294967295
+  0 ≤ 4294967296*a + b - 1000000*c ≤ 999999
+  0 ≤ 4294967296*a + b - 18446744073709551616*d - 18446744073709551616*e ≤ 18446744073709551615
+  0 ≤ 4294967296*a + b - 18446744073709551616*d - 18446744073709551616*e - 1000000*f ≤ 999999
+where
+ a := ↑r.toNat
+ b := ↑w.toNat
+ c := ↑(4294967296 * r.toNat + w.toNat) / 1000000
+ d := ↑(4294967296 * r.toNat) / 18446744073709551616
+ e := ↑(4294967296 * r.toNat % 2 ^ 64 + w.toNat) / 18446744073709551616
+ f := ↑((4294967296 * r.toNat % 2 ^ 64 + w.toNat) % 2 ^ 64) / 1000000
+
+real	0m1.530s
+user	0m0.809s
+sys	0m0.567s
+[?2004hroot@1f43b516d28e:/tmp/t# cat > L.lean << 'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem divStep_spec (r w : UInt64) (hr : r.toNat < 1000000) (hw : w.toNat < 4294967296) :
+[?2004l[?2004h>     (divStep r w).quot.toNat = (4294967296 * r.toNat + w.toNat) / 1000000 ∧
+[?2004l[?2004h>     (divStep r w).rem.toNat = (4294967296 * r.toNat + w.toNat) % 1000000 := by
+[?2004l[?2004h>   have h1 : (4294967296 : UInt64).toNat = 4294967296 := rfl
+[?2004l[?2004h>   have h2 : (1000000 : UInt64).toNat = 1000000 := rfl
+[?2004l[?2004h>   have hlt1 : 4294967296 * r.toNat < 2^64 := by omega
+[?2004l[?2004h>   have hlt2 : 4294967296 * r.toNat + w.toNat < 2^64 := by omega
+[?2004l[?2004h>   simp only [divStep, limbBase, feeRateMulValue, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>     UInt64.toNat_add, UInt64.toNat_mul, h1, h2, Nat.mod_eq_of_lt hlt1, Nat.mod_eq_of_lt hlt2]
+[?2004l[?2004h>   exact ⟨rfl, rfl⟩
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# LEAN_PATH=/workspace/lean lean L.lean
+[?2004lL.lean:13:9: error: Application type mismatch: The argument
+  rfl
+has type
+  ?m.130 = ?m.130
+but is expected to have type
+  True
+in the application
+  And.intro rfl
+[?2004hroot@1f43b516d28e:/tmp/t# sed -i 's/exact ⟨rfl, rfl⟩/exact ⟨trivial, trivial⟩/' L.lean; cat >> L.lean << 'EOF'
+[?2004l[?2004h> #check @UInt64.lt_iff_toNat_lt
+[?2004l[?2004h> #check @UInt64.le_iff_toNat_le
+[?2004l[?2004h> #check @UInt64.toNat_inj
+[?2004l[?2004h> #check @UInt64.toNat_sub_of_le
+[?2004l[?2004h> #check @UInt64.toNat_ofNat
+[?2004l[?2004h> #check @UInt64.toNat_ofNat_of_lt
+[?2004l[?2004h> #check @UInt64.toNat_lt
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# LEAN_PATH=/workspace/lean lean L.lean
+[?2004l@UInt64.lt_iff_toNat_lt : ∀ {a b : UInt64}, a < b ↔ a.toNat < b.toNat
+@UInt64.le_iff_toNat_le : ∀ {a b : UInt64}, a ≤ b ↔ a.toNat ≤ b.toNat
+@UInt64.toNat_inj : ∀ {a b : UInt64}, a.toNat = b.toNat ↔ a = b
+UInt64.toNat_sub_of_le : ∀ (a b : UInt64), b ≤ a → (a - b).toNat = a.toNat - b.toNat
+@UInt64.toNat_ofNat : ∀ {n : Nat}, (OfNat.ofNat n).toNat = n % 2 ^ 64
+@UInt64.toNat_ofNat_of_lt : ∀ {n : Nat}, n < UInt64.size → UInt64.toNat (OfNat.ofNat n) = n
+UInt64.toNat_lt : ∀ (n : UInt64), n.toNat < 2 ^ 64
+[?2004hroot@1f43b516d28e:/tmp/t# cat > /workspace/submission/Spec.lean << 'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact gross fee: ceil((amount + fee * 2^64) / 1_000_000). -/
+[?2004l[?2004h> def grossFeeNat (a f : UInt64) : Nat :=
+[?2004l[?2004h>   (a.toNat + f.toNat * 18446744073709551616 + 999999) / 1000000
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact total debit: floor(amount / 2) + gross fee. -/
+[?2004l[?2004h> def totalDebitNat (a f : UInt64) : Nat :=
+[?2004l[?2004h>   a.toNat / 2 + grossFeeNat a f
+[?2004l[?2004h> 
+[?2004lr[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts b a f := totalDebitNat a f ≤ b.toNat
+[?2004l[?2004h>   output _ a f t := t.toNat = totalDebitNat a f
+[?2004l[?2004h> 
+[?2004l[?2004h> namespace CandidateAux
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem lb : limbBase.toNat = 4294967296 := rfl
+[?2004l[?2004h> 
+[?2004l
+[?2004h> theorem toNat_add_lt {x y : UInt64} (h : x.toNat + y.toNat < 18446744073709551616) :
+[?2004l[?2004h>     (x + y).toNat = x.toNat + y.toNat := by
+[?2004l[?2004h>   rw [UInt64.toNat_add]; exact Nat.mod_eq_of_lt h
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem toNat_mul_lt {x y : UInt64} (h : x.toNat * y.toNat < 18446744073709551616) :
+[?2004l[?2004h>     (x * y).toNat = x.toNat * y.toNat := by
+[?2004l[?2004h>   rw [UInt64.toNat_mul]; exact Nat.mod_eq_of_lt h
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem divStep_spec (r w : UInt64) (hr : r.toNat < 1000000) (hw : w.toNat < 4294967296) :
+[?2004l[?2004h>     (divStep r w).quot.toNat = (4294967296 * r.toNat + w.toNat) / 1000000 ∧
+[?2004l[?2004h>     (divStep r w).rem.toNat = (4294967296 * r.toNat + w.toNat) % 1000000 := by
+[?2004l[?2004h>   have h1 : (4294967296 : UInt64).toNat = 4294967296 := rfl
+[?2004l[?2004h>   have h2 : (1000000 : UInt64).toNat = 1000000 := rfl
+[?2004l[?2004h>   have hlt1 : 4294967296 * r.toNat < 2^64 := by omega
+[?2004l[?2004h>   have hlt2 : 4294967296 * r.toNat + w.toNat < 2^64 := by omega
+[?2004l[?2004h>   simp only [divStep, limbBase, feeRateMulValue, UInt64.toNat_div, UInt64.toNat_mod,
+[?2004l[?2004h>     UInt64.toNat_add, UInt64.toNat_mul, h1, h2, Nat.mod_eq_of_lt hlt1, Nat.mod_eq_of_lt hlt2]
+[?2004l[?2004h>   exact ⟨trivial, trivial⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem chain_spec (w : U128Words) (h0 : w.w0.toNat < 4294967296) (h1 : w.w1.toNat < 4294967296)
+[?2004l[?2004h>     (h2 : w.w2.toNat < 4294967296) (h3 : w.w3.toNat < 4294967296) :
+[?2004l[?2004h>     (divWordChain w).q0.toNat < 4294967296 ∧ (divWordChain w).q1.toNat < 4294967296 ∧
+[?2004l[?2004h>     (divWordChain w).q2.toNat < 4294967296 ∧ (divWordChain w).q3.toNat < 4294967296 ∧
+[?2004l[?2004h>     (divWordChain w).rem.toNat < 1000000 ∧
+[?2004l[?2004h>     (79228162514264337593543950336 * (divWordChain w).q3.toNat
+[?2004l[?2004h>       + 18446744073709551616 * (divWordChain w).q2.toNat
+[?2004l[?2004h>       + 4294967296 * (divWordChain w).q1.toNat + (divWordChain w).q0.toNat) * 1000000
+[?2004l[?2004h>       + (divWordChain w).rem.toNat
+[?2004l[?2004h>       = 79228162514264337593543950336 * w.w3.toNat + 18446744073709551616 * w.w2.toNat
+[?2004l[?2004h>         + 4294967296 * w.w1.toNat + w.w0.toNat := by
+[?2004l[?2004h>   have z : (0 : UInt64).toNat = 0 := rfl
+[?2004l[?2004h>   have s3 := divStep_spec 0 w.w3 (by decide) h3
+[?2004l[?2004h>   have s2 := divStep_spec (divStep 0 w.w3).rem w.w2 (by rw [s3.2]; omega) h2
+[?2004l[?2004h>   have s1 := divStep_spec (divStep (divStep 0 w.w3).rem w.w2).rem w.w1 (by rw [s2.2]; omega) h1
+[?2004l[?2004h>   have s0 := divStep_spec (divStep (divStep (divStep 0 w.w3).rem w.w2).rem w.w1).rem w.w0
+[?2004l[?2004h>     (by rw [s1.2]; omega) h0
+[?2004l[?2004h>   obtain ⟨e3q, e3r⟩ := s3
+[?2004l[?2004h>   obtain ⟨e2q, e2r⟩ := s2
+[?2004l[?2004h>   obtain ⟨e1q, e1r⟩ := s1
+[?2004l[?2004h>   obtain ⟨e0q, e0r⟩ := s0
+[?2004l[?2004h>   simp only [divWordChain]
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem roundUp_spec (D : DivResult) (h0 : D.q0.toNat < 4294967296) (h1 : D.q1.toNat < 4294967296)
+[?2004l[?2004h>     (h2 : D.q2.toNat < 4294967296) (h3 : D.q3.toNat < 4294967296) :
+[?2004l[?2004h>     (roundUpQuotient D).w0.toNat < 4294967296 ∧ (roundUpQuotient D).w1.toNat < 4294967296 ∧
+[?2004l[?2004h>     (roundUpQuotient D).w2.toNat < 4294967296 ∧
+[?2004l[?2004h>     (0 < D.rem.toNat →
+[?2004l[?2004h>       79228162514264337593543950336 * (roundUpQuotient D).w3.toNat
+[?2004l[?2004h>       + 18446744073709551616 * (roundUpQuotient D).w2.toNat
+[?2004l[?2004h>       + 4294967296 * (roundUpQuotient D).w1.toNat + (roundUpQuotient D).w0.toNat
+[?2004l[?2004h>       = 79228162514264337593543950336 * D.q3.toNat + 18446744073709551616 * D.q2.toNat
+[?2004l[?2004h>         + 4294967296 * D.q1.toNat + D.q0.toNat + 1) ∧
+[?2004l[?2004h>     (D.rem.toNat = 0 →
+[?2004l[?2004h>       79228162514264337593543950336 * (roundUpQuotient D).w3.toNat
+[?2004l[?2004h>       + 18446744073709551616 * (roundUpQuotient D).w2.toNat
+[?2004l[?2004h>       + 4294967296 * (roundUpQuotient D).w1.toNat + (roundUpQuotient D).w0.toNat
+[?2004l[?2004h>       = 79228162514264337593543950336 * D.q3.toNat + 18446744073709551616 * D.q2.toNat
+[?2004l[?2004h>         + 4294967296 * D.q1.toNat + D.q0.toNat) := by
+[?2004l[?2004h>   obtain ⟨q0, q1, q2, q3, rem⟩ := D
+[?2004l[?2004h>   dsimp only at h0 h1 h2 h3 ⊢
+[?2004l[?2004h>   simp only [roundUpQuotient]
+[?2004l:= UInt64.[?2004h>   generalize hI : (if 0 < rem then (1 : UInt64) else 0) = inc
+[?2004l[?2004h>   have hi1 : 0 < rem.toNat → inc.toNat = 1 := by
+[?2004l[?2004h>     intro h; rw [← hI, if_pos (UInt64.lt_iff_toNat_lt.mpr h)]; rfl
+[?2004l[?2004h>   have hi0 : rem.toNat = 0 → inc.toNat = 0 := by
+[?2004l[?2004h>     intro h
+[?2004l[?2004h>     have hn : ¬ (0 : UInt64) < rem := by
+[?2004l[?2004h>       rw [UInt64.lt_iff_toNat_lt]; show ¬ 0 < rem.toNat; omega
+[?2004l[?2004h>     rw [← hI, if_neg hn]; rfl
+[?2004l[?2004h>   have hi : inc.toNat ≤ 1 := by
+[?2004l[?2004h>     by_cases h : rem.toNat = 0
+[?2004l[?2004h>     · have := hi0 h; omega
+[?2004l[?2004h>     · have := hi1 (by omega); omega
+[?2004l[?2004h>   have e0 := toNat_add_lt (x := inc) (y := q0) (by omega)
+[?2004l[?2004h>   generalize inc + q0 = s0 at *
+[?2004l[?2004h>   have e1 := toNat_add_lt (x := s0 / limbBase) (y := q1) (by rw [UInt64.toNat_div, lb]; omega)
+[?2004l[?2004h>   generalize s0 / limbBase + q1 = s1 at *
+[?2004l[?2004h>   have e2 := toNat_add_lt (x := s1 / limbBase) (y := q2) (by rw [UInt64.toNat_div, lb]; omega)
+[?2004l[?2004h>   generalize s1 / limbBase + q2 = s2 at *
+[?2004l[?2004h>   have e3 := toNat_add_lt (x := s2 / limbBase) (y := q3) (by rw [UInt64.toNat_div, lb]; omega)
+[?2004l[?2004h>   generalize s2 / limbBase + q3 = s3 at *
+[?2004l[?2004h>   simp only [UInt64.toNat_div, UInt64.toNat_mod, lb] at *
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem divRound_spec (a f : UInt64) :
+[?2004l[?2004h>     (∀ g, divRoundUpFee a f = some g → g.toNat = grossFeeNat a f) ∧
+[?2004l[?2004h>     (divRoundUpFee a f = none → 18446744073709551616 ≤ grossFeeNat a f) := by
+[?2004l[?2004h>   have hW0 : (splitU128 a f).w0.toNat = a.toNat % 4294967296 := by
+[?2004l[?2004h>     simp only [splitU128, UInt64.toNat_mod, lb]
+[?2004l[?2004h>   have hW1 : (splitU128 a f).w1.toNat = a.toNat / 4294967296 := by
+[?2004l[?2004h>     simp only [splitU128, UInt64.toNat_div, lb]
+[?2004l[?2004h>   have hW2 : (splitU128 a f).w2.toNat = f.toNat % 4294967296 := by
+[?2004l[?2004h>     simp only [splitU128, UInt64.toNat_mod, lb]
+[?2004l[?2004h>   have hW3 : (splitU128 a f).w3.toNat = f.toNat / 4294967296 := by
+[?2004l[?2004h>     simp only [splitU128, UInt64.toNat_div, lb]
+[?2004l[?2004h>   have ha := UInt64.toNat_lt a
+[?2004l[?2004h>   have hf := UInt64.toNat_lt f
+[?2004l[?2004h>   obtain ⟨a0, a1, a2, a3, ar, aeq⟩ := chain_spec (splitU128 a f) (by rw [hW0]; omega)
+[?2004l[?2004h>     (by rw [hW1]; omega) (by rw [hW2]; omega) (by rw [hW3]; omega)
+[?2004l[?2004h>   obtain ⟨b0, b1, b2, bpos, bzero⟩ := roundUp_spec (divWordChain (splitU128 a f)) a0 a1 a2 a3
+[?2004l[?2004h>   simp only [divRoundUpFee]
+[?2004l[?2004h>   generalize roundUpQuotient (divWordChain (splitU128 a f)) = R at *
+[?2004l[?2004h>   generalize divWordChain (splitU128 a f) = D at *
+[?2004l[?2004h>   generalize splitU128 a f = W at *
+[?2004l[?2004h>   have hR : 79228162514264337593543950336 * R.w3.toNat + 18446744073709551616 * R.w2.toNat
+[?2004l[?2004h>       + 4294967296 * R.w1.toNat + R.w0.toNat
+[?2004l[?2004h>       = (a.toNat + f.toNat * 18446744073709551616 + 999999) / 1000000 := by
+[?2004l[?2004h>     by_cases h : D.rem.toNat = 0
+[?2004l[?2004h>     · have := bzero h; omega
+[?2004l[?2004h>     · have := bpos (by omega); omega
+[?2004l[?2004h>   unfold grossFeeNat
+[?2004l[?2004h>   unfold tryIntoU64
+[?2004l[?2004h>   by_cases hc : R.w2 = 0 ∧ R.w3 = 0
+[?2004l[?2004h>   · rw [if_pos hc]
+[?2004l[?2004h>     have z2 : R.w2.toNat = 0 := by rw [hc.1]; rfl
+[?2004l[?2004h>     have z3 : R.w3.toNat = 0 := by rw [hc.2]; rfl
+[?2004l[?2004h>     have hm : (limbBase * R.w1).toNat = 4294967296 * R.w1.toNat := by
+[?2004l[?2004h>       rw [toNat_mul_lt (by rw [lb]; omega), lb]
+[?2004l[?2004h>     have hs : (limbBase * R.w1 + R.w0).toNat = 4294967296 * R.w1.toNat + R.w0.toNat := by
+[?2004l[?2004h>       rw [toNat_add_lt (by rw [hm]; omega), hm]
+[?2004l[?2004h>     refine ⟨fun g hg => ?_, fun h => by simp at h⟩
+[?2004l[?2004h>     injection hg with hg
+[?2004l[?2004h>     subst hg
+[?2004l[?2004h>     rw [hs]; omega
+[?2004l[?2004h>   · rw [if_neg hc]
+[?2004l[?2004h>     refine ⟨fun g hg => by simp at hg, fun _ => ?_⟩
+[?2004l[?2004h>     by_cases x : R.w2.toNat = 0
+[?2004l[?2004h>     · by_cases y : R.w3.toNat = 0
+[?2004l[?2004h>       · exact absurd ⟨UInt64.toNat_inj.mp x, UInt64.toNat_inj.mp y⟩ hc
+[?2004l[?2004h>       · omega
+[?2004l[?2004h>     · omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem key (b a f : UInt64) :
+[?2004l[?2004h>     (∀ t, challengeAuthorize b a f = some t → t.toNat = totalDebitNat a f ∧ totalDebitNat a f ≤ b.toNat) ∧
+[?2004l[?2004h>     (challengeAuthorize b a f = none → ¬ totalDebitNat a f ≤ b.toNat) := by
+[?2004l[?2004h>   obtain ⟨hs, hn⟩ := divRound_spec a f
+[?2004l[?2004h>   have hP : (a / principalDivisor).toNat = a.toNat / 2 := by rw [UInt64.toNat_div]; rfl
+[?2004l[?2004h>   have hM : u64Max.toNat = 18446744073709551615 := rfl
+[?2004l[?2004h>   have hb := UInt64.toNat_lt b
+[?2004l[?2004h>   have ha := UInt64.toNat_lt a
+[?2004l[?2004h>   unfold totalDebitNat
+[?2004l[?2004h>   simp only [challengeAuthorize, buildQuote]
+[?2004l[?2004h>   cases h : divRoundUpFee a f with
+[?2004l[?2004h>   | none =>
+[?2004l[?2004h>     have := hn h
+[?2004l[?2004h>     refine ⟨fun t ht => by simp at ht, fun _ => by omega⟩
+[?2004l[?2004h>   | some g =>
+[?2004l[?2004h>     have hg := hs g h
+[?2004l[?2004h>     have hgt := UInt64.toNat_lt g
+[?2004l[?2004h>     have hsub : (u64Max - a / principalDivisor).toNat = 18446744073709551615 - a.toNat / 2 := by
+[?2004l[?2004h>       rw [UInt64.toNat_sub_of_le _ _ (by rw [UInt64.le_iff_toNat_le, hP, hM]; omega), hP, hM]
+[?2004l[?2004h>     dsimp only
+[?2004l[?2004h>     by_cases hc : g ≤ u64Max - a / principalDivisor
+[?2004l[?2004h>     · rw [if_pos hc]
+[?2004l[?2004h>       have hc' := UInt64.le_iff_toNat_le.mp hc
+[?2004l[?2004h>       rw [hsub] at hc'
+[?2004l[?2004h>       have hadd : (a / principalDivisor + g).toNat = a.toNat / 2 + g.toNat := by
+[?2004l[?2004h>         rw [toNat_add_lt (by rw [hP]; omega), hP]
+[?2004l[?2004h>       simp only [verifyAffordability]
+[?2004l[?2004h>       by_cases hv : a / principalDivisor + g ≤ b
+[?2004l[?2004h>       · rw [if_pos hv]
+[?2004l[?2004h>         have hv' := UInt64.le_iff_toNat_le.mp hv
+[?2004l[?2004h>         rw [hadd] at hv'
+[?2004l[?2004h>         refine ⟨fun t ht => ?_, fun ht => by simp at ht⟩
+[?2004l[?2004h>         injection ht with ht
+[?2004l[?2004h>         subst ht
+[?2004l[?2004h>         rw [hadd]; omega
+[?2004l[?2004h>       · rw [if_neg hv]
+[?2004l[?2004h>         have hv' : ¬ (a / principalDivisor + g).toNat ≤ b.toNat := fun x => hv (UInt64.le_iff_toNat_le.mpr x)
+[?2004l[?2004h>         rw [hadd] at hv'
+[?2004l[?2004h>         refine ⟨fun t ht => by simp at ht, fun _ => by omega⟩
+[?2004l[?2004h>     · rw [if_neg hc]
+[?2004l[?2004h>       have hc' : ¬ g.toNat ≤ (u64Max - a / principalDivisor).toNat := fun x => hc (UInt64.le_iff_toNat_le.mpr x)
+[?2004l[?2004h>       rw [hsub] at hc'
+[?2004l[?2004h>       refine ⟨fun t ht => by simp at ht, fun _ => by omega⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem conforms : Conforms candidateSpec challengeAuthorize := by
+[?2004l[?2004h>   refine ⟨fun b a f => ?_, fun b a f t ht => ((key b a f).1 t ht).1⟩
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · rintro ⟨t, ht⟩
+[?2004l[?2004h>     exact ((key b a f).1 t ht).2
+[?2004l[?2004h>   · intro h
+[?2004l[?2004h>     cases hc : challengeAuthorize b a f with
+[?2004l[?2004h>     | none => exact absurd h ((key b a f).2 hc)
+[?2004l[?2004h>     | some t => exact ⟨t, rfl⟩
+[?2004l[?2004h> 
+[?2004l[?2004h> end CandidateAux
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# cp /workspace/submission/Spec.lean S.lean; time LEAN_PATH=/workspace/lean lean S.lean 2>&1 | head -80
+[?2004lS.lean:84:58: error: Application type mismatch: The argument
+  h
+has type
+  0 < rem.toNat
+but is expected to have type
+  UInt64.toNat ?m.210 < UInt64.toNat ?m.211
+in the application
+  UInt64.lt_iff_toNat_lt.mpr h
+S.lean:98:88: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  g ≥ 1
+  e ≥ 0
+  d ≥ 0
+  0 ≤ d - e ≤ 4294967295
+  0 ≤ d - 4294967296*f ≤ 4294967295
+  1 ≤ c ≤ 4294967296
+  0 ≤ b ≤ 4294967295
+  0 ≤ a ≤ 4294967295
+  a + f ≥ 18446744073709551616
+where
+ a := ↑q2.toNat
+ b := ↑q3.toNat
+ c := ↑s0.toNat
+ d := ↑s1.toNat
+ e := ↑(s0 / limbBase).toNat
+ f := ↑s1.toNat / 4294967296
+ g := ↑rem.toNat
+S.lean:100:88: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  h ≥ 1
+  f ≥ 0
+  e ≥ 0
+  0 ≤ e - f ≤ 4294967295
+  0 ≤ e - 4294967296*g ≤ 4294967295
+  d ≥ 0
+  c ≥ 0
+  0 ≤ c - d ≤ 4294967295
+  1 ≤ b ≤ 4294967296
+  0 ≤ a ≤ 4294967295
+  a + g ≥ 18446744073709551616
+where
+ a := ↑q3.toNat
+ b := ↑s0.toNat
+ c := ↑s1.toNat
+ d := ↑(s0 / limbBase).toNat
+ e := ↑s2.toNat
+ f := ↑(s1 / limbBase).toNat
+ g := ↑s2.toNat / 4294967296
+ h := ↑rem.toNat
+
+real	0m2.819s
+user	0m3.226s
+sys	0m0.487s
+[?2004hroot@1f43b516d28e:/tmp/t# python3 - << 'EOF'
+[?2004l[?2004h> p='/workspace/submission/Spec.lean'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=s.replace("intro h; rw [← hI, if_pos (UInt64.lt_iff_toNat_lt.mpr h)]; rfl",
+[?2004l[?2004h>  "intro h\n    have hp : (0 : UInt64) < rem := UInt64.lt_iff_toNat_lt.mpr (by show 0 < rem.toNat; exact h)\n    rw [← hI, if_pos hp]; rfl")
+[?2004l[?2004h> for n,s_ in [('e1','s0'),('e2','s1'),('e3','s2')]:
+[?2004l[?2004h>     key='  have %s := toNat_add_lt (x := %s / limbBase)' % (n,s_)
+[?2004l[?2004h>     i=s.index(key); j=s.index('\n',i)
+[?2004l[?2004h>     s=s[:j+1]+'  rw [UInt64.toNat_div, lb] at %s\n' % n + s[j+1:]
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# grep -n 'toNat_div, lb\] at\|have hp' /workspace/submission/Spec.lean
+[?2004l[32m[K85[m[K[36m[K:[m[K    [01;31m[Khave hp[m[K : (0 : UInt64) < rem := UInt64.lt_iff_toNat_lt.mpr (by show 0 < rem.toNat; exact h)
+[32m[K99[m[K[36m[K:[m[K  rw [UInt64.[01;31m[KtoNat_div, lb] at[m[K e1
+[32m[K102[m[K[36m[K:[m[K  rw [UInt64.[01;31m[KtoNat_div, lb] at[m[K e2
+[32m[K105[m[K[36m[K:[m[K  rw [UInt64.[01;31m[KtoNat_div, lb] at[m[K e3
+[?2004hroot@1f43b516d28e:/tmp/t# cp /workspace/submission/Spec.lean S.lean; time LEAN_PATH=/workspace/lean lean S.lean 2>&1 | head -80
+[?2004lS.lean:107:13: warning: This simp argument is unused:
+  UInt64.toNat_div
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_d̵i̵v̵,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵mod, lb] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+
+real	0m2.938s
+user	0m3.358s
+sys	0m0.473s
+[?2004hroot@1f43b516d28e:/tmp/t# printf 'by\n  exact CandidateAux.conforms\n' > /workspace/submission/Proof.lean
+[?2004l[?2004hroot@1f43b516d28e:/tmp/t# python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004lCandidateSpec.lean:5:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:9:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:108:13: warning: This simp argument is unused:
+  UInt64.toNat_div
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_d̵i̵v̵,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵mod, lb] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateSpec.lean:111:8: warning: declaration uses `sorry`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+EXIT=1
+[?2004hroot@1f43b516d28e:/tmp/t# printf 'import SecurityChallenge\nopen SecurityChallenge\n' > A.lean; tail -n +3 /workspace/submission/Spec.lean >> A.lean; tail -n +3 /workspace/submission/Audit.lean >> A.lean; printf 'theorem ev : AuditClaim candidateSpec verdict := by\n  exact CandidateAux.conforms\n#print axioms ev\n' >> A.lean; LEAN_PATH=/workspace/lean lean A.lean 2>&1 | grep -v 'simp arg\|Hint\|toNat_d\|linter\|^$'
+[?2004l'ev' depends on axioms: [propext, Classical.choice, Quot.sound]
+[?2004hroot@1f43b516d28e:/tmp/t# ls -la /workspace/submission /workspace/submission/src; cd /workspace/challenge && cargo test --release 2>&1 | tail -5; cd /tmp/t
+[?2004l/workspace/submission:
+total 40
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   85 Oct  7 07:14 Audit.lean
+-rw-r--r-- 1 root root   33 Oct  7 07:24 Proof.lean
+-rw-r--r-- 1 root root 9995 Oct  7 07:22 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34msrc[0m
+
+/workspace/submission/src:
+total 12
+drwxr-xr-x 2 root root 4096 Oct  7 07:02 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  7 07:02 [01;34m..[0m
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@1f43b516d28e:/tmp/t# sed -i 's#^/-- \(.*\) -/$#-- \1#' /workspace/submission/Spec.lean; grep -n '^--\|/-' /workspace/submission/Spec.lean; python3 /workspace/lean/check.py; echo EXIT=$?
+[?2004l[32m[K4[m[K[36m[K:[m[K[01;31m[K--[m[K Exact gross fee: ceil((amount + fee * 2^64) / 1_000_000).
+[32m[K8[m[K[36m[K:[m[K[01;31m[K--[m[K Exact total debit: floor(amount / 2) + gross fee.
+CandidateSpec.lean:108:13: warning: This simp argument is unused:
+  UInt64.toNat_div
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_d̵i̵v̵,̵ ̵U̵I̵n̵t̵6̵4̵.̵t̵o̵N̵a̵t̵_̵mod, lb] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+EXIT=0
+[?2004hroot@1f43b516d28e:/tmp/t# cd /workspace/challenge && cargo test --release 2>&1 | grep -E 'test |result'; cd /tmp/t
+[?2004l[01;31m[Ktest [m[Ktests::multi_word_carry_across_q0_boundary ... ok
+[01;31m[Ktest [m[Ktests::rounds_up_fractional_fee ... ok
+[01;31m[Ktest [m[Ktests::zero_payment_is_authorized ... ok
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[?2004hroot@1f43b516d28e:/tmp/t# 
