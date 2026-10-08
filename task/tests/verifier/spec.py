@@ -302,12 +302,20 @@ def purify_divmod(expr):
         return z3.simplify(acc) if changed else e
 
     def get_qr(a, c_val, c_expr):
+        lo_raw, hi_raw = get_bounds(a)
         a_s = z3.simplify(a)
         keep_alive.append(a_s)
         lo, hi = get_bounds(a_s)
-        if lo is not None and hi is not None and 0 <= lo and hi < c_val:
+        if lo_raw is not None and hi_raw is not None:
+            lo = max(lo, lo_raw) if lo is not None else lo_raw
+            hi = min(hi, hi_raw) if hi is not None else hi_raw
             _cache_bound(a_s, (lo, hi))
-            return (z3.IntVal(0), a_s)
+        if lo is not None and hi is not None and lo // c_val == hi // c_val:
+            q_const = lo // c_val
+            r_exact = a_s if q_const == 0 else z3.simplify(a_s - z3.IntVal(q_const * c_val))
+            keep_alive.append(r_exact)
+            _cache_bound(r_exact, (lo - q_const * c_val, hi - q_const * c_val))
+            return (z3.IntVal(q_const), r_exact)
         if z3.is_app(a_s) and a_s.decl().kind() == z3.Z3_OP_ITE:
             cond, t_br, f_br = a_s.arg(0), a_s.arg(1), a_s.arg(2)
             qt, rt = get_qr(t_br, c_val, c_expr)
@@ -315,6 +323,8 @@ def purify_divmod(expr):
             q_ite = z3.If(cond, qt, qf)
             r_ite = z3.If(cond, rt, rf)
             _cache_bound(r_ite, (0, c_val - 1))
+            if lo is not None and hi is not None:
+                _cache_bound(q_ite, (lo // c_val, hi // c_val))
             return (q_ite, r_ite)
         a_exp = expand_rems(a_s)
         keep_alive.append(a_exp)
@@ -326,6 +336,8 @@ def purify_divmod(expr):
             q_exact = z3.simplify(q_exact)
             r_exact = z3.IntVal(c0 % c_val)
             keep_alive.extend((q_exact, r_exact))
+            if lo is not None and hi is not None:
+                _cache_bound(q_exact, (lo // c_val, hi // c_val))
             return (q_exact, r_exact)
         if c_val == 2013265921:
             c0_m, terms_m = _extract_linear(a_s)
@@ -381,6 +393,8 @@ def purify_divmod(expr):
                     q_sub, r_sub = get_qr(rem_s, c_val, c_expr)
                     q_tot = z3.simplify(q_mult + q_sub)
                     keep_alive.append(q_tot)
+                    if lo is not None and hi is not None:
+                        _cache_bound(q_tot, (lo // c_val, hi // c_val))
                     return (q_tot, r_sub)
         key = (a_s.get_id(), c_val)
         if key not in dm_cache:

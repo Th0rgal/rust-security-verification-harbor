@@ -591,8 +591,17 @@ class Interpreter:
                 if val.ty == 'return': out.append((g, val)); continue
                 if k == 'if':
                     condition = typed(val, 'bool').data
-                    out += self.evaluate(e[2], env, z3.And(g, condition))
-                    out += self.evaluate(e[3], env, z3.And(g, z3.Not(condition)))
+                    tp = self.evaluate(e[2], env, z3.And(g, condition))
+                    fp = self.evaluate(e[3], env, z3.And(g, z3.Not(condition)))
+                    if (
+                        len(tp) == 1
+                        and len(fp) == 1
+                        and tp[0][1].ty == fp[0][1].ty
+                        and tp[0][1].ty in ('u32', 'u64', 'u128', 'bool')
+                    ):
+                        out.append((g, Value(tp[0][1].ty, z3.If(condition, tp[0][1].data, fp[0][1].data))))
+                    else:
+                        out += tp + fp
                 else:
                     if val.ty not in ('some', 'none'): raise Unsupported('Option pattern required')
                     local = dict(env)
