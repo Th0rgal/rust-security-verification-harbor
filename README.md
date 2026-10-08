@@ -97,6 +97,23 @@ We evaluate models with Harbor 0.9.0 (`terminus-2`, `reasoning_effort=high`) und
 | `goldilocks-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (79.5k + 12.0k) | **1.00** | **1.00** | 9 | 73.7k (69.6k + 4.0k) |
 | `goldilocks-safe` | `.safe` | **1.00** | **1.00** | 10 | 374.9k (318.9k + 56.0k) | **0.25** | **1.00** | 25 | 530.0k (520.2k + 9.8k) |
 
+### Concrete Proof vs. Failure Inspection Links
+
+Reviewers can directly inspect the three `.safe` universal proof tasks that separate **Claude Opus 5.5** (`1.00`) from **GPT 6.1 Sol (`high`)** (`0.25`):
+
+- **`ruint-safe` (Möller-Granlund 2-by-1 normalized division):**
+  - [Reference Lean 4.31 Proof (`problems/ruint/solution/safe/Proof.lean`)](problems/ruint/solution/safe/Proof.lean)
+  - [Opus 5.5 (`1.00`, 23 turns) — Verifier Report](evidence/v3/claude-opus-5-5/claude-opus-5-5-ruint-safe/ruint-safe__kP8qzNh/verifier/details.json) · [Terminal Transcript](evidence/v3/claude-opus-5-5/claude-opus-5-5-ruint-safe/ruint-safe__kP8qzNh/agent/terminus_2.pane)
+  - [GPT 6.1 Sol (`0.25`, 25 turns, failed `omega` proof) — Verifier Report](evidence/v3/gpt-6.1-sol-high/gpt-6.1-sol-high-ruint-safe/ruint-safe__HcwaH48/verifier/details.json) · [Terminal Transcript](evidence/v3/gpt-6.1-sol-high/gpt-6.1-sol-high-ruint-safe/ruint-safe__HcwaH48/agent/terminus_2.pane)
+- **`succinct-safe` (Non-Web3 Vigna SWAR broadword byte detection):**
+  - [Reference Lean 4.31 Proof (`problems/succinct/solution/safe/Proof.lean`)](problems/succinct/solution/safe/Proof.lean)
+  - [Opus 5.5 (`1.00`, 15 turns) — Verifier Report](evidence/v3/claude-opus-5-5/claude-opus-5-5-succinct-safe/succinct-safe__vSngWU9/verifier/details.json) · [Terminal Transcript](evidence/v3/claude-opus-5-5/claude-opus-5-5-succinct-safe/succinct-safe__vSngWU9/agent/terminus_2.pane)
+  - [GPT 6.1 Sol (`0.25`, 25 turns, rejected `bv_decide` axiom) — Verifier Report](evidence/v3/gpt-6.1-sol-high/gpt-6.1-sol-high-succinct-safe/succinct-safe__oYsCe2P/verifier/details.json) · [Terminal Transcript](evidence/v3/gpt-6.1-sol-high/gpt-6.1-sol-high-succinct-safe/succinct-safe__oYsCe2P/agent/terminus_2.pane)
+- **`plonky3-safe` (BabyBear 64-bit Montgomery reduction):**
+  - [Reference Lean 4.31 Proof (`problems/plonky3/solution/safe/Proof.lean`)](problems/plonky3/solution/safe/Proof.lean)
+  - [Opus 5.5 (`1.00`, 16 turns) — Verifier Report](evidence/v3/claude-opus-5-5/claude-opus-5-5-plonky3-safe/plonky3-safe__ByhaTT4/verifier/details.json) · [Terminal Transcript](evidence/v3/claude-opus-5-5/claude-opus-5-5-plonky3-safe/plonky3-safe__ByhaTT4/agent/terminus_2.pane)
+  - [GPT 6.1 Sol (`0.25`, 25 turns, left `by sorry`) — Verifier Report](evidence/v3/gpt-6.1-sol-high/gpt-6.1-sol-high-plonky3-safe/plonky3-safe__K6xkgTV/verifier/details.json) · [Terminal Transcript](evidence/v3/gpt-6.1-sol-high/gpt-6.1-sol-high-plonky3-safe/plonky3-safe__K6xkgTV/agent/terminus_2.pane)
+
 <details>
 <summary><strong>Auxiliary Calibration & Regression Tasks (4 pairs = 8 tasks, <code>--problem all</code>)</strong></summary>
 
@@ -123,6 +140,9 @@ Requirements: Docker with Compose v2, Python 3.12+, and access to the pinned bas
 git clone https://github.com/Th0rgal/rust-security-verification-harbor
 cd rust-security-verification-harbor
 python3 -m venv .venv && .venv/bin/pip install -r scripts/harbor-requirements.lock
+
+# Regenerate the @10T vs @25T Markdown summary table from evidence/v3/ traces:
+python3 scripts/summarize-results.py
 
 # Generates the 6 Challenge Benchmark pairs (12 Harbor tasks) by default.
 # Pass `--problem all` to generate all 10 pairs (20 tasks).
@@ -167,6 +187,7 @@ problems/whirlpool/             Challenge #5: Web3/DeFi 4-limb U128Muldiv ceilin
 problems/goldilocks/            Challenge #6: Web3/ZK Goldilocks 128-bit prime reduction
 problems/{settlement,settlement-modular,openpql}/  auxiliary calibration/regression pairs (--problem all)
 scripts/make-family.py          generates the 6 Challenge pairs by default (or --problem all)
+scripts/summarize-results.py    prints the @10T vs @25T Markdown summary table from evidence/v3/
 scripts/selftest.py             adversarial regression suite covering all 20 variants
 scripts/harbor-smoke.py         Harbor 0.9.0 E2E oracle check
 evidence/v3/                    reference JSONs + complete Harbor traces (claude-opus-5-5, gpt-6.1-sol-high, glm-5.3-flash)
