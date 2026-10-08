@@ -1,78 +1,58 @@
-# Lean-native v3 validation (2026-10-02)
+# Benchmark Details & Per-Task Breakdown (v3)
 
-The two generated tasks use byte-identical prompts and task-specific original
-Rust/Lean models. Harbor 0.9.0 with Docker Compose v2 and separate offline
-verifiers accepted both oracle references at 1.00, with no trial exceptions.
-See harbor/summary.json and the two reference details files for actual results
-and prompt hashes. Local reference details also record 1.00; both empty skeletons
-score 0.00.
+## 1. The 6 Challenge Pairs (12 Harbor Tasks)
 
-The complete suite also passes as root in the rebuilt verifier Docker image:
-`docker run --rm --network none -v "$PWD:/repo" -e VERIFIER_ROOT=/opt/security-verifier security-verifier:v3-review python3 /repo/scripts/selftest.py`.
-The final output is `selftest v3: PASS`. Generated family APIs are beneath a
-0755 temporary parent so uid 65534 can traverse them after the verifier's
-privilege drop; production sandbox permissions are unchanged.
+Each problem wraps a real-world 64-bit Rust arithmetic kernel into a unified `authorize(balance, amount, fee) -> Option<Authorization>` gate that authorizes an operation iff its target mathematical cost is $\le \text{balance}$.
 
-The adversarial selftest accepts 11 equivalent Rust repairs and rejects six
-incorrect repairs universally and concretely. Unsupported production syntax is
-rejected before execution. Lean spec cases cover commutativity, guarded Nat
-subtraction, if, helper definitions, let, negation, implication, and UInt64
-identity helpers; wrapping UInt64 arithmetic remains unsupported in specs.
-All-False specs receive only one quarter of the spec checkpoint; empty output
-fails coherence and credited exactness. Incorrect/weak/strict specs produce
-counterexamples. Unsupported output preserves supported acceptance scores.
-Injected solver unknown/timeout never earns success.
+| Pair (`-vulnerable` / `-safe`) | Origin & Domain | Target Specification (Unbounded `Nat`) | Bug in `.vulnerable` (Fixed in `.safe`) |
+|---|---|---|---|
+| **[`ruint`](../../problems/ruint)** | `alloy-rs/ruint` (Multiprecision Division) | $\lfloor \text{amount}/2 \rfloor + \lfloor (((\text{fee} \bmod 32771) \cdot 2^{16} + (\text{amount} \bmod 2^{16})) / 32771 \rfloor$ | Möller-Granlund 2-by-1 reciprocal division (`div_2x1_mg10`, `D = 0x8003`, `V = 0xFFF4`) omits the second conditional remainder correction `if r_corr >= D`, under-estimating the quotient by `1` when `r_corr` falls in `[D, 2D)`. |
+| **[`succinct`](../../problems/succinct)** | `tov/succinct-rs` (Non-Web3 SWAR Bitmaps) | $\lfloor \text{amount}/2 \rfloor + (\text{sum of bytes of } \text{fee}) + 256 \times (\text{count of non-zero bytes of } \text{fee})$ | Vigna's SWAR broadword non-zero byte detector `(((x \| H8) - L8) \| x) & H8` omits `\| x`, silently treating every byte equal to `0x80` (`128`) as zero. |
+| **[`plonky3`](../../problems/plonky3)** | `Plonky3/Plonky3` (ZK BabyBear Field, $P = 2\,013\,265\,921$) | $\text{amount} + (((\text{amount} \bmod 2^{32}) + (\text{fee} \bmod P) \cdot 2^{32}) \cdot 943\,718\,400 \bmod P)$ | 64-bit Montgomery reduction (`MU = 2_281_701_377`) adds `(1 << 32) - P` instead of `P` in the unsigned underflow branch after shifting by 32 bits. |
+| **[`settlement-engine`](../../problems/settlement-engine)** | Multi-Module Settlement Engine (~330 lines Rust, 6 modules) | $\text{amount} + (\lceil (\text{amount}+\text{fee})/10\,000 \rceil - \lfloor \lceil (\text{amount}+\text{fee})/10\,000 \rceil / 10 \rfloor)$ | Pure-`u64` carry folding across 3 modules is exact at `u64::MAX`, but under-computes the fee by `1` inside an interior pocket ($2^{64}-9\,999 \le \text{amount}+\text{fee} \le 2^{64}-1\,617$), surrounded by 6 sound sibling calculators acting as realistic noise. |
+| **[`whirlpool`](../../problems/whirlpool)** | `orca-so/whirlpools` (DeFi 128-bit Ceiling Division) | $\lfloor \text{amount}/2 \rfloor + \lceil (\text{amount} + \text{fee} \cdot 2^{64}) / 1\,000\,000 \rceil$ | 4-limb base-$2^{32}$ ceiling division drops the `w1 -> w2` carry when rounding up `q0 = 2^32 - 1, q1 = 2^32 - 1` with non-zero remainder, wrapping a $2^{64}$ quotient to `0`. |
+| **[`goldilocks`](../../problems/goldilocks)** | `recmo/goldilocks` (ZK Goldilocks Field, $P = 2^{64}-2^{32}+1$) | $\lfloor \text{amount}/2 \rfloor + ((\text{amount} + \text{fee} \cdot 2^{64}) \bmod P)$ | Two-step 128-bit Goldilocks reduction checks `> P` instead of `>= P` in the final canonicalization step, leaving a single unreduced residue `r = P`. |
 
-Both reference proof terms pass without omega. Invalid types, sorry, added or
-tactic-injected axioms, forbidden imports and writes outside the sandbox are
-rejected. Malformed spec does not gate vulnerable verdict/witness/patch scores.
-Safe verdict without valid evidence earns no verdict/response score. Safe optional
-artifacts are inspected by metadata only: binary, oversized, direct symlink and
-parent symlink tests pass for both witness and repair paths.
+*(Passing `--problem all` to `scripts/make-family.py` also generates 4 auxiliary calibration pairs: `authorization`, `settlement`, `settlement-modular`, and `openpql`.)*
 
-The old GLM 5.3 Flash 0.60 result belongs to v2 JSON grading. No fresh native-Lean
-GLM result is included. The spec translator covers a finite Lean fragment;
-arbitrary Lean is unsupported with no automated fallback. Lean evidence concerns
-the original visible model and submitted spec; repaired Rust and original/model
-correspondence are separate trusted SMT/backend obligations, not a Lean compiler
-correctness proof.
+---
 
-## Mathlib + RVB `too_complex` expansion (2026-10-07)
+## 2. Per-Task Breakdown (`10` Turns Default vs. `25` Turns Extended)
 
-Three additional symmetric task pairs (`goldilocks`, `whirlpool`, `plonky3`) were
-added from functions in the `rust-verification-benchmark` upstream repositories
-(`Winterfell`, `Orca Whirlpools`, `Plonky3`) that had been excluded from RVB as
-`too_complex`. Both agent and verifier images now include precompiled `Mathlib`,
-`Batteries`, `Aesop`, `Qq`, `Std`, and `Init` (`paloma/lean4-31-rvb-deps:latest`),
-and the verifier supports recursive Lean definition unfolding, general `Nat.mul`,
-variable-divisor `Nat.div`/`Nat.mod`, Euclidean Z3 purification for large/variable
-divisors, and bitwise/shift/tuple-destructuring Rust symbolic semantics.
+Reproducible via `python3 scripts/summarize-results.py` (or `python3 scripts/summarize-results.py --all`):
 
-All 20 reference solutions and skeletons pass `scripts/selftest.py` (`selftest v3: PASS`,
-recorded in `evidence/v3/*-reference.json`).
+| Task | Variant | Opus 5.5 @ **10T** | Opus 5.5 @ **25T** | Opus 5.5 Turns | Opus 5.5 Tokens (`in` + `out`) | GPT 6.1 Sol @ **10T** | GPT 6.1 Sol @ **25T** | GPT 6.1 Sol Turns | GPT 6.1 Sol Tokens (`in` + `out`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ruint-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 9 | 107.3k (95.8k + 11.5k) | **1.00** | **1.00** | 10 | 84.2k (80.6k + 3.6k) |
+| `ruint-safe` | `.safe` | **0.00** | **1.00** | 23 | 665.6k (606.7k + 58.9k) | **0.25** | **0.25 ❌** | 25 | 671.7k (661.5k + 10.2k) |
+| `succinct-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 9 | 116.7k (106.5k + 10.2k) | **1.00** | **1.00** | 7 | 58.5k (54.8k + 3.6k) |
+| `succinct-safe` | `.safe` | **0.00** | **1.00** | 15 | 572.9k (519.2k + 53.7k) | **0.25** | **0.25 ❌** | 25 | 745.1k (735.4k + 9.7k) |
+| `plonky3-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (78.4k + 13.0k) | **1.00** | **1.00** | 10 | 83.1k (79.0k + 4.2k) |
+| `plonky3-safe` | `.safe` | **0.00** | **1.00** | 16 | 490.2k (427.5k + 62.7k) | **0.25** | **0.25 ❌** | 25 | 537.2k (528.5k + 8.7k) |
+| `settlement-engine-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 12 *(done T8)* | 218.3k (203.6k + 14.7k) | **1.00** | **1.00** | 12 *(done T9)* | 146.3k (142.0k + 4.4k) |
+| `settlement-engine-safe` | `.safe` | **0.25** | **1.00** | 20 | 354.7k (326.2k + 28.5k) | **0.25** | **1.00** | 25 | 582.2k (574.3k + 8.0k) |
+| `whirlpool-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 90.8k (79.6k + 11.2k) | **1.00** | **1.00** | 10 | 92.6k (88.3k + 4.3k) |
+| `whirlpool-safe` | `.safe` | **1.00** | **1.00** | 11 *(done T9)* | 260.1k (207.8k + 52.3k) | **0.25** | **1.00** | 21 | 573.1k (562.7k + 10.5k) |
+| `goldilocks-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (79.5k + 12.0k) | **1.00** | **1.00** | 9 | 73.7k (69.6k + 4.0k) |
+| `goldilocks-safe` | `.safe` | **1.00** | **1.00** | 10 | 374.9k (318.9k + 56.0k) | **0.25** | **1.00** | 25 | 530.0k (520.2k + 9.8k) |
+| **Mean (12 tasks)** | **All** | **0.688** (`8.25/12`) | **1.000** (`12.00/12`) | - | - | **0.625** (`7.50/12`) | **0.813** (`9.75/12`) | - | - |
 
-## Challenge Benchmark curation and 10-turn default horizon (2026-10-08)
+### Direct Proof & Failure Inspection Links
 
-To provide a non-redundant difficulty gradient without easy or duplicate tasks,
-`scripts/make-family.py` and `scripts/harbor-smoke.py` now default to `--problem challenge`,
-which generates the **6 core Challenge pairs (`12` Harbor tasks)**:
-`settlement-engine`, `goldilocks`, `whirlpool`, `plonky3`, `succinct`, and `ruint`
-(while `--problem all` retains `authorization`, `settlement`, `settlement-modular`,
-and `openpql` for regression testing).
+- **`ruint-safe`:** [Reference Proof](../../problems/ruint/solution/safe/Proof.lean) · [Opus 5.5 (`1.00`, 23T) Report](claude-opus-5-5/claude-opus-5-5-ruint-safe/ruint-safe__kP8qzNh/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-ruint-safe/ruint-safe__kP8qzNh/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, failed `omega`) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-ruint-safe/ruint-safe__HcwaH48/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-ruint-safe/ruint-safe__HcwaH48/agent/terminus_2.pane)
+- **`succinct-safe`:** [Reference Proof](../../problems/succinct/solution/safe/Proof.lean) · [Opus 5.5 (`1.00`, 15T) Report](claude-opus-5-5/claude-opus-5-5-succinct-safe/succinct-safe__vSngWU9/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-succinct-safe/succinct-safe__vSngWU9/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, disallowed `bv_decide`) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-succinct-safe/succinct-safe__oYsCe2P/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-succinct-safe/succinct-safe__oYsCe2P/agent/terminus_2.pane)
+- **`plonky3-safe`:** [Reference Proof](../../problems/plonky3/solution/safe/Proof.lean) · [Opus 5.5 (`1.00`, 16T) Report](claude-opus-5-5/claude-opus-5-5-plonky3-safe/plonky3-safe__ByhaTT4/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-plonky3-safe/plonky3-safe__ByhaTT4/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, left `sorry`) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-plonky3-safe/plonky3-safe__K6xkgTV/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-plonky3-safe/plonky3-safe__K6xkgTV/agent/terminus_2.pane)
 
-The recommended default agent budget is **`max_turns=10`** (`recommended_max_turns = 10`
-in `task/task.toml`), paired with an extended **`max_turns=25`** analysis:
-- **At 10 turns (`max_turns=10`)**: Both `claude-opus-5-5` and `gpt-6.1-sol-high` solve
-  `6/6` `.vulnerable` tasks (`1.000`), but on `.safe` universal Lean 4 proof tasks
-  `claude-opus-5-5` scores `0.375` (`2.25/6`, overall mean `0.688`) and `gpt-6.1-sol-high`
-  scores `0.250` (`1.50/6`, overall mean `0.625`).
-- **At 25 turns (`max_turns=25`)**: `claude-opus-5-5` solves `12/12` Challenge tasks (`1.000`,
-  and `18/18` across all benchmarked tasks), whereas `gpt-6.1-sol-high` reaches `0.813`
-  (`9.75/12` on the Challenge suite, `15/18` overall), failing at `0.25` on three `.safe`
-  universal Lean 4 proof tasks:
-  - `plonky3-safe`: exhausted 25 turns on the 64-bit BabyBear Montgomery reduction Lean proof (`by sorry`).
-  - `succinct-safe` (Non-Web3 SWAR broadword kernel from `tov/succinct-rs`): exhausted 25 turns and left a `bv_decide` helper rejected by the transitive axiom auditor (`count_correct._native.bv_decide.ax_1_5`).
-  - `ruint-safe` (Web3 Möller-Granlund 2-by-1 normalized division kernel from `alloy-rs/ruint`): exhausted 25 turns unable to discharge the universal `omega` proof over the reciprocal approximation (`D = 32771`, `V = 65524`).
+---
 
+## 3. Verifier Validation & Adversarial Regression (`scripts/selftest.py`)
 
+All 20 reference solutions (`1.00`) and skeletons (`0.00`), plus adversarial test cases (vacuous specs, under-constrained outputs, `sorry` / `bv_decide` / `native_decide` axiom injection, invalid counterexamples, non-equivalent Rust patches, symlink escapes), are verified offline via:
 
+```bash
+docker build -t security-verifier:v3 -f task/tests/Dockerfile task/tests
+docker run --rm --network none -v "$PWD:/repo" -e VERIFIER_ROOT=/opt/security-verifier \
+  security-verifier:v3 python3 /repo/scripts/selftest.py
+```
+
+The final output is `selftest v3: PASS`, with reference receipts recorded in `evidence/v3/*-reference.json`.
