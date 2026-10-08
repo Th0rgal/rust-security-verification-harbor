@@ -1,36 +1,30 @@
 # Rust Security Verification Harbor
 
-## Why This Approach Matters
+Each task in this benchmark gives an agent a real-world 64-bit Rust arithmetic kernel without telling it whether the code is safe or buggy. Every problem exists as two Harbor tasks (`-vulnerable` and `-safe`) with the exact same prompt and passing unit tests.
 
-Evaluating frontier models on formal security verification faces a fundamental dilemma:
-- **If you hand the model a fixed theorem statement**, you have already done half the security auditor's job: the model immediately knows whether the code is safe or buggy, and never has to formalize the intended mathematical specification itself.
-- **If you let the model write its own specification (`Spec.lean`) and prove it (`Proof.lean`)**, a naive Lean checker is trivially gamed: a model can write a vacuous specification (`False`), leave the output unconstrained, or copy the buggy fixed-width `u64` code into the specification and prove a 1-line tautology.
+Instead of giving the model a pre-written theorem statement (which leaks the answer), we ask the model to write its own formal specification and proof, and we grade the submission automatically in three steps:
 
-This benchmark solves both problems by pairing **symmetric blind tasks (`-vulnerable` and `-safe`, with byte-identical prompts)** and guiding the model through a **3-stage formal verification pipeline** that scales to complex, real-world Rust systems bugs:
+1. **Specification (`Spec.lean`, `0.25`):**
+   The model formalizes what the Rust function should compute in unbounded `Nat` arithmetic (where machine overflow cannot happen). Because the model writes `Spec.lean` itself, a naive Lean checker could be gamed by a vacuous spec (`False`) or by copying the buggy `u64` code into the spec. To prevent this while accepting any valid mathematical formulation, our Lean 4.31 metaprogram (`SpecAudit.lean`) unfolds the submitted spec into a normalized arithmetic AST, and `spec.py` uses Z3 (`QF_NIA` with Euclidean quotient/remainder purification) to verify semantic equivalence over all $2^{64} \times 2^{64} \times 2^{64}$ inputs across four facets (safety, completeness, output exactness, and non-vacuity).
 
-1. **Formulate the Mathematical Specification (`Spec.lean`, weight `0.25`):**
-   - The model defines in unbounded `Nat` arithmetic (where machine overflow cannot occur) when an operation should be accepted and what exact value it should produce.
-   - **How we verify equivalence regardless of syntax:** The model can write `candidateSpec` using any combination of `let` bindings, helper functions, conditionals, shifts, masks, or Euclidean division. Inside the verifier container, a Lean 4.31 metaprogram (`SpecAudit.lean`) elaborates `Spec.lean`, unfolds definitions in the kernel environment, and extracts a normalized arithmetic AST. That AST is passed to `spec.py`, which applies **Euclidean quotient/remainder purification** (`a = d * q + r` with `0 <= r < d`, limb/byte decomposition, and interval bound propagation) to query **Z3 (`QF_NIA`) over the entire $2^{64} \times 2^{64} \times 2^{64}$ input space** across four independent facets (safety, completeness, output exactness/uniqueness, and non-vacuity). Any mathematically equivalent formulation gets full credit; vacuous or bug-copying specs fail with a concrete counterexample.
+2. **Audit & Lean 4.31 Proof (`Audit.lean` + `Proof.lean`, `0.40`):**
+   The model declares `.safe` or `.vulnerable` (`0.15`) and proves `AuditClaim candidateSpec verdict` (`0.25`) against the visible Lean model of the Rust code (`SecurityChallenge.lean`), checked from scratch by `leanchecker --fresh` (no `sorry`, custom `axiom`, `native_decide`, or `bv_decide`). On `.vulnerable` tasks, the bugs sit in narrow arithmetic corner cases that unit tests and fuzzers miss; attempting a `.safe` proof fails on the exact broken subgoal and guides the model to a formal refutation.
 
-2. **Audit the Implementation and Prove the Verdict in Lean 4.31 (`Audit.lean` + `Proof.lean`, weight `0.40`):**
-   - The model declares `verdict : AuditVerdict` (`.safe` or `.vulnerable`, weight `0.15`) and proves `AuditClaim candidateSpec verdict` (weight `0.25`) against the visible Lean model of the Rust implementation (`SecurityChallenge.lean`), verified by `leanchecker --fresh` with zero `sorry` or `bv_decide` / `native_decide` trust axioms.
-   - **Why this works on hard problems:** Real arithmetic bugs hide in tiny corner cases (such as an 8,383-wide carry pocket near $2^{64}$, a single `0x80` byte in SWAR broadword logic, or a missing second remainder correction in reciprocal division) that unit tests and fuzzers miss. Attempting to prove a `.vulnerable` implementation `.safe` in Lean 4 immediately gets stuck on the exact failing subgoal, guiding the model to discover the bug and switch to a formal refutation.
-
-3. **Resolve the Finding: Universal Safety or Verified Rust Patch (`counterexample.json` + `src/lib.rs`, weight `0.35`):**
-   - **If `.safe`:** Closing the universal Lean 4.31 proof in Stage 2 certifies that the implementation matches `candidateSpec` across all `u64` inputs.
-   - **If `.vulnerable`:** The model submits a concrete runtime counterexample (`counterexample.json`, `0.15`, checked against the compiled Rust binary) and a patched pure-`u64` Rust implementation (`src/lib.rs`, `0.20`), which is symbolically executed (`rust_symbolic.py`) and proven universally equivalent by Z3 over all `u64` inputs.
+3. **Resolution (`counterexample.json` + `src/lib.rs`, `0.35`):**
+   - **If `.safe`:** The universal Lean 4.31 proof in Step 2 completes the task.
+   - **If `.vulnerable`:** The model provides a concrete input (`counterexample.json`, `0.15`) that breaks the compiled Rust binary (`rustc -O`), and a patched pure-`u64` Rust implementation (`src/lib.rs`, `0.20`) that our symbolic executor (`rust_symbolic.py`) verifies in Z3 over all `u64` inputs.
 
 ---
 
 ## Challenge Benchmark Suite & Results
 
-By default (`python3 scripts/make-family.py /tmp/security-family`), the benchmark generates **6 non-redundant symmetric pairs (12 Harbor tasks)** spanning a clear difficulty gradient:
-- **[`ruint`](problems/ruint)** (`alloy-rs/ruint` Möller-Granlund 2-by-1 reciprocal division)
-- **[`succinct`](problems/succinct)** (`tov/succinct-rs` Vigna SWAR broadword byte detection)
-- **[`plonky3`](problems/plonky3)** (`Plonky3/Plonky3` BabyBear 64-bit Montgomery reduction)
-- **[`settlement-engine`](problems/settlement-engine)** (Multi-module financial engine with 6 red-herring calculators and an interior carry pocket)
-- **[`whirlpool`](problems/whirlpool)** (`orca-so/whirlpools` 4-limb 128-bit ceiling division)
-- **[`goldilocks`](problems/goldilocks)** (`recmo/goldilocks` 128-bit Goldilocks prime field reduction)
+By default (`python3 scripts/make-family.py /tmp/security-family`), the benchmark generates **6 non-redundant symmetric pairs (12 Harbor tasks)**:
+- **[`ruint`](problems/ruint)**: `alloy-rs/ruint` Möller-Granlund 2-by-1 reciprocal division
+- **[`succinct`](problems/succinct)**: `tov/succinct-rs` Vigna SWAR broadword byte detection
+- **[`plonky3`](problems/plonky3)**: `Plonky3/Plonky3` BabyBear 64-bit Montgomery reduction
+- **[`settlement-engine`](problems/settlement-engine)**: Multi-module financial engine with 6 red-herring calculators and an interior carry pocket
+- **[`whirlpool`](problems/whirlpool)**: `orca-so/whirlpools` 4-limb 128-bit ceiling division
+- **[`goldilocks`](problems/goldilocks)**: `recmo/goldilocks` 128-bit Goldilocks prime field reduction
 
 We evaluate models under a **10-turn default budget (`max_turns=10`)** and an **extended 25-turn budget (`max_turns=25`)**:
 
@@ -40,8 +34,8 @@ We evaluate models under a **10-turn default budget (`max_turns=10`)** and an **
 | **`.safe` tasks (`6` tasks)** | **0.375** (`2.25 / 6`) | **1.000** (`6.00 / 6`) | **0.250** (`1.50 / 6`) | **0.625** (`3.75 / 6`) |
 | **Overall Mean (`12` tasks)** | **0.688** (`8.25 / 12`) | **1.000** (`12.00 / 12`) | **0.625** (`7.50 / 12`) | **0.813** (`9.75 / 12`) |
 
-- **Full specification formulas, per-task token/turn breakdown, and proof/failure trace links:** see **[evidence/v3/VALIDATION.md](evidence/v3/VALIDATION.md)** (or run `python3 scripts/summarize-results.py`).
-- **Verifier architecture and AST lowering details:** see **[BACKEND.md](BACKEND.md)**.
+- **Specification formulas, per-task token/turn breakdown, and proof/failure trace links:** [evidence/v3/VALIDATION.md](evidence/v3/VALIDATION.md)
+- **Verifier architecture and AST lowering details:** [BACKEND.md](BACKEND.md)
 
 ---
 
