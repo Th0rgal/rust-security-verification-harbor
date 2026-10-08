@@ -1,48 +1,66 @@
 # Rust Security Verification Harbor
 
-## Why This Benchmark?
+## Why This Approach Matters
 
-Most security benchmarks either ask a model to guess whether a snippet has a bug, or hand the model a finished formal specification and ask it to fill in a proof.
+Evaluating frontier models on formal security verification faces a fundamental dilemma:
+- **If you hand the model a fixed theorem statement**, you have already done half the security auditor's job: the model immediately knows whether the code is safe or buggy, and does not have to formalize the intended mathematical specification itself.
+- **If you let the model write its own specification (`Spec.lean`) and prove it (`Proof.lean`)**, a naive Lean checker is trivially gamed: a model can write a vacuous specification (`False`), leave the output unconstrained, or copy the buggy fixed-width `u64` code into the specification and prove a 1-line tautology.
 
-This benchmark tests the **complete formal security workflow** on real-world Rust systems code. Every problem comes as a **symmetric pair (`-vulnerable` and `-safe`)** with the **exact same prompt** and passing unit tests—the model is never told whether the code is buggy or sound. Instead, we guide the model through three steps:
+This benchmark solves both problems by combining **symmetric blind task pairs** with a **two-layer formal verification architecture (Lean 4.31 kernel replay + full-domain Z3 semantic equivalence)** that scales to complex, real-world Rust arithmetic kernels.
 
-1. **Write the Specification (`Spec.lean` — `0.25`):** Formalize what the Rust code *should* compute in ideal, unbounded integer arithmetic (where machine overflow and bit-wrapping cannot happen).
-2. **Audit the Implementation (`Audit.lean` + `Proof.lean` — `0.40`):** Compare the 64-bit machine implementation against that specification to determine whether it is **`.safe`** or **`.vulnerable`**, and prove that finding in Lean 4.31.
-3. **Prove or Fix (`0.35`):**
-   - **If `.safe`:** Prove in Lean 4.31 that the implementation matches the specification for **all** $2^{64} \times 2^{64} \times 2^{64}$ inputs.
-   - **If `.vulnerable`:** Provide a concrete input that triggers the bug (`counterexample.json`), **patch the Rust code** (`src/lib.rs`), and pass a full-domain formal equivalence check proving the patched Rust code is universally correct.
+### How the Architecture Works
 
-Every step is **100% automatically verified** inside an isolated offline container (using the Lean 4.31 kernel checker `leanchecker` and Z3 over the full `u64` domain). Model text is never graded.
+Every problem is packaged as two separate Harbor tasks (`-vulnerable` and `-safe`) with **byte-identical instructions** and passing unit tests. For each task, the model must complete three coupled stages inside an offline container:
+
+1. **Formulate the Mathematical Specification (`Spec.lean`, weight `0.25`):**
+   - The model writes `candidateSpec : AuthorizationSpec`, defining in unbounded natural-number arithmetic (`Nat`, where machine overflow cannot occur) when an operation should be accepted and what exact value it should produce.
+   - **How we verify equivalence regardless of how the model writes the spec:** The model is free to express `candidateSpec` using any combination of `let` bindings, helper functions, conditionals, shifts, masks, or modular arithmetic. Inside the verifier container, a Lean 4.31 metaprogram (`SpecAudit.lean`) elaborates `Spec.lean`, unfolds definitions in the kernel environment, and extracts a normalized arithmetic AST. That AST is passed to `spec.py`, which applies **Euclidean quotient/remainder purification** (`a = d * q + r` with `0 <= r < d`, limb/byte decomposition, and interval bound propagation) to query **Z3 (`QF_NIA`) over the entire $2^{64} \times 2^{64} \times 2^{64}$ input space** across four independent facets:
+     1. *Safety* (`accepts -> target_cost <= balance`),
+     2. *Completeness* (`target_cost <= balance -> accepts`),
+     3. *Output exactness & uniqueness* (`accepts /\ output -> total = target_cost`),
+     4. *Non-vacuity & output existence* (rejects empty or contradictory specs).
+   - Because Z3 proves semantic equivalence over all `u64` inputs, any mathematically equivalent formulation gets full credit, while vacuous, under-constrained, or bug-copying specs fail with a concrete counterexample.
+
+2. **Audit the Implementation and Prove the Verdict in Lean 4.31 (`Audit.lean` + `Proof.lean`, weight `0.40`):**
+   - The model declares `verdict : AuditVerdict` (`.safe` or `.vulnerable`, weight `0.15`) and proves `AuditClaim candidateSpec verdict` (weight `0.25`) against the visible Lean model of the Rust implementation (`SecurityChallenge.lean`).
+   - **Why this works for hard bugs:** Production arithmetic bugs often hide in minuscule corner cases (such as an 8,383-wide carry pocket near $2^{64}$, a single `0x80` byte in SWAR broadword logic, or a missing second remainder correction in reciprocal division) that pass standard tests and random fuzzing. Trying to prove a `.vulnerable` implementation `.safe` in Lean 4 immediately gets stuck on the exact failing subgoal, guiding the model to discover the bug and switch to a refutation proof.
+   - **Kernel-level anti-cheating:** `Proof.lean` is compiled in a Landlock + seccomp sandbox (`uid 65534`), replayed from scratch by `leanchecker --fresh`, and audited with `loadExts := false`. Only standard axioms (`propext`, `Classical.choice`, `Quot.sound`) are permitted (`sorry`, custom `axiom`, `native_decide`, and `bv_decide` trust axioms are rejected). On `.safe` tasks, verdict credit is gated on a valid proof so guessing `.safe` scores `0.00`.
+
+3. **Resolve the Finding: Universal Safety or Verified Rust Patch (`counterexample.json` + `src/lib.rs`, weight `0.35`):**
+   - **If `.safe`:** Closing the universal Lean 4.31 proof in Stage 2 certifies that the implementation matches `candidateSpec` across all $2^{64} \times 2^{64} \times 2^{64}$ inputs (and no witness or patch files may be submitted).
+   - **If `.vulnerable`:** The model must submit:
+     - `counterexample.json` (`0.15`): a concrete `(balance, amount, fee)` input verified against the pristine compiled Rust binary (`rustc -O`) to demonstrate a real runtime violation.
+     - `src/lib.rs` (`0.20`): a patched pure-`u64` Rust implementation (`u128` is disallowed in extended problems). Our symbolic Rust executor (`rust_symbolic.py`) parses the patched Rust AST, symbolically executes all control-flow paths, and uses Z3 purification to prove universal equivalence of the patched Rust code over all `u64` inputs, backed by compiled `rustc -O` regression tests.
 
 ---
 
 ## The 6 Challenge Pairs (12 Harbor Tasks)
 
-To apply the same verifier across different domains, each task wraps a real-world 64-bit Rust kernel into a unified `authorize(balance, amount, fee)` gate that authorizes an operation iff its target mathematical cost is $\le \text{balance}$.
+To apply this unified verification pipeline across diverse domains, each problem wraps a real-world 64-bit Rust arithmetic kernel into a common `authorize(balance, amount, fee) -> Option<Authorization>` entry point that authorizes an operation iff its target mathematical cost is $\le \text{balance}$.
 
-By default (`python3 scripts/make-family.py /tmp/security-family`), the benchmark generates **6 non-redundant symmetric pairs (12 tasks)** spanning a clear difficulty gradient:
+By default (`python3 scripts/make-family.py /tmp/security-family`), the generator emits **6 non-redundant symmetric pairs (12 Harbor tasks)** spanning a broad gradient of domain and proof complexity:
 
-| Pair (`-vulnerable` / `-safe`) | Origin & Domain | Target Specification (What the code should compute) | The Bug in `.vulnerable` (Fixed in `.safe`) |
+| Pair (`-vulnerable` / `-safe`) | Origin & Domain | Target Specification (Unbounded `Nat`) | Bug in `.vulnerable` (Fixed in `.safe`) |
 |---|---|---|---|
-| **[`ruint`](problems/ruint)** | `alloy-rs/ruint` — Multiprecision Division | $\lfloor \text{amount}/2 \rfloor + \lfloor (((\text{fee} \bmod 32771) \cdot 2^{16} + (\text{amount} \bmod 2^{16})) / 32771 \rfloor$ | Möller-Granlund 2-by-1 reciprocal division (`div_2x1_mg10`) omits the second remainder correction `if r_corr >= D`, under-estimating the quotient by `1` on a narrow band of inputs. |
-| **[`succinct`](problems/succinct)** | `tov/succinct-rs` — Non-Web3 SWAR Bitmaps | $\lfloor \text{amount}/2 \rfloor + (\text{sum of bytes of } \text{fee}) + 256 \times (\text{count of non-zero bytes of } \text{fee})$ | Vigna's broadword non-zero byte detector `(((x \| H8) - L8) \| x) & H8` omits `\| x`, silently treating every `0x80` (`128`) byte as zero. |
-| **[`plonky3`](problems/plonky3)** | `Plonky3/Plonky3` — ZK BabyBear Field ($P = 2\,013\,265\,921$) | $\text{amount} + (((\text{amount} \bmod 2^{32}) + (\text{fee} \bmod P) \cdot 2^{32}) \cdot 943\,718\,400 \bmod P)$ | 64-bit Montgomery reduction adds `(1 << 32) - P` instead of `P` in the unsigned underflow branch after shifting by 32 bits. |
-| **[`settlement-engine`](problems/settlement-engine)** | Multi-Module Settlement Engine (~330 lines Rust, 6 modules) | $\text{amount} + (\lceil (\text{amount}+\text{fee})/10\,000 \rceil - \lfloor \lceil (\text{amount}+\text{fee})/10\,000 \rceil / 10 \rfloor)$ | Pure-`u64` carry folding across 3 modules is exact at `u64::MAX`, but under-computes the fee by `1` inside a narrow high-sum pocket ($2^{64}-9\,999 \le \text{amount}+\text{fee} \le 2^{64}-1\,617$), surrounded by 6 sound helper functions acting as realistic noise. |
-| **[`whirlpool`](problems/whirlpool)** | `orca-so/whirlpools` — DeFi 128-bit Ceiling Division | $\lfloor \text{amount}/2 \rfloor + \lceil (\text{amount} + \text{fee} \cdot 2^{64}) / 1\,000\,000 \rceil$ | 4-limb base-$2^{32}$ ceiling division drops the `w1 → w2` carry when rounding up `q0 = 2^32 - 1, q1 = 2^32 - 1` with non-zero remainder. |
-| **[`goldilocks`](problems/goldilocks)** | `recmo/goldilocks` — ZK Goldilocks Field ($P = 2^{64}-2^{32}+1$) | $\lfloor \text{amount}/2 \rfloor + ((\text{amount} + \text{fee} \cdot 2^{64}) \bmod P)$ | 128-bit prime reduction checks `> P` instead of `>= P` in the final canonicalization step, leaving `r = P` unreduced. |
+| **[`ruint`](problems/ruint)** | `alloy-rs/ruint` (Multiprecision Division) | $\lfloor \text{amount}/2 \rfloor + \lfloor (((\text{fee} \bmod 32771) \cdot 2^{16} + (\text{amount} \bmod 2^{16})) / 32771 \rfloor$ | Möller-Granlund 2-by-1 reciprocal division (`div_2x1_mg10`, `D = 0x8003`, `V = 0xFFF4`) omits the second conditional remainder correction `if r_corr >= D`, under-estimating the quotient by `1` when `r_corr` falls in `[D, 2D)`. |
+| **[`succinct`](problems/succinct)** | `tov/succinct-rs` (Non-Web3 SWAR Bitmaps) | $\lfloor \text{amount}/2 \rfloor + (\text{sum of bytes of } \text{fee}) + 256 \times (\text{count of non-zero bytes of } \text{fee})$ | Vigna's SWAR broadword non-zero byte detector `(((x \| H8) - L8) \| x) & H8` omits `\| x`, silently treating every byte equal to `0x80` (`128`) as zero. |
+| **[`plonky3`](problems/plonky3)** | `Plonky3/Plonky3` (ZK BabyBear Field, $P = 2\,013\,265\,921$) | $\text{amount} + (((\text{amount} \bmod 2^{32}) + (\text{fee} \bmod P) \cdot 2^{32}) \cdot 943\,718\,400 \bmod P)$ | 64-bit Montgomery reduction (`MU = 2_281_701_377`) adds `(1 << 32) - P` instead of `P` in the unsigned underflow branch after shifting by 32 bits. |
+| **[`settlement-engine`](problems/settlement-engine)** | Multi-Module Settlement Engine (~330 lines Rust, 6 modules) | $\text{amount} + (\lceil (\text{amount}+\text{fee})/10\,000 \rceil - \lfloor \lceil (\text{amount}+\text{fee})/10\,000 \rceil / 10 \rfloor)$ | Pure-`u64` carry folding across 3 modules is exact at `u64::MAX`, but under-computes the fee by `1` inside an interior pocket ($2^{64}-9\,999 \le \text{amount}+\text{fee} \le 2^{64}-1\,617$), surrounded by 6 sound sibling calculators acting as realistic noise. |
+| **[`whirlpool`](problems/whirlpool)** | `orca-so/whirlpools` (DeFi 128-bit Ceiling Division) | $\lfloor \text{amount}/2 \rfloor + \lceil (\text{amount} + \text{fee} \cdot 2^{64}) / 1\,000\,000 \rceil$ | 4-limb base-$2^{32}$ ceiling division drops the `w1 -> w2` carry when rounding up `q0 = 2^32 - 1, q1 = 2^32 - 1` with non-zero remainder, wrapping a $2^{64}$ quotient to `0`. |
+| **[`goldilocks`](problems/goldilocks)** | `recmo/goldilocks` (ZK Goldilocks Field, $P = 2^{64}-2^{32}+1$) | $\lfloor \text{amount}/2 \rfloor + ((\text{amount} + \text{fee} \cdot 2^{64}) \bmod P)$ | Two-step 128-bit Goldilocks reduction checks `> P` instead of `>= P` in the final canonicalization step, leaving a single unreduced residue `r = P`. |
 
-*(Note: Passing `--problem all` also generates 4 simpler calibration pairs—`authorization`, `settlement`, `settlement-modular`, and `openpql`—used in our regression suite `scripts/selftest.py`.)*
+*(Passing `--problem all` also generates 4 auxiliary calibration pairs (`authorization`, `settlement`, `settlement-modular`, and `openpql`) used in the full 20-variant regression suite `scripts/selftest.py`.)*
 
 ---
 
 ## Benchmark Results (`10` Turns Default vs. `25` Turns Extended)
 
-We set the default benchmark budget to **10 turns (`max_turns=10`)**, which is a reasonable budget for an agent to specify, audit, and patch a task. We also ran an extended evaluation at **25 turns (`max_turns=25`)** to give models extra headroom and observe whether they can eventually close the hardest Lean 4 proofs:
+We set the default benchmark horizon to **10 turns (`max_turns=10`)**, which is a practical budget for an agent to specify, audit, and patch a task. To measure each model's asymptotic formal-proof capability without turn truncation, we also ran an extended evaluation at **25 turns (`max_turns=25`)**:
 
-- **Finding & patching bugs (`.vulnerable`) is fast:** Within **10 turns**, both **Claude Opus 5.5 (`high`)** and **GPT 6.1 Sol (`high`)** solve **6/6 `.vulnerable` tasks (`1.000`)**—formalizing the spec, proving the refutation, finding a counterexample, and patching the Rust code.
-- **Proving universal safety (`.safe`) is the real differentiator:**
-  - At **10 turns (default)**, **Claude Opus 5.5** closes **2/6** `.safe` proofs (**`0.688` overall**), while **GPT 6.1 Sol** closes **0/6** (**`0.625` overall**, earning only the `0.25` specification credit on `.safe` tasks).
-  - At **25 turns (extended)**, **Claude Opus 5.5** closes **6/6** `.safe` proofs (**`1.000` overall**), whereas **GPT 6.1 Sol** closes **3/6** (**`0.813` overall**), failing on `ruint-safe`, `succinct-safe`, and `plonky3-safe`.
+- **Refuting and patching `.vulnerable` tasks (`6/6` solved within 10 turns):** Both **Claude Opus 5.5 (`high`)** and **GPT 6.1 Sol (`high`)** achieve **`1.000`** across all 6 `.vulnerable` tasks within 10 turns (formalizing `Spec.lean`, proving the refutation in `Proof.lean`, extracting `counterexample.json`, and writing a Z3-verified Rust patch in `src/lib.rs`).
+- **Proving universal safety on `.safe` tasks (the core differentiator):**
+  - At **10 turns (default)**, **Claude Opus 5.5** closes **2/6** universal `.safe` proofs (**`0.688` overall**), while **GPT 6.1 Sol** closes **0/6** (**`0.625` overall**, earning only the `0.25` specification credit on `.safe` tasks).
+  - At **25 turns (extended)**, **Claude Opus 5.5** closes **6/6** universal `.safe` proofs (**`1.000` overall**), whereas **GPT 6.1 Sol** closes **3/6** (**`0.813` overall**), failing at `0.25` on the three hardest non-linear/bitwise proofs (`ruint-safe`, `succinct-safe`, and `plonky3-safe`).
 
 | Summary (12 Challenge Tasks) | Claude Opus 5.5 (`high`) @ **10T** | Claude Opus 5.5 (`high`) @ **25T** | GPT 6.1 Sol (`high`) @ **10T** | GPT 6.1 Sol (`high`) @ **25T** |
 |---|---:|---:|---:|---:|
@@ -95,4 +113,4 @@ docker run --rm --network none -v "$PWD:/repo" -e VERIFIER_ROOT=/opt/security-ve
   security-verifier:v3 python3 /repo/scripts/selftest.py
 ```
 
-For full details on the verifier architecture and anti-cheating checks, see [BACKEND.md](BACKEND.md) and [evidence/v3/VALIDATION.md](evidence/v3/VALIDATION.md).
+For full details on the verifier implementation, AST lowering, and anti-cheating checks, see [BACKEND.md](BACKEND.md) and [evidence/v3/VALIDATION.md](evidence/v3/VALIDATION.md).
