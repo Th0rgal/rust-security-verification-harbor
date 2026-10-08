@@ -49,14 +49,30 @@ variable-divisor `Nat.div`/`Nat.mod`, Euclidean Z3 purification for large/variab
 divisors, and bitwise/shift/tuple-destructuring Rust symbolic semantics.
 
 All 20 reference solutions and skeletons pass `scripts/selftest.py` (`selftest v3: PASS`,
-recorded in `evidence/v3/*-reference.json`). Full Harbor 0.9.0 evaluations across
-all 18 benchmarked tasks (`36` trials total across `settlement*`, `goldilocks`,
-`whirlpool`, `plonky3`, `succinct`, `openpql`, `ruint`) were completed for
-`claude-opus-5-5` (18/18 at `1.00`, mean `1.000`) and `gpt-6.1-sol-high`
-(15/18 at `1.00`, mean `0.875`), which scored `0.25` on three `.safe` universal
-Lean 4 proof tasks:
-- `plonky3-safe`: exhausted 25 turns on the 64-bit BabyBear Montgomery reduction Lean proof (`by sorry`).
-- `succinct-safe` (Non-Web3 SWAR broadword kernel from `tov/succinct-rs`): exhausted 25 turns and left a `bv_decide` helper rejected by the transitive axiom auditor (`count_correct._native.bv_decide.ax_1_5`).
-- `ruint-safe` (Web3 Möller-Granlund 2-by-1 normalized division kernel from `alloy-rs/ruint`): exhausted 25 turns unable to discharge the universal `omega` proof over the reciprocal approximation (`D = 32771`, `V = 65524`).
+recorded in `evidence/v3/*-reference.json`).
+
+## Challenge Benchmark curation and 10-turn default horizon (2026-10-08)
+
+To provide a non-redundant difficulty gradient without easy or duplicate tasks,
+`scripts/make-family.py` and `scripts/harbor-smoke.py` now default to `--problem challenge`,
+which generates the **6 core Challenge pairs (`12` Harbor tasks)**:
+`settlement-engine`, `goldilocks`, `whirlpool`, `plonky3`, `succinct`, and `ruint`
+(while `--problem all` retains `authorization`, `settlement`, `settlement-modular`,
+and `openpql` for regression testing).
+
+The recommended default agent budget is **`max_turns=10`** (`recommended_max_turns = 10`
+in `task/task.toml`), paired with an extended **`max_turns=25`** analysis:
+- **At 10 turns (`max_turns=10`)**: Both `claude-opus-5-5` and `gpt-6.1-sol-high` solve
+  `6/6` `.vulnerable` tasks (`1.000`), but on `.safe` universal Lean 4 proof tasks
+  `claude-opus-5-5` scores `0.375` (`2.25/6`, overall mean `0.688`) and `gpt-6.1-sol-high`
+  scores `0.250` (`1.50/6`, overall mean `0.625`).
+- **At 25 turns (`max_turns=25`)**: `claude-opus-5-5` solves `12/12` Challenge tasks (`1.000`,
+  and `18/18` across all benchmarked tasks), whereas `gpt-6.1-sol-high` reaches `0.813`
+  (`9.75/12` on the Challenge suite, `15/18` overall), failing at `0.25` on three `.safe`
+  universal Lean 4 proof tasks:
+  - `plonky3-safe`: exhausted 25 turns on the 64-bit BabyBear Montgomery reduction Lean proof (`by sorry`).
+  - `succinct-safe` (Non-Web3 SWAR broadword kernel from `tov/succinct-rs`): exhausted 25 turns and left a `bv_decide` helper rejected by the transitive axiom auditor (`count_correct._native.bv_decide.ax_1_5`).
+  - `ruint-safe` (Web3 Möller-Granlund 2-by-1 normalized division kernel from `alloy-rs/ruint`): exhausted 25 turns unable to discharge the universal `omega` proof over the reciprocal approximation (`D = 32771`, `V = 65524`).
+
 
 

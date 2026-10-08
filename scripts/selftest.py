@@ -180,7 +180,7 @@ def main():
         # trusted APIs must remain readable through this temporary parent.
         raw.chmod(0o755)
         family=raw/'family'
-        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--build-api'],check=True)
+        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem','all','--build-api'],check=True)
 
         # Settlement-specific Rust & Lean checks across isolation levels
         settlement_safe_rs=(ROOT/'problems/settlement/safe/lib.rs').read_text()
