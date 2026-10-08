@@ -707,7 +707,7 @@ def check(source, problem='authorization'):
     is_extended = (
         problem == 'settlement'
         or problem.startswith('settlement-')
-        or problem in ('goldilocks', 'whirlpool', 'plonky3')
+        or problem in ('goldilocks', 'whirlpool', 'plonky3', 'succinct', 'openpql', 'ruint')
     )
     consts, structs, funcs, names, body = Parser(
         source, allow_u128=not is_extended, allow_modules=is_extended

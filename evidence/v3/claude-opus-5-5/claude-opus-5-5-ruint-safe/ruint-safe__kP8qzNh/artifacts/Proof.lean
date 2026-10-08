@@ -1,0 +1,1 @@
+SpecAux.conforms_thm

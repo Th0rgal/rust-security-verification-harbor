@@ -1,0 +1,517 @@
+[?2004hroot@27e4dcb10dc1:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@27e4dcb10dc1:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@27e4dcb10dc1:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod broadword {
+    pub const L8: u64 = 0x0101_0101_0101_0101u64;
+    pub const H8: u64 = 0x8080_8080_8080_8080u64;
+    pub const M16: u64 = 0x00FF_00FF_00FF_00FFu64;
+    pub const L16: u64 = 0x0001_0001_0001_0001u64;
+
+    /// Vigna's SWAR broadword non-zero byte indicator (`tov/succinct-rs` `src/broadword.rs`):
+    /// Sets bit `8*i + 7` iff byte `i` of `x` is non-zero.
+    #[inline]
+    pub fn u_nz8(x: u64) -> u64 {
+        ((x | H8) - L8) & H8
+    }
+
+    /// Count non-zero bytes in `x` in parallel using SWAR multiplication by `L8`.
+    #[inline]
+    pub fn count_nz_bytes(x: u64) -> u64 {
+        ((u_nz8(x) >> 7u64).wrapping_mul(L8)) >> 56u64
+    }
+
+    /// Sum all 8 bytes of `x` in parallel using 16-bit lane folding and `L16`.
+    #[inline]
+    pub fn sum_bytes(x: u64) -> u64 {
+        let pairs: u64 = (x & M16) + ((x >> 8u64) & M16);
+        (pairs.wrapping_mul(L16) >> 48u64) & 0xFFFFu64
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::broadword;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SuccinctQuote {
+        pub principal_share: u64,
+        pub active_bytes: u64,
+        pub byte_sum: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<SuccinctQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let active_bytes: u64 = broadword::count_nz_bytes(fee);
+        let byte_sum: u64 = broadword::sum_bytes(fee);
+        let total_debit: u64 = principal_share + (active_bytes << 8u64) + byte_sum;
+        Some(SuccinctQuote {
+            principal_share,
+            active_bytes,
+            byte_sum,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: SuccinctQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Succinct SWAR broadword byte-schedule settlement against `balance`.
+///
+/// In exact integer arithmetic, let the 8 bytes of `fee` be
+/// `b_i = (fee >> (8 * i)) & 0xFF` for `i in {0, ..., 7}`:
+/// - `active_bytes = sum_{i=0..7} (if b_i > 0 then 1 else 0)`
+/// - `byte_sum = sum_{i=0..7} b_i`
+/// - `total_debit = floor(amount / 2) + 256 * active_bytes + byte_sum`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::SuccinctQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn low_bit_bytes_are_counted_and_summed() {
+        assert_eq!(
+            authorize(565, 100, 0x0201),
+            Some(Authorization { total_debit: 565 })
+        );
+        assert_eq!(authorize(564, 100, 0x0201), None);
+    }
+
+    #[test]
+    fn full_low_bits_across_all_bytes() {
+        assert_eq!(
+            authorize(2056, 0, broadword::L8),
+            Some(Authorization { total_debit: 2056 })
+        );
+    }
+}
+[?2004hroot@27e4dcb10dc1:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004lnamespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def l8Mask : UInt64 := 0x0101010101010101
+def h8Mask : UInt64 := 0x8080808080808080
+def m16Mask : UInt64 := 0x00FF00FF00FF00FF
+def l16Mask : UInt64 := 0x0001000100010001
+
+structure SuccinctQuote where
+  principalShare : UInt64
+  activeBytes : UInt64
+  byteSum : UInt64
+  totalDebit : UInt64
+
+def uNz8 (x : UInt64) : UInt64 :=
+  ((x ||| h8Mask) - l8Mask) &&& h8Mask
+
+def countNzBytes (x : UInt64) : UInt64 :=
+  (((uNz8 x) >>> 7) * l8Mask) >>> 56
+
+def sumBytes (x : UInt64) : UInt64 :=
+  let pairs := (x &&& m16Mask) + ((x >>> 8) &&& m16Mask)
+  ((pairs * l16Mask) >>> 48) &&& 0xFFFF
+
+def buildQuote (amount fee : UInt64) : Option SuccinctQuote :=
+  let principalShare := amount >>> 1
+  let activeBytes := countNzBytes fee
+  let byteSum := sumBytes fee
+  let totalDebit := principalShare + (activeBytes <<< 8) + byteSum
+  some {
+    principalShare := principalShare,
+    activeBytes := activeBytes,
+    byteSum := byteSum,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : SuccinctQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@27e4dcb10dc1:/workspace# cat /workspace/lean/check.py; ls -la /workspace/lean /workspace/challenge /workspace/submission
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+/workspace/challenge:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  8 11:09 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  159 Oct  5 19:59 Cargo.lock
+-rw-r--r-- 1 root root   97 Oct  5 19:59 Cargo.toml
+drwxr-xr-x 2 root root 4096 Oct  8 11:09 [01;34msrc[0m
+drwxr-xr-x 3 root root 4096 Oct  8 11:09 [01;34mtarget[0m
+
+/workspace/lean:
+total 172
+drwxr-xr-x 1 root root   4096 Oct  8 11:09 [01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2043 Oct  8 11:09 SecurityChallenge.lean
+-rw-r--r-- 1 root root 151080 Oct  8 11:09 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  7 08:20 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+
+/workspace/submission:
+total 24
+drwxr-xr-x 1 root root 4096 Oct  8 11:09 [01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  8 11:09 [01;34msrc[0m
+[?2004hroot@27e4dcb10dc1:/workspace# cat /workspace/submission/Spec.lean /workspace/submission/Audit.lean /workspace/submission/Proof.lean; cat /workspace/challenge/Cargo.toml; lean --version
+[?2004limport SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[?2004hroot@27e4dcb10dc1:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> namespace PaymentPolicy
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Extract each byte as an exact natural number, independently of SWAR.
+[?2004l[?2004h> def feeByte (fee : UInt64) (i : Nat) : Nat :=
+[?2004l[?2004h>   (fee.toNat / (256 ^ i)) % 256
+[?2004l[?2004h> 
+[?2004l[?2004h> def active (b : Nat) : Nat := if b = 0 then 0 else 1
+[?2004l[?2004h> 
+[?2004l[?2004h> def activeBytes (fee : UInt64) : Nat :=
+[?2004l[?2004h>   active (feeByte fee 0) + active (feeByte fee 1) +
+[?2004l[?2004h>   active (feeByte fee 2) + active (feeByte fee 3) +
+[?2004l[?2004h>   active (feeByte fee 4) + active (feeByte fee 5) +
+[?2004l[?2004h>   active (feeByte fee 6) + active (feeByte fee 7)
+[?2004l[?2004h> 
+[?2004l[?2004h> def byteSum (fee : UInt64) : Nat :=
+[?2004l[?2004h>   feeByte fee 0 + feeByte fee 1 + feeByte fee 2 + feeByte fee 3 +
+[?2004l[?2004h>   feeByte fee 4 + feeByte fee 5 + feeByte fee 6 + feeByte fee 7
+[?2004l[?2004h> 
+[?2004l[?2004h> -- Settlement arithmetic is exact, not arithmetic modulo 2^64.
+[?2004l[?2004h> def debit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 + 256 * activeBytes fee + byteSum fee
+[?2004l[?2004h> 
+[?2004l[?2004h> end PaymentPolicy
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : SecurityChallenge.AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee =>
+[?2004l[?2004h>     PaymentPolicy.debit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun _balance amount fee totalDebit =>
+[?2004l[?2004h>     totalDebit.toNat = PaymentPolicy.debit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+[?2004l[?2004h>   intro h
+[?2004l[?2004h>   have actual : SecurityChallenge.challengeAuthorize 128 0 128 = some 128 := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   have rejected : ¬ candidateSpec.accepts 128 0 128 := by
+[?2004l[?2004h>     decide
+[?2004l[?2004h>   exact rejected ((h.1 128 0 128).mp ⟨128, actual⟩)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# cat > /workspace/submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance":128,"amount":0,"fee":128}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# mkdir -p /workspace/submission/src
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# cp /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p = '/workspace/submission/src/lib.rs'
+[?2004l[?2004h> s = open(p).read().replace('((x | H8) - L8) & H8', '(((x | H8) - L8) | x) & H8')
+[?2004l[?2004h> open(p, 'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateProof.lean:14:4: error: failed to synthesize
+  Decidable ¬candidateSpec.accepts 128 0 128
+
+Hint: Additional diagnostic information may be available using the `set_option diagnostics true` command.
+[?2004hroot@27e4dcb10dc1:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p = '/workspace/submission/src/lib.rs'
+[?2004l[?2004h> s = open(p).read()
+[?2004l[?2004h> s = s.replace("/// Vigna's SWAR broadword non-zero byte indicator (`tov/succinct-rs` `src/broadword.rs`):", "/// SWAR non-zero byte indicator, retaining original high bits as well:")
+[?2004l[?2004h> s += '''
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod regression_tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn high_bit_only_bytes_are_nonzero() {
+[?2004l[?2004h>         assert_eq!(authorize(128, 0, 128), None);
+[?2004l[?2004h>         for i in 0..8 {
+[?2004l[?2004h>             let fee = 128u64 << (8 * i);
+[?2004l[?2004h>             assert_eq!(authorize(383, 0, fee), None);
+[?2004l[?2004h>             assert_eq!(authorize(384, 0, fee), Some(Authorization { total_debit: 384 }));
+[?2004l[?2004h>         }
+[?2004l[?2004h>         assert_eq!(authorize(3072, 0, broadword::H8), Some(Authorization { total_debit: 3072 }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn maximum_fee_and_principal_remain_exact() {
+[?2004l[?2004h>         let total = (u64::MAX / 2) + 4088;
+[?2004l[?2004h>         assert_eq!(authorize(total, u64::MAX, u64::MAX), Some(Authorization { total_debit: total }));
+[?2004l[?2004h>         assert_eq!(authorize(total - 1, u64::MAX, u64::MAX), None);
+[?2004l[?2004h>         assert_eq!(authorize(4088, 0, u64::MAX), Some(Authorization { total_debit: 4088 }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> '''
+[?2004l[?2004h> open(p, 'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# rustc --edition=2021 --test /workspace/submission/src/lib.rs -o /tmp/authorization-tests && /tmp/authorization-tests
+[?2004l
+running 5 tests
+test regression_tests::high_bit_only_bytes_are_nonzero ... [32mok[m
+test regression_tests::maximum_fee_and_principal_remain_exact ... [32mok[m
+test tests::full_low_bits_across_all_bytes ... [32mok[m
+test tests::low_bit_bytes_are_counted_and_summed ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@27e4dcb10dc1:/workspace# cat > /tmp/authorization-reference.rs <<'EOF'
+[?2004l[?2004h> include!("/workspace/submission/src/lib.rs");
+[?2004l[?2004h> 
+[?2004l[?2004h> fn check(amount: u64, fee: u64) {
+[?2004l[?2004h>     let mut debit = (amount as u128) / 2;
+[?2004l[?2004h>     for i in 0..8 {
+[?2004l[?2004h>         let byte = (fee >> (8 * i)) & 255;
+[?2004l[?2004h>         debit += byte as u128;
+[?2004l[?2004h>         if byte != 0 { debit += 256; }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     assert!(debit <= u64::MAX as u128);
+[?2004l[?2004h>     let debit = debit as u64;
+[?2004l[?2004h>     assert_eq!(authorize(debit, amount, fee), Some(Authorization { total_debit: debit }));
+[?2004l[?2004h>     assert_eq!(authorize(u64::MAX, amount, fee), Some(Authorization { total_debit: debit }));
+[?2004l[?2004h>     if debit != 0 { assert_eq!(authorize(debit - 1, amount, fee), None); }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     for i in 0..8 {
+[?2004l[?2004h>         for byte in 0u64..256 {
+[?2004l[?2004h>             for amount in [0, 1, 2, u64::MAX - 1, u64::MAX] {
+[?2004l[?2004h>                 check(amount, byte << (8 * i));
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     for fee in [0, broadword::L8, broadword::H8, u64::MAX, 0x7f7f7f7f7f7f7f7f] {
+[?2004l[?2004h>         check(u64::MAX, fee);
+[?2004l[?2004h>     }
+[?2004l[?2004h>     let mut state = 0x9e3779b97f4a7c15u64;
+[?2004l[?2004h>     for _ in 0..100_000 {
+[?2004l[?2004h>         state ^= state << 13;
+[?2004l[?2004h>         state ^= state >> 7;
+[?2004l[?2004h>         state ^= state << 17;
+[?2004l[?2004h>         check(state.rotate_left(29), state);
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("Wider-arithmetic reference comparisons passed");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# rustc --edition=2021 /tmp/authorization-reference.rs -o /tmp/authorization-reference && /tmp/authorization-reference
+[?2004lWider-arithmetic reference comparisons passed
+[?2004hroot@27e4dcb10dc1:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p = '/workspace/submission/Proof.lean'
+[?2004l[?2004h> s = open(p).read().replace('have rejected : ¬ candidateSpec.accepts 128 0 128 := by\n    decide', 'have rejected : ¬ candidateSpec.accepts 128 0 128 := by\n    change ¬ ((384 : Nat) ≤ 128)\n    decide')
+[?2004l[?2004h> open(p, 'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@27e4dcb10dc1:/workspace# python3 /workspace/lean/check.py
+[?2004lfind /workspace/submission -maxdepth 2 -type f -print; cat /workspace/submission/Proof.lean; diff -u /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs
+[?2004hroot@27e4dcb10dc1:/workspace# find /workspace/submission -maxdepth 2 -type f -print; cat /workspace/submission/Proof.lean; diff -u /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs
+[?2004l/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src/lib.rs
+/workspace/submission/counterexample.json
+by
+  change ¬ SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize
+  intro h
+  have actual : SecurityChallenge.challengeAuthorize 128 0 128 = some 128 := by
+    decide
+  have rejected : ¬ candidateSpec.accepts 128 0 128 := by
+    change ¬ ((384 : Nat) ≤ 128)
+    decide
+  exact rejected ((h.1 128 0 128).mp ⟨128, actual⟩)
+--- /workspace/challenge/src/lib.rs	2026-10-08 11:09:16.000000000 +0000
++++ /workspace/submission/src/lib.rs	2026-10-08 11:20:26.967132568 +0000
+@@ -9,11 +9,11 @@
+     pub const M16: u64 = 0x00FF_00FF_00FF_00FFu64;
+     pub const L16: u64 = 0x0001_0001_0001_0001u64;
+ 
+-    /// Vigna's SWAR broadword non-zero byte indicator (`tov/succinct-rs` `src/broadword.rs`):
++    /// SWAR non-zero byte indicator, retaining original high bits as well:
+     /// Sets bit `8*i + 7` iff byte `i` of `x` is non-zero.
+     #[inline]
+     pub fn u_nz8(x: u64) -> u64 {
+-        ((x | H8) - L8) & H8
++        (((x | H8) - L8) | x) & H8
+     }
+ 
+     /// Count non-zero bytes in `x` in parallel using SWAR multiplication by `L8`.
+@@ -109,3 +109,27 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod regression_tests {
++    use super::*;
++
++    #[test]
++    fn high_bit_only_bytes_are_nonzero() {
++        assert_eq!(authorize(128, 0, 128), None);
++        for i in 0..8 {
++            let fee = 128u64 << (8 * i);
++            assert_eq!(authorize(383, 0, fee), None);
++            assert_eq!(authorize(384, 0, fee), Some(Authorization { total_debit: 384 }));
++        }
++        assert_eq!(authorize(3072, 0, broadword::H8), Some(Authorization { total_debit: 3072 }));
++    }
++
++    #[test]
++    fn maximum_fee_and_principal_remain_exact() {
++        let total = (u64::MAX / 2) + 4088;
++        assert_eq!(authorize(total, u64::MAX, u64::MAX), Some(Authorization { total_debit: total }));
++        assert_eq!(authorize(total - 1, u64::MAX, u64::MAX), None);
++        assert_eq!(authorize(4088, 0, u64::MAX), Some(Authorization { total_debit: 4088 }));
++    }
++}
+[?2004hroot@27e4dcb10dc1:/workspace# 

@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 ROOT=Path(__file__).resolve().parents[1]
-PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3')
+PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3','succinct','openpql','ruint')
 p=argparse.ArgumentParser()
 p.add_argument('output',type=Path)
 p.add_argument('--problem',choices=('all',)+PROBLEMS,default='all',help='which task family to generate')

@@ -1,0 +1,1192 @@
+[?2004hroot@abe121926f29:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@abe121926f29:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@abe121926f29:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mixed_radix {
+    pub const RADIX_MASK: u64 = 0xFFFFu64;
+    pub const SHIFT_16: u64 = 16u64;
+    pub const SHIFT_32: u64 = 32u64;
+    pub const SHIFT_48: u64 = 48u64;
+
+    #[inline]
+    pub fn clamp_digit(a: u64, b: u64) -> u64 {
+        if a < b {
+            a
+        } else {
+            b - 1u64
+        }
+    }
+
+    /// Encode a 4-level mixed-radix coordinate `(d0, d1, d2, d3)` with radices
+    /// `(b0, b1, b2, b3)` in `[1, 65536]` extracted from `fee` (`waugh_indexer::MixedRadix`).
+    /// Since `d_i <= b_i - 1`, the encoded index satisfies
+    /// `d0 * b1 * b2 * b3 + d1 * b2 * b3 + d2 * b3 + d3 <= b0 * b1 * b2 * b3 - 1 <= 2^64 - 1`.
+    #[inline]
+    pub fn encode(amount: u64, fee: u64) -> u64 {
+        let b0: u64 = (fee & RADIX_MASK) + 1u64;
+        let b1: u64 = ((fee >> SHIFT_16) & RADIX_MASK) + 1u64;
+        let b2: u64 = ((fee >> SHIFT_32) & RADIX_MASK) + 1u64;
+        let b3: u64 = ((fee >> SHIFT_48) & RADIX_MASK) + 1u64;
+        let a0: u64 = amount & RADIX_MASK;
+        let a1: u64 = (amount >> SHIFT_16) & RADIX_MASK;
+        let a2: u64 = (amount >> SHIFT_32) & RADIX_MASK;
+        let a3: u64 = (amount >> SHIFT_48) & RADIX_MASK;
+        let d0: u64 = clamp_digit(a0, b0);
+        let d1: u64 = clamp_digit(a1, b1);
+        let d2: u64 = clamp_digit(a2, b2);
+        let d3: u64 = clamp_digit(a3, b3);
+        let o2: u64 = b3;
+        let o1: u64 = b2 * o2;
+        let o0: u64 = b1 * o1;
+        d0 * o0 + d1 * o1 + d2 * o2 + d3
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mixed_radix;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OpenPqlQuote {
+        pub principal_share: u64,
+        pub encoded_idx: u64,
+        pub index_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<OpenPqlQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let encoded_idx: u64 = mixed_radix::encode(amount, fee);
+        let index_surcharge: u64 = encoded_idx >> 1u64;
+        let total_debit: u64 = principal_share + index_surcharge;
+        Some(OpenPqlQuote {
+            principal_share,
+            encoded_idx,
+            index_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: OpenPqlQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize an OpenPQL 4-level mixed-radix settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - For `i in {0, 1, 2, 3}`:
+///   - `b_i = ((fee >> (16 * i)) & 0xFFFF) + 1` in `[1, 65536]`
+///   - `a_i = (amount >> (16 * i)) & 0xFFFF` in `[0, 65535]`
+///   - `d_i = min(a_i, b_i - 1)`
+/// - Suffix-product offsets: `o2 = b3`, `o1 = b2 * o2`, `o0 = b1 * o1`
+/// - `encoded_idx = d0 * o0 + d1 * o1 + d2 * o2 + d3`
+/// - `total_debit = floor(amount / 2) + floor(encoded_idx / 2)`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::OpenPqlQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_mixed_radix_coordinates_match_policy() {
+        // fee = 0x0003_0003_0003_0003 -> b_i = 4 for all i, o2 = 4, o1 = 16, o0 = 64
+        // amount = 0x0001_0002_0001_0002 -> d0 = 2, d1 = 1, d2 = 2, d3 = 1
+        // encoded_idx = 2*64 + 1*16 + 2*4 + 1 = 153
+        // total_debit = (281483566710786 / 2) + (153 / 2) = 140741783355393 + 76 = 140741783355469
+        let fee: u64 = 0x0003_0003_0003_0003;
+        let amount: u64 = 0x0001_0002_0001_0002;
+        assert_eq!(
+            authorize(140_741_783_355_469, amount, fee),
+            Some(Authorization {
+                total_debit: 140_741_783_355_469
+            })
+        );
+        assert_eq!(authorize(140_741_783_355_468, amount, fee), None);
+    }
+
+    #[test]
+    fn clamps_digits_to_radix_minus_one() {
+        // fee = 0 -> all b_i = 1 -> all d_i = 0 -> encoded_idx = 0
+        assert_eq!(
+            authorize(50, 100, 0),
+            Some(Authorization { total_debit: 50 })
+        );
+    }
+}
+[?2004hroot@abe121926f29:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def radixBase : UInt64 := 65536
+def shift16 : UInt64 := 65536
+def shift32 : UInt64 := 4294967296
+def shift48 : UInt64 := 281474976710656
+def halfDivisor : UInt64 := 2
+
+structure OpenPqlQuote where
+  principalShare : UInt64
+  encodedIdx : UInt64
+  indexSurcharge : UInt64
+  totalDebit : UInt64
+
+def clampDigit (a b : UInt64) : UInt64 :=
+  if a < b then a else b - 1
+
+def encodeMixedRadix (amount fee : UInt64) : UInt64 :=
+  let b0 := (fee % radixBase) + 1
+  let b1 := ((fee / shift16) % radixBase) + 1
+  let b2 := ((fee / shift32) % radixBase) + 1
+  let b3 := ((fee / shift48) % radixBase) + 1
+  let a0 := amount % radixBase
+  let a1 := (amount / shift16) % radixBase
+  let a2 := (amount / shift32) % radixBase
+  let a3 := (amount / shift48) % radixBase
+  let d0 := clampDigit a0 b0
+  let d1 := clampDigit a1 b1
+  let d2 := clampDigit a2 b2
+  let d3 := clampDigit a3 b3
+  let o2 := b3
+  let o1 := b2 * o2
+  let o0 := b1 * o1
+  d0 * o0 + d1 * o1 + d2 * o2 + d3
+
+def buildQuote (amount fee : UInt64) : Option OpenPqlQuote :=
+  let principalShare := amount / halfDivisor
+  let encodedIdx := encodeMixedRadix amount fee
+  let indexSurcharge := encodedIdx / halfDivisor
+  let totalDebit := principalShare + indexSurcharge
+  some {
+    principalShare := principalShare,
+    encodedIdx := encodedIdx,
+    indexSurcharge := indexSurcharge,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : OpenPqlQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@abe121926f29:/workspace# cat /workspace/lean/check.py; ls -la /workspace/lean; ls -la /workspace/submission
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+total 180
+drwxr-xr-x 1 root root   4096 Oct  8 11:10 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2544 Oct  8 11:09 SecurityChallenge.lean
+-rw-r--r-- 1 root root 157024 Oct  8 11:10 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  7 08:20 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+total 24
+drwxr-xr-x 1 root root 4096 Oct  8 11:10 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  8 11:10 [01;34msrc[0m
+[?2004hroot@abe121926f29:/workspace# cat /workspace/lean/SecurityChallenge.lean; cat /workspace/submission/{Spec,Audit,Proof}.lean; cat /workspace/lean/Signature.lean; ls /opt/rvb-deps
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def radixBase : UInt64 := 65536
+def shift16 : UInt64 := 65536
+def shift32 : UInt64 := 4294967296
+def shift48 : UInt64 := 281474976710656
+def halfDivisor : UInt64 := 2
+
+structure OpenPqlQuote where
+  principalShare : UInt64
+  encodedIdx : UInt64
+  indexSurcharge : UInt64
+  totalDebit : UInt64
+
+def clampDigit (a b : UInt64) : UInt64 :=
+  if a < b then a else b - 1
+
+def encodeMixedRadix (amount fee : UInt64) : UInt64 :=
+  let b0 := (fee % radixBase) + 1
+  let b1 := ((fee / shift16) % radixBase) + 1
+  let b2 := ((fee / shift32) % radixBase) + 1
+  let b3 := ((fee / shift48) % radixBase) + 1
+  let a0 := amount % radixBase
+  let a1 := (amount / shift16) % radixBase
+  let a2 := (amount / shift32) % radixBase
+  let a3 := (amount / shift48) % radixBase
+  let d0 := clampDigit a0 b0
+  let d1 := clampDigit a1 b1
+  let d2 := clampDigit a2 b2
+  let d3 := clampDigit a3 b3
+  let o2 := b3
+  let o1 := b2 * o2
+  let o0 := b1 * o1
+  d0 * o0 + d1 * o1 + d2 * o2 + d3
+
+def buildQuote (amount fee : UInt64) : Option OpenPqlQuote :=
+  let principalShare := amount / halfDivisor
+  let encodedIdx := encodeMixedRadix amount fee
+  let indexSurcharge := encodedIdx / halfDivisor
+  let totalDebit := principalShare + indexSurcharge
+  some {
+    principalShare := principalShare,
+    encodedIdx := encodedIdx,
+    indexSurcharge := indexSurcharge,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : OpenPqlQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+[0m[01;34mpackages[0m  requirements-verifier.txt
+[?2004hroot@abe121926f29:/workspace# lean --version; lean --print-prefix; grep -nE 'toNat_(add|mul|div|shiftRight|and)|toNat_lt|lt_iff_toNat|le_iff_toNat' $(lean --print-prefix)/src/lean/Init/Data/UInt/Lemmas.lean
+[?2004lLean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+/opt/lean
+[32m[K69[m[K[36m[K:[m[K  theorem [01;31m[Kle_iff_toNat[m[K_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+[32m[K71[m[K[36m[K:[m[K  theorem [01;31m[Klt_iff_toNat[m[K_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+[32m[K138[m[K[36m[K:[m[K  @[simp] protected theorem [01;31m[KtoNat_add[m[K (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.[01;31m[KtoNat_add[m[K ..
+[32m[K142[m[K[36m[K:[m[K  @[simp] protected theorem [01;31m[KtoNat_mul[m[K (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.[01;31m[KtoNat_mul[m[K  ..
+[32m[K146[m[K[36m[K:[m[K  @[simp] protected theorem [01;31m[KtoNat_div[m[K (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+[32m[K150[m[K[36m[K:[m[K  protected theorem [01;31m[KtoNat_lt[m[K_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+[32m[K152[m[K[36m[K:[m[K  open $typeName (toNat_mod [01;31m[KtoNat_lt[m[K_size) in
+[32m[K159[m[K[36m[K:[m[K      · apply [01;31m[KtoNat_lt[m[K_size
+[32m[K197[m[K[36m[K:[m[K    simp [Nat.mod_eq_of_lt x.[01;31m[KtoNat_lt[m[K_size]
+[32m[K279[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K281[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K283[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K285[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K288[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K290[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K292[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K294[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K297[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K299[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K301[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K303[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K306[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K308[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K310[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K312[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K315[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K317[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, toNat_ofNat_of_lt' h]
+[32m[K319[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K321[m[K[36m[K:[m[K  rw [[01;31m[Kle_iff_toNat[m[K_le, toNat_ofNat_of_lt' h]
+[32m[K329[m[K[36m[K:[m[K@[simp] theorem UInt8.[01;31m[KtoNat_lt[m[K (n : UInt8) : n.toNat < 2 ^ 8 := n.toFin.isLt
+[32m[K330[m[K[36m[K:[m[K@[simp] theorem UInt16.[01;31m[KtoNat_lt[m[K (n : UInt16) : n.toNat < 2 ^ 16 := n.toFin.isLt
+[32m[K331[m[K[36m[K:[m[K@[simp] theorem UInt32.[01;31m[KtoNat_lt[m[K (n : UInt32) : n.toNat < 2 ^ 32 := n.toFin.isLt
+[32m[K332[m[K[36m[K:[m[K@[simp] theorem UInt64.[01;31m[KtoNat_lt[m[K (n : UInt64) : n.toNat < 2 ^ 64 := n.toFin.isLt
+[32m[K345[m[K[36m[K:[m[Ktheorem USize.[01;31m[KtoNat_lt[m[K_two_pow_numBits (n : USize) : n.toNat < 2 ^ System.Platform.numBits := n.toFin.isLt
+[32m[K346[m[K[36m[K:[m[K@[simp] theorem USize.[01;31m[KtoNat_lt[m[K (n : USize) : n.toNat < 2 ^ 64 := Nat.lt_of_lt_of_le n.toFin.isLt size_le
+[32m[K350[m[K[36m[K:[m[Ktheorem UInt8.[01;31m[KtoNat_lt[m[K_usizeSize (n : UInt8) : n.toNat < USize.size :=
+[32m[K351[m[K[36m[K:[m[K  Nat.lt_of_lt_of_le n.[01;31m[KtoNat_lt[m[K (by cases USize.size_eq <;> simp_all)
+[32m[K352[m[K[36m[K:[m[Ktheorem UInt16.[01;31m[KtoNat_lt[m[K_usizeSize (n : UInt16) : n.toNat < USize.size :=
+[32m[K353[m[K[36m[K:[m[K  Nat.lt_of_lt_of_le n.[01;31m[KtoNat_lt[m[K (by cases USize.size_eq <;> simp_all)
+[32m[K354[m[K[36m[K:[m[Ktheorem UInt32.[01;31m[KtoNat_lt[m[K_usizeSize (n : UInt32) : n.toNat < USize.size :=
+[32m[K355[m[K[36m[K:[m[K  Nat.lt_of_lt_of_le n.[01;31m[KtoNat_lt[m[K (by cases USize.size_eq <;> simp_all)
+[32m[K380[m[K[36m[K:[m[K@[simp] theorem UInt8.toNat_mod_size (n : UInt8) : n.toNat % UInt8.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K
+[32m[K381[m[K[36m[K:[m[K@[simp] theorem UInt8.toNat_mod_uInt16Size (n : UInt8) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide))
+[32m[K382[m[K[36m[K:[m[K@[simp] theorem UInt8.toNat_mod_uInt32Size (n : UInt8) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide))
+[32m[K383[m[K[36m[K:[m[K@[simp] theorem UInt8.toNat_mod_uInt64Size (n : UInt8) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide))
+[32m[K384[m[K[36m[K:[m[K@[simp] theorem UInt8.toNat_mod_uSizeSize (n : UInt8) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K_usizeSize
+[32m[K386[m[K[36m[K:[m[K@[simp] theorem UInt16.toNat_mod_size (n : UInt16) : n.toNat % UInt16.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K
+[32m[K387[m[K[36m[K:[m[K@[simp] theorem UInt16.toNat_mod_uInt32Size (n : UInt16) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide))
+[32m[K388[m[K[36m[K:[m[K@[simp] theorem UInt16.toNat_mod_uInt64Size (n : UInt16) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide))
+[32m[K389[m[K[36m[K:[m[K@[simp] theorem UInt16.toNat_mod_uSizeSize (n : UInt16) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K_usizeSize
+[32m[K391[m[K[36m[K:[m[K@[simp] theorem UInt32.toNat_mod_size (n : UInt32) : n.toNat % UInt32.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K
+[32m[K392[m[K[36m[K:[m[K@[simp] theorem UInt32.toNat_mod_uInt64Size (n : UInt32) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide))
+[32m[K393[m[K[36m[K:[m[K@[simp] theorem UInt32.toNat_mod_uSizeSize (n : UInt32) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K_usizeSize
+[32m[K395[m[K[36m[K:[m[K@[simp] theorem UInt64.toNat_mod_size (n : UInt64) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K
+[32m[K397[m[K[36m[K:[m[K@[simp] theorem USize.toNat_mod_size (n : USize) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K_size
+[32m[K398[m[K[36m[K:[m[K@[simp] theorem USize.toNat_mod_uInt64Size (n : USize) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.[01;31m[KtoNat_lt[m[K
+[32m[K476[m[K[36m[K:[m[K@[simp] theorem UInt8.ofNatLT_toNat (n : UInt8) : UInt8.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K = n := (rfl)
+[32m[K477[m[K[36m[K:[m[K@[simp] theorem UInt16.ofNatLT_uInt8ToNat (n : UInt8) : UInt16.ofNatLT n.toNat (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide)) = n.toUInt16 := (rfl)
+[32m[K478[m[K[36m[K:[m[K@[simp] theorem UInt32.ofNatLT_uInt8ToNat (n : UInt8) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide)) = n.toUInt32 := (rfl)
+[32m[K479[m[K[36m[K:[m[K@[simp] theorem UInt64.ofNatLT_uInt8ToNat (n : UInt8) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide)) = n.toUInt64 := (rfl)
+[32m[K480[m[K[36m[K:[m[K@[simp] theorem USize.ofNatLT_uInt8ToNat (n : UInt8) : USize.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K_usizeSize = n.toUSize := (rfl)
+[32m[K482[m[K[36m[K:[m[K@[simp] theorem UInt16.ofNatLT_toNat (n : UInt16) : UInt16.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K = n := (rfl)
+[32m[K483[m[K[36m[K:[m[K@[simp] theorem UInt32.ofNatLT_uInt16ToNat (n : UInt16) : UInt32.ofNatLT n.toNat (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide)) = n.toUInt32 := (rfl)
+[32m[K484[m[K[36m[K:[m[K@[simp] theorem UInt64.ofNatLT_uInt16ToNat (n : UInt16) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide)) = n.toUInt64 := (rfl)
+[32m[K485[m[K[36m[K:[m[K@[simp] theorem USize.ofNatLT_uInt16ToNat (n : UInt16) : USize.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K_usizeSize = n.toUSize := (rfl)
+[32m[K487[m[K[36m[K:[m[K@[simp] theorem UInt32.ofNatLT_toNat (n : UInt32) : UInt32.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K = n := (rfl)
+[32m[K488[m[K[36m[K:[m[K@[simp] theorem UInt64.ofNatLT_uInt32ToNat (n : UInt32) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.[01;31m[KtoNat_lt[m[K (by decide)) = n.toUInt64 := (rfl)
+[32m[K489[m[K[36m[K:[m[K@[simp] theorem USize.ofNatLT_uInt32ToNat (n : UInt32) : USize.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K_usizeSize = n.toUSize := (rfl)
+[32m[K491[m[K[36m[K:[m[K@[simp] theorem UInt64.ofNatLT_toNat (n : UInt64) : UInt64.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K = n := (rfl)
+[32m[K493[m[K[36m[K:[m[K@[simp] theorem USize.ofNatLT_toNat (n : USize) : USize.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K_size = n := (rfl)
+[32m[K494[m[K[36m[K:[m[K@[simp] theorem UInt64.ofNatLT_uSizeToNat (n : USize) : UInt64.ofNatLT n.toNat n.[01;31m[KtoNat_lt[m[K = n.toUInt64 := (rfl)
+[32m[K663[m[K[36m[K:[m[K  rw [UInt8.ofNatClamp_eq_ofNat] <;> simp [n.[01;31m[KtoNat_lt[m[K]
+[32m[K667[m[K[36m[K:[m[K  exact Nat.lt_trans (n.[01;31m[KtoNat_lt[m[K) (by decide)
+[32m[K669[m[K[36m[K:[m[K  rw [UInt16.ofNatClamp_eq_ofNat] <;> simp [n.[01;31m[KtoNat_lt[m[K]
+[32m[K673[m[K[36m[K:[m[K  exact Nat.lt_trans (n.[01;31m[KtoNat_lt[m[K) (by decide)
+[32m[K676[m[K[36m[K:[m[K  exact Nat.lt_trans (n.[01;31m[KtoNat_lt[m[K) (by decide)
+[32m[K678[m[K[36m[K:[m[K  rw [UInt32.ofNatClamp_eq_ofNat] <;> simp [n.[01;31m[KtoNat_lt[m[K]
+[32m[K682[m[K[36m[K:[m[K  exact Nat.lt_trans (n.[01;31m[KtoNat_lt[m[K) (by decide)
+[32m[K685[m[K[36m[K:[m[K  exact Nat.lt_trans (n.[01;31m[KtoNat_lt[m[K) (by decide)
+[32m[K688[m[K[36m[K:[m[K  exact Nat.lt_trans (n.[01;31m[KtoNat_lt[m[K) (by decide)
+[32m[K690[m[K[36m[K:[m[K  rw [UInt64.ofNatClamp_eq_ofNat] <;> simp [n.[01;31m[KtoNat_lt[m[K]
+[32m[K693[m[K[36m[K:[m[K  exact n.[01;31m[KtoNat_lt[m[K
+[32m[K697[m[K[36m[K:[m[K  exact n.[01;31m[KtoNat_lt[m[K_usizeSize
+[32m[K700[m[K[36m[K:[m[K  exact n.[01;31m[KtoNat_lt[m[K_usizeSize
+[32m[K703[m[K[36m[K:[m[K  exact n.[01;31m[KtoNat_lt[m[K_usizeSize
+[32m[K705[m[K[36m[K:[m[K  rw [USize.ofNatClamp_eq_ofNat] <;> simp [n.[01;31m[KtoNat_lt[m[K_size]
+[32m[K858[m[K[36m[K:[m[K  next h => rw [Nat.mod_eq_of_lt (h ▸ n.[01;31m[KtoNat_lt[m[K_size), USize.toNat_ofNat,
+[32m[K1922[m[K[36m[K:[m[Ktheorem UInt64.toUSize_div_of_[01;31m[KtoNat_lt[m[K (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) :
+[32m[K1969[m[K[36m[K:[m[K  · have ha' := h ▸ a.[01;31m[KtoNat_lt[m[K_size
+[32m[K1970[m[K[36m[K:[m[K    have hb' := h ▸ b.[01;31m[KtoNat_lt[m[K_size
+[32m[K1983[m[K[36m[K:[m[K  · have ha' := h ▸ a.[01;31m[KtoNat_lt[m[K_size
+[32m[K1984[m[K[36m[K:[m[K    have hb' := h ▸ b.[01;31m[KtoNat_lt[m[K_size
+[32m[K1997[m[K[36m[K:[m[Ktheorem UInt64.toUSize_mod_of_[01;31m[KtoNat_lt[m[K (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) : (a % b).toUSize = a.toUSize % b.toUSize :=
+[32m[K2104[m[K[36m[K:[m[K  have := Nat.mod_eq_of_lt a.[01;31m[KtoNat_lt[m[K_two_pow_numBits
+[32m[K2105[m[K[36m[K:[m[K  have := Nat.mod_eq_of_lt b.[01;31m[KtoNat_lt[m[K_two_pow_numBits
+[32m[K2128[m[K[36m[K:[m[K  have := Nat.mod_eq_of_lt b.[01;31m[KtoNat_lt[m[K_two_pow_numBits
+[32m[K2172[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt16.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2174[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt32.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2176[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt64.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2178[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, USize.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2181[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt32.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2183[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt64.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2185[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, USize.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2188[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt64.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2190[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, USize.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2193[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt64.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2196[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt8.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2198[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt8.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2200[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt8.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2202[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt8.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2205[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt16.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2207[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt16.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2209[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt16.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2212[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, UInt32.[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2215[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K2218[m[K[36m[K:[m[K  simp only [USize.[01;31m[Klt_iff_toNat[m[K_lt, toNat_toUSize, [01;31m[Klt_iff_toNat[m[K_lt, UInt64.toNat_mod, toNat_ofNat', Nat.reducePow]
+[32m[K2222[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt16.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2224[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt32.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2226[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt64.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2228[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, USize.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2231[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt32.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2233[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt64.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2235[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, USize.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2238[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt64.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2240[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, USize.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2243[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt64.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2246[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt8.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2248[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt8.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2250[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt8.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2252[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt8.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2255[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt16.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2257[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt16.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2259[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt16.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2262[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt32.[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2265[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le]
+[32m[K2268[m[K[36m[K:[m[K  simp only [USize.[01;31m[Kle_iff_toNat[m[K_le, toNat_toUSize, [01;31m[Kle_iff_toNat[m[K_le, UInt64.toNat_mod]
+[32m[K2566[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_add[m[K h₁ h₂]
+[32m[K2575[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_add[m[K h₁ h₂]
+[32m[K2584[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_add[m[K h₁ h₂]
+[32m[K2593[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_add[m[K h₁ h₂]
+[32m[K2617[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ two_pow_numBits_nonneg, Int.[01;31m[KtoNat_add[m[K h₁ h₂]
+[32m[K2714[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_mul[m[K h₁ h₂]
+[32m[K2723[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_mul[m[K h₁ h₂]
+[32m[K2732[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_mul[m[K h₁ h₂]
+[32m[K2741[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ (by decide), Int.[01;31m[KtoNat_mul[m[K h₁ h₂]
+[32m[K2751[m[K[36m[K:[m[K  rw [Int.toNat_emod h₃ two_pow_numBits_nonneg, Int.[01;31m[KtoNat_mul[m[K h₁ h₂]
+[32m[K2875[m[K[36m[K:[m[Ktheorem USize.zero_lt_one : (0 : USize) < 1 := by simp [[01;31m[Klt_iff_toNat[m[K_lt]
+[32m[K3350[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le] using Nat.le_of_lt
+[32m[K3352[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le] using Nat.le_of_lt
+[32m[K3354[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le] using Nat.le_of_lt
+[32m[K3356[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le] using Nat.le_of_lt
+[32m[K3358[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le] using Nat.le_of_lt
+[32m[K3361[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt8.toNat_inj] using Nat.lt_of_le_of_ne
+[32m[K3363[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt16.toNat_inj] using Nat.lt_of_le_of_ne
+[32m[K3365[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt32.toNat_inj] using Nat.lt_of_le_of_ne
+[32m[K3367[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt64.toNat_inj] using Nat.lt_of_le_of_ne
+[32m[K3369[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← USize.toNat_inj] using Nat.lt_of_le_of_ne
+[32m[K3372[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt8.toNat_inj] using Nat.lt_iff_le_and_ne
+[32m[K3374[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt16.toNat_inj] using Nat.lt_iff_le_and_ne
+[32m[K3376[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt32.toNat_inj] using Nat.lt_iff_le_and_ne
+[32m[K3378[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← UInt64.toNat_inj] using Nat.lt_iff_le_and_ne
+[32m[K3380[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le, ← USize.toNat_inj] using Nat.lt_iff_le_and_ne
+[32m[K3479[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_le_of_lt
+[32m[K3481[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_le_of_lt
+[32m[K3483[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_le_of_lt
+[32m[K3485[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_le_of_lt
+[32m[K3487[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_le_of_lt
+[32m[K3490[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_lt_of_le
+[32m[K3492[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_lt_of_le
+[32m[K3494[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_lt_of_le
+[32m[K3496[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_lt_of_le
+[32m[K3498[m[K[36m[K:[m[K  simpa [[01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.lt_of_lt_of_le
+[32m[K3501[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, ← UInt8.toNat_inj] using Nat.lt_or_lt_of_ne
+[32m[K3503[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, ← UInt16.toNat_inj] using Nat.lt_or_lt_of_ne
+[32m[K3505[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, ← UInt32.toNat_inj] using Nat.lt_or_lt_of_ne
+[32m[K3507[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, ← UInt64.toNat_inj] using Nat.lt_or_lt_of_ne
+[32m[K3509[m[K[36m[K:[m[K  simpa [[01;31m[Klt_iff_toNat[m[K_lt, ← USize.toNat_inj] using Nat.lt_or_lt_of_ne
+[32m[K3512[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le]; omega
+[32m[K3514[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le]; omega
+[32m[K3516[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le]; omega
+[32m[K3518[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le]; omega
+[32m[K3520[m[K[36m[K:[m[K  simp [[01;31m[Klt_iff_toNat[m[K_lt, [01;31m[Kle_iff_toNat[m[K_le]; omega
+[32m[K3535[m[K[36m[K:[m[K  simpa [← UInt8.toNat_inj, [01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.le_iff_lt_or_eq
+[32m[K3537[m[K[36m[K:[m[K  simpa [← UInt16.toNat_inj, [01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.le_iff_lt_or_eq
+[32m[K3539[m[K[36m[K:[m[K  simpa [← UInt32.toNat_inj, [01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.le_iff_lt_or_eq
+[32m[K3541[m[K[36m[K:[m[K  simpa [← UInt64.toNat_inj, [01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.le_iff_lt_or_eq
+[32m[K3543[m[K[36m[K:[m[K  simpa [← USize.toNat_inj, [01;31m[Kle_iff_toNat[m[K_le, [01;31m[Klt_iff_toNat[m[K_lt] using Nat.le_iff_lt_or_eq
+[32m[K3552[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt8.toNat_sub_of_le _ _ hab]
+[32m[K3554[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt16.toNat_sub_of_le _ _ hab]
+[32m[K3556[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt32.toNat_sub_of_le _ _ hab]
+[32m[K3558[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, UInt64.toNat_sub_of_le _ _ hab]
+[32m[K3560[m[K[36m[K:[m[K  simp [[01;31m[Kle_iff_toNat[m[K_le, USize.toNat_sub_of_le _ _ hab]
+[32m[K3563[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, UInt8.toNat_sub_of_le _ _ hab]
+[32m[K3564[m[K[36m[K:[m[K  refine Nat.sub_lt ?_ (UInt8.[01;31m[Klt_iff_toNat[m[K_lt.1 hb)
+[32m[K3565[m[K[36m[K:[m[K  exact UInt8.[01;31m[Klt_iff_toNat[m[K_lt.1 (UInt8.lt_of_lt_of_le hb hab)
+[32m[K3567[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, UInt16.toNat_sub_of_le _ _ hab]
+[32m[K3568[m[K[36m[K:[m[K  refine Nat.sub_lt ?_ (UInt16.[01;31m[Klt_iff_toNat[m[K_lt.1 hb)
+[32m[K3569[m[K[36m[K:[m[K  exact UInt16.[01;31m[Klt_iff_toNat[m[K_lt.1 (UInt16.lt_of_lt_of_le hb hab)
+[32m[K3571[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, UInt32.toNat_sub_of_le _ _ hab]
+[32m[K3572[m[K[36m[K:[m[K  refine Nat.sub_lt ?_ (UInt32.[01;31m[Klt_iff_toNat[m[K_lt.1 hb)
+[32m[K3573[m[K[36m[K:[m[K  exact UInt32.[01;31m[Klt_iff_toNat[m[K_lt.1 (UInt32.lt_of_lt_of_le hb hab)
+[32m[K3575[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, UInt64.toNat_sub_of_le _ _ hab]
+[32m[K3576[m[K[36m[K:[m[K  refine Nat.sub_lt ?_ (UInt64.[01;31m[Klt_iff_toNat[m[K_lt.1 hb)
+[32m[K3577[m[K[36m[K:[m[K  exact UInt64.[01;31m[Klt_iff_toNat[m[K_lt.1 (UInt64.lt_of_lt_of_le hb hab)
+[32m[K3579[m[K[36m[K:[m[K  rw [[01;31m[Klt_iff_toNat[m[K_lt, USize.toNat_sub_of_le _ _ hab]
+[32m[K3580[m[K[36m[K:[m[K  refine Nat.sub_lt ?_ (USize.[01;31m[Klt_iff_toNat[m[K_lt.1 hb)
+[32m[K3581[m[K[36m[K:[m[K  exact USize.[01;31m[Klt_iff_toNat[m[K_lt.1 (USize.lt_of_lt_of_le hb hab)
+[?2004hroot@abe121926f29:/workspace# find /opt/rvb-deps -path '*/Mathlib/Tactic.olean'; sed -n '130,155p' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean; grep -n 'toNat_sub_of_le' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head; ls -la /workspace/submission/src
+[?2004l/opt/rvb-deps/packages/mathlib/.lake/build/lib/lean/Mathlib/Tactic.olean
+cat > /workspace/submission/Spec.lean <<'EOF'
+import SecurityChallenge
+import Mathlib.Tactic
+open SecurityChallenge
+
+/-- The four base-65536 components, interpreted in exact natural arithmetic. -/
+def component (n divisor : Nat) : Nat := (n / divisor) % 65536
+
+def policyDigit (a b : Nat) : Nat := if a < b then a else b - 1
+
+/-- The clamped mixed-radix index, with no word-level arithmetic. -/
+def policyIndex (amount fee : Nat) : Nat :=
+  let b0 := component fee 1 + 1
+  let b1 := component fee 65536 + 1
+  let b2 := component fee 4294967296 + 1
+  let b3 := component fee 281474976710656 + 1
+  let d0 := policyDigit (component amount 1) b0
+  let d1 := policyDigit (component amount 65536) b1
+  let d2 := policyDigit (component amount 4294967296) b2
+  let d3 := policyDigit (component amount 281474976710656) b3
+  d0 * (b1 * (b2 * b3)) + d1 * (b2 * b3) + d2 * b3 + d3
+
+/-- Exact settlement debit: principal share plus index surcharge. -/
+def policyDebit (amount fee : Nat) : Nat :=
+  amount / 2 + policyIndex amount fee / 2
+
+def candidateSpec : AuthorizationSpec where
+  accepts balance amount fee := policyDebit amount.toNat fee.toNat ≤ balance.toNat
+  output balance amount fee totalDebit :=
+    policyDebit amount.toNat fee.toNat ≤ balance.toNat ∧
+    totalDebit.toNat = policyDebit amount.toNat fee.toNat
+EOF
+cat > /workspace/submission/Audit.lean <<'EOF'
+import SecurityChallenge
+open SecurityChallenge
+
+def verdict : AuditVerdict := .safe
+EOF
+cat > /workspace/submission/Proof.lean <<'EOF'
+by
+  have component_bound (n k : Nat) : component n k < 65536 := by
+    unfold component
+    exact Nat.mod_lt _ (by decide)
+  have radix_nat (x : UInt64) : ((x % radixBase) + 1).toNat = x.toNat % 65536 + 1 := by
+    have h := Nat.mod_lt x.toNat (show 0 < 65536 by decide)
+    simp [radixBase, UInt64.toNat_add, UInt64.toNat_mod, Nat.mod_eq_of_lt (show x.toNat % 65536 + 1 < 2^64 by omega)]
+  have clamp_nat (x y : UInt64) (hy : 0 < y.toNat) :
+      (clampDigit x y).toNat = policyDigit x.toNat y.toNat := by
+    unfold clampDigit policyDigit
+    simp only [UInt64.lt_iff_toNat_lt]
+    split
+    · rfl
+    · rw [UInt64.toNat_sub_of_le]
+      · simp
+      · change 1 ≤ y.toNat
+        omega
+  have pack_bound (x p y q : Nat) (hx : x < p) (hy : y < q) : x*q+y < p*q := by
+    nlinarith
+  have digit_bound (a b : Nat) (hb : 0 < b) : policyDigit a b < b := by
+    unfold policyDigit
+    split <;> omega
+  have index_bound (a f : Nat) : policyIndex a f < 2^64 := by
+    let b0 := component f 1 + 1
+    let b1 := component f 65536 + 1
+    let b2 := component f 4294967296 + 1
+    let b3 := component f 281474976710656 + 1
+    let d0 := policyDigit (component a 1) b0
+    let d1 := policyDigit (component a 65536) b1
+    let d2 := policyDigit (component a 4294967296) b2
+    let d3 := policyDigit (component a 281474976710656) b3
+    have hb0 : b0 ≤ 65536 := by dsimp [b0]; have := component_bound f 1; omega
+    have hb1 : b1 ≤ 65536 := by dsimp [b1]; have := component_bound f 65536; omega
+    have hb2 : b2 ≤ 65536 := by dsimp [b2]; have := component_bound f 4294967296; omega
+    have hb3 : b3 ≤ 65536 := by dsimp [b3]; have := component_bound f 281474976710656; omega
+    have hd0 : d0 < b0 := digit_bound _ _ (by dsimp [b0]; omega)
+    have hd1 : d1 < b1 := digit_bound _ _ (by dsimp [b1]; omega)
+    have hd2 : d2 < b2 := digit_bound _ _ (by dsimp [b2]; omega)
+    have hd3 : d3 < b3 := digit_bound _ _ (by dsimp [b3]; omega)
+    have h01 := pack_bound d0 b0 d1 b1 hd0 hd1
+    have h012 := pack_bound _ _ d2 b2 h01 hd2
+    have h0123 := pack_bound _ _ d3 b3 h012 hd3
+    have hp : b0*b1*b2*b3 ≤ 2^64 := by
+      calc
+        b0*b1*b2*b3 ≤ 65536*65536*65536*65536 :=
+          Nat.mul_le_mul (Nat.mul_le_mul (Nat.mul_le_mul hb0 hb1) hb2) hb3
+        _ = 2^64 := by norm_num
+    have he : policyIndex a f = ((d0*b1+d1)*b2+d2)*b3+d3 := by
+      change d0*(b1*(b2*b3))+d1*(b2*b3)+d2*b3+d3 = _
+      ring
+    rw [he]
+    omega
+  have index_nat (a f : UInt64) : (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat := by
+    sorry
+  have debit_nat (a f : UInt64) :
+      (a /  open $typeName (ne_of_toBitVec_ne) in
+  protected theorem ne_of_lt {a b : $typeName} (h : a < b) : a ≠ b := by
+    apply ne_of_toBitVec_ne
+    apply BitVec.ne_of_lt
+    simpa [lt_iff_toBitVec_lt] using h
+
+  @[simp] protected theorem toNat_zero : (0 : $typeName).toNat = 0 := Nat.zero_mod _
+
+  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+
+  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+
+  @[simp] protected theorem toNat_mul (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.toNat_mul  ..
+
+  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+
+  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+
+  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+
+  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+
+  open $typeName (toNat_mod toNat_lt_size) in
+  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+    intro u h1
+    by_cases h2 : m < size
+148:  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+3552:  simp [le_iff_toNat_le, UInt8.toNat_sub_of_le _ _ hab]
+3554:  simp [le_iff_toNat_le, UInt16.toNat_sub_of_le _ _ hab]
+3556:  simp [le_iff_toNat_le, UInt32.toNat_sub_of_le _ _ hab]
+3558:  simp [le_iff_toNat_le, UInt64.toNat_sub_of_le _ _ hab]
+3560:  simp [le_iff_toNat_le, USize.toNat_sub_of_le _ _ hab]
+3563:  rw [lt_iff_toNat_lt, UInt8.toNat_sub_of_le _ _ hab]
+3567:  rw [lt_iff_toNat_lt, UInt16.toNat_sub_of_le _ _ hab]
+3571:  rw [lt_iff_toNat_lt, UInt32.toNat_sub_of_le _ _ hab]
+3575:  rw [lt_iff_toNat_lt, UInt64.toNat_sub_of_le _ _ hab]
+total 8
+drwxr-xr-x 2 root root 4096 Oct  8 11:10 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  8 11:10 [01;34m..[0m
+[?2004hroot@abe121926f29:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Mathlib.Tactic
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- The four base-65536 components, interpreted in exact natural arithmetic. -/
+[?2004l[?2004h> def component (n divisor : Nat) : Nat := (n / divisor) % 65536
+[?2004l[?2004h> 
+[?2004l[?2004h> def policyDigit (a b : Nat) : Nat := if a < b then a else b - 1
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- The clamped mixed-radix index, with no word-level arithmetic. -/
+[?2004l[?2004h> def policyIndex (amount fee : Nat) : Nat :=
+[?2004l[?2004h>   let b0 := component fee 1 + 1
+[?2004l[?2004h>   let b1 := component fee 65536 + 1
+[?2004l[?2004h>   let b2 := component fee 4294967296 + 1
+[?2004l[?2004h>   let b3 := component fee 281474976710656 + 1
+[?2004l[?2004h>   let d0 := policyDigit (component amount 1) b0
+[?2004l[?2004h>   let d1 := policyDigit (component amount 65536) b1
+[?2004l[?2004h>   let d2 := policyDigit (component amount 4294967296) b2
+[?2004l[?2004h>   let d3 := policyDigit (component amount 281474976710656) b3
+[?2004l[?2004h>   d0 * (b1 * (b2 * b3)) + d1 * (b2 * b3) + d2 * b3 + d3
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Exact settlement debit: principal share plus index surcharge. -/
+[?2004l[?2004h> def policyDebit (amount fee : Nat) : Nat :=
+[?2004l[?2004h>   amount / 2 + policyIndex amount fee / 2
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts balance amount fee := policyDebit amount.toNat fee.toNat ≤ balance.toNat
+[?2004l[?2004h>   output balance amount fee totalDebit :=
+[?2004l[?2004h>     policyDebit amount.toNat fee.toNat ≤ balance.toNat ∧
+[?2004l[?2004h>     totalDebit.toNat = policyDebit amount.toNat fee.toNat
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@abe121926f29:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@abe121926f29:/workspace# cat > /workspace/submission/Proof.lean <<'EOF'
+[?2004l[?2004h> by
+[?2004l[?2004h>   have component_bound (n k : Nat) : component n k < 65536 := by
+[?2004l[?2004h>     unfold component
+[?2004l[?2004h>     exact Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   have radix_nat (x : UInt64) : ((x % radixBase) + 1).toNat = x.toNat % 65536 + 1 := by
+[?2004l[?2004h>     have h := Nat.mod_lt x.toNat (show 0 < 65536 by decide)
+[?2004l[?2004h>     simp [radixBase, UInt64.toNat_add, UInt64.toNat_mod, Nat.mod_eq_of_lt (show x.toNat % 65536 + 1 < 2^64 by omega)]
+[?2004l[?2004h>   have clamp_nat (x y : UInt64) (hy : 0 < y.toNat) :
+[?2004l[?2004h>       (clampDigit x y).toNat = policyDigit x.toNat y.toNat := by
+[?2004l[?2004h>     unfold clampDigit policyDigit
+[?2004l[?2004h>     simp only [UInt64.lt_iff_toNat_lt]
+[?2004l[?2004h>     split
+[?2004l[?2004h>     · rfl
+[?2004l[?2004h>     · rw [UInt64.toNat_sub_of_le]
+[?2004l[?2004h>       · simp
+[?2004l[?2004h>       · change 1 ≤ y.toNat
+[?2004l[?2004h>         omega
+[?2004l[?2004h>   have pack_bound (x p y q : Nat) (hx : x < p) (hy : y < q) : x*q+y < p*q := by
+[?2004l[?2004h>     nlinarith
+[?2004l[?2004h>   have digit_bound (a b : Nat) (hb : 0 < b) : policyDigit a b < b := by
+[?2004l[?2004h>     unfold policyDigit
+[?2004l[?2004h>     split <;> omega
+[?2004l[?2004h>   have index_bound (a f : Nat) : policyIndex a f < 2^64 := by
+[?2004l[?2004h>     let b0 := component f 1 + 1
+[?2004l[?2004h>     let b1 := component f 65536 + 1
+[?2004l[?2004h>     let b2 := component f 4294967296 + 1
+[?2004l[?2004h>     let b3 := component f 281474976710656 + 1
+[?2004l[?2004h>     let d0 := policyDigit (component a 1) b0
+[?2004l[?2004h>     let d1 := policyDigit (component a 65536) b1
+[?2004l[?2004h>     let d2 := policyDigit (component a 4294967296) b2
+[?2004l[?2004h>     let d3 := policyDigit (component a 281474976710656) b3
+[?2004l[?2004h>     have hb0 : b0 ≤ 65536 := by dsimp [b0]; have := component_bound f 1; omega
+[?2004l[?2004h>     have hb1 : b1 ≤ 65536 := by dsimp [b1]; have := component_bound f 65536; omega
+[?2004l[?2004h>     have hb2 : b2 ≤ 65536 := by dsimp [b2]; have := component_bound f 4294967296; omega
+[?2004l[?2004h>     have hb3 : b3 ≤ 65536 := by dsimp [b3]; have := component_bound f 281474976710656; omega
+[?2004l[?2004h>     have hd0 : d0 < b0 := digit_bound _ _ (by dsimp [b0]; omega)
+[?2004l[?2004h>     have hd1 : d1 < b1 := digit_bound _ _ (by dsimp [b1]; omega)
+[?2004l[?2004h>     have hd2 : d2 < b2 := digit_bound _ _ (by dsimp [b2]; omega)
+[?2004l[?2004h>     have hd3 : d3 < b3 := digit_bound _ _ (by dsimp [b3]; omega)
+[?2004l[?2004h>     have h01 := pack_bound d0 b0 d1 b1 hd0 hd1
+[?2004l[?2004h>     have h012 := pack_bound _ _ d2 b2 h01 hd2
+[?2004l[?2004h>     have h0123 := pack_bound _ _ d3 b3 h012 hd3
+[?2004l[?2004h>     have hp : b0*b1*b2*b3 ≤ 2^64 := by
+[?2004l[?2004h>       calc
+[?2004l[?2004h>         b0*b1*b2*b3 ≤ 65536*65536*65536*65536 :=
+[?2004l[?2004h>           Nat.mul_le_mul (Nat.mul_le_mul (Nat.mul_le_mul hb0 hb1) hb2) hb3
+[?2004l[?2004h>         _ = 2^64 := by norm_num
+[?2004l[?2004h>     have he : policyIndex a f = ((d0*b1+d1)*b2+d2)*b3+d3 := by
+[?2004l[?2004h>       change d0*(b1*(b2*b3))+d1*(b2*b3)+d2*b3+d3 = _
+[?2004l[?2004h>       ring
+[?2004l[?2004h>     rw [he]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   have index_nat (a f : UInt64) : (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat := by
+[?2004l[?2004h>     sorry
+[?2004l[?2004h>   have debit_nat (a f : UInt64) :
+[?2004l[?2004h>       (a / halfDivisor + encodeMixedRadix a f / halfDivisor).toNat = policyDebit a.toNat f.toNat := by
+[?2004l[?2004h>     have ha := a.toNat_lt_size
+[?2004l[?2004h>     have hi := index_bound a.toNat f.toNat
+[?2004l[?2004h>     have hsum : a.toNat / 2 + policyIndex a.toNat f.toNat / 2 < 2^64 := by
+[?2004l[?2004h>       change a.toNat < 2^64 at ha
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     simp [UInt64.toNat_add, UInt64.toNat_div, halfDivisor, index_nat, policyDebit,
+[?2004l[?2004h>       Nat.mod_eq_of_lt hsum]
+[?2004l[?2004h>   change Conforms candidateSpec challengeAuthorize
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     simp [challengeAuthorize, buildQuote, verifyAffordability, candidateSpec,
+[?2004l[?2004h>       UInt64.le_iff_toNat_le, debit_nat]
+[?2004l[?2004h>   · intro b a f total h
+[?2004l[?2004h>     simp only [challengeAuthorize, buildQuote, verifyAffordability] at h
+[?2004l[?2004h>     split at h
+[?2004l[?2004h>     · cases h
+[?2004l[?2004h>       exact ⟨by simpa only [UInt64.le_iff_toNat_le, debit_nat] using ‹_›, debit_nat a f⟩
+[?2004l[?2004h>     · contradiction
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@abe121926f29:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateSpec.lean:7:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:12:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:24:1: error: unexpected token 'def'; expected term
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@abe121926f29:/workspace# sed -i '/^\/--.*-\/$/d' /workspace/submission/Spec.lean; grep -nE 'theorem (.*mod.*(add|mul)|.*(add|mul).*mod)' /opt/lean/src/lean/Init/Data/Nat/{Lemmas,Div/Basic,Div/Lemmas}.lean | head -60; python3 /workspace/lean/check.py
+[?2004l/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:792:theorem mul_mod_mul_right (z x y : Nat) : (x * z) % (y * z) = (x % y) * z := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:795:theorem sub_mul_mod {x k n : Nat} (h₁ : n*k ≤ x) : (x - n*k) % n = x % n := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:809:theorem mul_mod (a b n : Nat) : a * b % n = (a % n) * (b % n) % n := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:816:@[simp] theorem mod_add_mod (m n k : Nat) : (m % n + k) % n = (m + k) % n := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:820:@[simp] theorem mul_mod_mod (m n l : Nat) : (m * (n % l)) % l = (m * n) % l := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:823:@[simp] theorem add_mod_mod (m n k : Nat) : (m + n % k) % k = (m + n) % k := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:826:@[simp] theorem mod_mul_mod (m n l : Nat) : ((m % l) * n) % l = (m * n) % l := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:829:theorem add_mod (a b n : Nat) : (a + b) % n = ((a % n) + (b % n)) % n := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1500:theorem mod_add_div' (a b : Nat) : a % b + a / b * b = a := by rw [Nat.mul_comm]; exact mod_add_div _ _
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1502:theorem div_add_mod' (a b : Nat) : a / b * b + a % b = a := by rw [Nat.mul_comm]; exact div_add_mod _ _
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1524:theorem add_mod_eq_ite {m n : Nat} :
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1542:theorem add_mod_eq_add_mod_right (c : Nat) (H : a % d = b % d) : (a + c) % d = (b + c) % d := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1545:theorem add_mod_eq_add_mod_left (c : Nat) (H : a % d = b % d) : (c + a) % d = (c + b) % d := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1569:theorem mul_add_mod (m x y : Nat) : (m * x + y) % m = y % m := by
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1577:theorem mul_add_mod' (a b c : Nat) : (a * b + c) % b = c % b := by rw [Nat.mul_comm, Nat.mul_add_mod]
+/opt/lean/src/lean/Init/Data/Nat/Lemmas.lean:1579:theorem mul_add_mod_of_lt {a b c : Nat} (h : c < b) : (a * b + c) % b = c := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:202:@[simp] protected theorem sub_mod_add_mod_cancel (a b : Nat) [NeZero a] : a - b % a + b % a = a := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:233:theorem div_add_mod (m n : Nat) : n * (m / n) + m % n = m := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:247:theorem mod_add_div (m k : Nat) : m % k + k * (m / k) = m := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:256:theorem mod_eq_sub_mul_div {x k : Nat} : x % k = x - k * (x / k) := mod_def _ _
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:258:theorem mod_eq_sub_div_mul {x k : Nat} : x % k = x - (x / k) * k := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:331:@[simp] theorem add_mod_right (x z : Nat) : (x + z) % z = x % z := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:334:@[simp] theorem add_mod_left (x z : Nat) : (x + z) % x = z % x := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:337:@[simp] theorem add_mul_mod_self_left (x y z : Nat) : (x + y * z) % y = x % y := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:342:@[simp] theorem mul_add_mod_self_left (a b c : Nat) : (a * b + c) % a = c % a := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:345:@[simp] theorem add_mul_mod_self_right (x y z : Nat) : (x + y * z) % z = x % z := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:348:@[simp] theorem mul_add_mod_self_right (a b c : Nat) : (a * b + c) % b = c % b := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:351:@[simp] theorem mul_mod_right (m n : Nat) : (m * n) % m = 0 := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:354:@[simp] theorem mul_mod_left (m n : Nat) : (m * n) % n = 0 := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Basic.lean:397:theorem mul_mod_mul_left (z x y : Nat) : (z * x) % (z * y) = z * (x % y) :=
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:26:theorem mod_add_mod_lt (a b : Nat) {c : Nat} (h : 0 < c) : a % c + b % c < 2 * c - 1 := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:31:theorem mod_add_mod_eq {a b c : Nat} : a % c + b % c = (a + b) % c + if a % c + b % c < c then 0 else c := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:47:theorem add_mod_eq_sub : (a + b) % c = a % c + b % c - if a % c + b % c < c then 0 else c := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:83:theorem div_mul_self_eq_mod_sub_self {x k : Nat} : (x / k) * k = x - (x % k) := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:88:theorem mul_div_self_eq_mod_sub_self {x k : Nat} : k * (x / k) = x - (x % k) := by
+/opt/lean/src/lean/Init/Data/Nat/Div/Lemmas.lean:185:theorem mod_add_mod_lt_of_add_mod_eq_sub_one (w : 0 < c) (h : (a + b) % c = c - 1) : a % c + b % c < c := by
+CandidateProof.lean:12:85: error: unsolved goals
+component_bound : ∀ (n k : ℕ), component n k < 65536
+x : UInt64
+h : x.toNat % 65536 < 65536
+⊢ x.toNat % 65536 + 1 < 18446744073709551616
+CandidateProof.lean:63:100: error: unsolved goals
+component_bound : ∀ (n k : ℕ), component n k < 65536
+radix_nat : ∀ (x : UInt64), (x % radixBase + 1).toNat = x.toNat % 65536 + 1
+clamp_nat : ∀ (x y : UInt64), 0 < y.toNat → (clampDigit x y).toNat = policyDigit x.toNat y.toNat
+pack_bound : ∀ (x p y q : ℕ), x < p → y < q → x * q + y < p * q
+digit_bound : ∀ (a b : ℕ), 0 < b → policyDigit a b < b
+index_bound : ∀ (a f : ℕ), policyIndex a f < 2 ^ 64
+index_nat : ∀ (a f : UInt64), (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat
+a f : UInt64
+ha : a.toNat < UInt64.size
+hi : policyIndex a.toNat f.toNat < 2 ^ 64
+hsum : a.toNat / 2 + policyIndex a.toNat f.toNat / 2 < 2 ^ 64
+⊢ a.toNat / 2 + policyIndex a.toNat f.toNat / 2 < 18446744073709551616
+CandidateProof.lean:80:69: error: Tactic `assumption` failed
+
+component_bound : ∀ (n k : ℕ), component n k < 65536
+radix_nat : ∀ (x : UInt64), (x % radixBase + 1).toNat = x.toNat % 65536 + 1
+clamp_nat : ∀ (x y : UInt64), 0 < y.toNat → (clampDigit x y).toNat = policyDigit x.toNat y.toNat
+pack_bound : ∀ (x p y q : ℕ), x < p → y < q → x * q + y < p * q
+digit_bound : ∀ (a b : ℕ), 0 < b → policyDigit a b < b
+index_bound : ∀ (a f : ℕ), policyIndex a f < 2 ^ 64
+index_nat : ∀ (a f : UInt64), (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat
+debit_nat : ∀ (a f : UInt64), (a / halfDivisor + encodeMixedRadix a f / halfDivisor).toNat = policyDebit a.toNat f.toNat
+b a f : UInt64
+h✝ : a / halfDivisor + encodeMixedRadix a f / halfDivisor ≤ b
+⊢ policyDebit a.toNat f.toNat ≤ b.toNat
+CandidateProof.lean:14:57: warning: This simp argument is unused:
+  Nat.mod_eq_of_lt (show x.toNat % 65536 + 1 < 2 ^ 64 by omega)
+
+Hint: Omit it from the simp argument list.
+  simp [radixBase, UInt64.toNat_add, UInt64.toNat_mod,̵ ̵N̵a̵t̵.̵m̵o̵d̵_̵e̵q̵_̵o̵f̵_̵l̵t̵ ̵(̵s̵h̵o̵w̵ ̵x̵.̵t̵o̵N̵a̵t̵ ̵%̵ ̵6̵5̵5̵3̵6̵ ̵+̵ ̵1̵ ̵<̵ ̵2̵^̵6̵4̵ ̵b̵y̵ ̵o̵m̵e̵g̵a̵)̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateProof.lean:70:6: warning: This simp argument is unused:
+  Nat.mod_eq_of_lt hsum
+
+Hint: Omit it from the simp argument list.
+  simp [UInt64.toNat_add, UInt64.toNat_div, halfDivisor, index_nat, policyDebit,̵
+  ̵ ̵ ̵ ̵ ̵ ̵ ̵N̵a̵t̵.̵m̵o̵d̵_̵e̵q̵_̵o̵f̵_̵l̵t̵ ̵h̵s̵u̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@abe121926f29:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'
+[?2004l[?2004h> s=open(p).read().replace('    sorry', '''    have clamp_radix (x y : UInt64) :
+[?2004l[?2004h>         (clampDigit x ((y % radixBase) + 1)).toNat =
+[?2004l[?2004h>           policyDigit x.toNat (y.toNat % 65536 + 1) := by
+[?2004l[?2004h>       rw [clamp_nat, radix_nat]
+[?2004l[?2004h>       rw [radix_nat]
+[?2004l[?2004h>       omega
+[?2004l[?2004h>     have hm : (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat % 2^64 := by
+[?2004l[?2004h>       simp only [encodeMixedRadix, UInt64.toNat_add, UInt64.toNat_mul,
+[?2004l[?2004h>         clamp_radix, radix_nat, UInt64.toNat_div, UInt64.toNat_mod]
+[?2004l[?2004h>       simp only [radixBase, shift16, shift32, shift48, UInt64.toNat_ofNat,
+[?2004l[?2004h>         Nat.mod_add_mod, Nat.add_mod_mod, Nat.mod_mul_mod, Nat.mul_mod_mod]
+[?2004l[?2004h>       rfl
+[?2004l[?2004h>     rw [hm, Nat.mod_eq_of_lt (index_bound a.toNat f.toNat)]''')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@abe121926f29:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateProof.lean:12:85: error: unsolved goals
+component_bound : ∀ (n k : ℕ), component n k < 65536
+x : UInt64
+h : x.toNat % 65536 < 65536
+⊢ x.toNat % 65536 + 1 < 18446744073709551616
+CandidateProof.lean:72:6: error: Tactic `rfl` failed: The left-hand side
+  (policyDigit (a.toNat % (65536 % 2 ^ 64)) (f.toNat % 65536 + 1) *
+            ((f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+              ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1))) +
+          policyDigit (a.toNat / (65536 % 2 ^ 64) % (65536 % 2 ^ 64)) (f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+            ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) +
+        policyDigit (a.toNat / (4294967296 % 2 ^ 64) % (65536 % 2 ^ 64)) (f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) *
+          (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1) +
+      policyDigit (a.toNat / (281474976710656 % 2 ^ 64) % (65536 % 2 ^ 64))
+        (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) %
+    2 ^ 64
+is not definitionally equal to the right-hand side
+  policyIndex a.toNat f.toNat % 2 ^ 64
+
+component_bound : ∀ (n k : ℕ), component n k < 65536
+radix_nat : ∀ (x : UInt64), (x % radixBase + 1).toNat = x.toNat % 65536 + 1
+clamp_nat : ∀ (x y : UInt64), 0 < y.toNat → (clampDigit x y).toNat = policyDigit x.toNat y.toNat
+pack_bound : ∀ (x p y q : ℕ), x < p → y < q → x * q + y < p * q
+digit_bound : ∀ (a b : ℕ), 0 < b → policyDigit a b < b
+index_bound : ∀ (a f : ℕ), policyIndex a f < 2 ^ 64
+a f : UInt64
+clamp_radix : ∀ (x y : UInt64), (clampDigit x (y % radixBase + 1)).toNat = policyDigit x.toNat (y.toNat % 65536 + 1)
+⊢ (policyDigit (a.toNat % (65536 % 2 ^ 64)) (f.toNat % 65536 + 1) *
+              ((f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+                ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1))) +
+            policyDigit (a.toNat / (65536 % 2 ^ 64) % (65536 % 2 ^ 64)) (f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+              ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) +
+          policyDigit (a.toNat / (4294967296 % 2 ^ 64) % (65536 % 2 ^ 64))
+              (f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) *
+            (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1) +
+        policyDigit (a.toNat / (281474976710656 % 2 ^ 64) % (65536 % 2 ^ 64))
+          (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) %
+      2 ^ 64 =
+    policyIndex a.toNat f.toNat % 2 ^ 64
+CandidateProof.lean:75:100: error: unsolved goals
+component_bound : ∀ (n k : ℕ), component n k < 65536
+radix_nat : ∀ (x : UInt64), (x % radixBase + 1).toNat = x.toNat % 65536 + 1
+clamp_nat : ∀ (x y : UInt64), 0 < y.toNat → (clampDigit x y).toNat = policyDigit x.toNat y.toNat
+pack_bound : ∀ (x p y q : ℕ), x < p → y < q → x * q + y < p * q
+digit_bound : ∀ (a b : ℕ), 0 < b → policyDigit a b < b
+index_bound : ∀ (a f : ℕ), policyIndex a f < 2 ^ 64
+index_nat : ∀ (a f : UInt64), (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat
+a f : UInt64
+ha : a.toNat < UInt64.size
+hi : policyIndex a.toNat f.toNat < 2 ^ 64
+hsum : a.toNat / 2 + policyIndex a.toNat f.toNat / 2 < 2 ^ 64
+⊢ a.toNat / 2 + policyIndex a.toNat f.toNat / 2 < 18446744073709551616
+CandidateProof.lean:92:69: error: Tactic `assumption` failed
+
+component_bound : ∀ (n k : ℕ), component n k < 65536
+radix_nat : ∀ (x : UInt64), (x % radixBase + 1).toNat = x.toNat % 65536 + 1
+clamp_nat : ∀ (x y : UInt64), 0 < y.toNat → (clampDigit x y).toNat = policyDigit x.toNat y.toNat
+pack_bound : ∀ (x p y q : ℕ), x < p → y < q → x * q + y < p * q
+digit_bound : ∀ (a b : ℕ), 0 < b → policyDigit a b < b
+index_bound : ∀ (a f : ℕ), policyIndex a f < 2 ^ 64
+index_nat : ∀ (a f : UInt64), (encodeMixedRadix a f).toNat = policyIndex a.toNat f.toNat
+debit_nat : ∀ (a f : UInt64), (a / halfDivisor + encodeMixedRadix a f / halfDivisor).toNat = policyDebit a.toNat f.toNat
+b a f : UInt64
+h✝ : a / halfDivisor + encodeMixedRadix a f / halfDivisor ≤ b
+⊢ policyDebit a.toNat f.toNat ≤ b.toNat
+CandidateProof.lean:14:57: warning: This simp argument is unused:
+  Nat.mod_eq_of_lt (show x.toNat % 65536 + 1 < 2 ^ 64 by omega)
+
+Hint: Omit it from the simp argument list.
+  simp [radixBase, UInt64.toNat_add, UInt64.toNat_mod,̵ ̵N̵a̵t̵.̵m̵o̵d̵_̵e̵q̵_̵o̵f̵_̵l̵t̵ ̵(̵s̵h̵o̵w̵ ̵x̵.̵t̵o̵N̵a̵t̵ ̵%̵ ̵6̵5̵5̵3̵6̵ ̵+̵ ̵1̵ ̵<̵ ̵2̵^̵6̵4̵ ̵b̵y̵ ̵o̵m̵e̵g̵a̵)̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateProof.lean:71:42: warning: This simp argument is unused:
+  Nat.mod_mul_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [radixBase, shift16, shift32, shift48, UInt64.toNat_ofNat, Nat.mod_add_mod,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Nat.add_mod_mod, N̵a̵t̵.̵m̵o̵d̵_̵m̵u̵l̵_̵m̵o̵d̵,̵ ̵Nat.mul_mod_mod]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+CandidateProof.lean:82:6: warning: This simp argument is unused:
+  Nat.mod_eq_of_lt hsum
+
+Hint: Omit it from the simp argument list.
+  simp [UInt64.toNat_add, UInt64.toNat_div, halfDivisor, index_nat, policyDebit,̵
+  ̵ ̵ ̵ ̵ ̵ ̵ ̵N̵a̵t̵.̵m̵o̵d̵_̵e̵q̵_̵o̵f̵_̵l̵t̵ ̵h̵s̵u̵m̵]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@abe121926f29:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=s.replace('    simp [radixBase, UInt64.toNat_add, UInt64.toNat_mod, Nat.mod_eq_of_lt (show x.toNat % 65536 + 1 < 2^64 by omega)]', '''    have hb : x.toNat % 65536 + 1 < 2^64 := by norm_num; omega
+[?2004l[?2004h>     simp only [UInt64.toNat_add, UInt64.toNat_mod, radixBase, UInt64.toNat_ofNat]
+[?2004l[?2004h>     exact Nat.mod_eq_of_lt hb''')
+[?2004l[?2004h> s=s.replace('    simp [UInt64.toNat_add, UInt64.toNat_div, halfDivisor, index_nat, policyDebit,\n      Nat.mod_eq_of_lt hsum]', '''    simp only [UInt64.toNat_add, UInt64.toNat_div, halfDivisor, UInt64.toNat_ofNat,
+[?2004l[?2004h>       index_nat, policyDebit]
+[?2004l[?2004h>     exact Nat.mod_eq_of_lt hsum''')
+[?2004l[?2004h> s=s.replace('    split at h\n    · cases h\n      exact ⟨by simpa only [UInt64.le_iff_toNat_le, debit_nat] using ‹_›, debit_nat a f⟩', '''    split at h
+[?2004l[?2004h>     · rename_i affordable
+[?2004l[?2004h>       cases h
+[?2004l[?2004h>       exact ⟨by simpa only [UInt64.le_iff_toNat_le, debit_nat] using affordable, debit_nat a f⟩''')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@abe121926f29:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateProof.lean:74:6: error: Tactic `rfl` failed: The left-hand side
+  (policyDigit (a.toNat % (65536 % 2 ^ 64)) (f.toNat % 65536 + 1) *
+            ((f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+              ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1))) +
+          policyDigit (a.toNat / (65536 % 2 ^ 64) % (65536 % 2 ^ 64)) (f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+            ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) +
+        policyDigit (a.toNat / (4294967296 % 2 ^ 64) % (65536 % 2 ^ 64)) (f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) *
+          (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1) +
+      policyDigit (a.toNat / (281474976710656 % 2 ^ 64) % (65536 % 2 ^ 64))
+        (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) %
+    2 ^ 64
+is not definitionally equal to the right-hand side
+  policyIndex a.toNat f.toNat % 2 ^ 64
+
+component_bound : ∀ (n k : ℕ), component n k < 65536
+radix_nat : ∀ (x : UInt64), (x % radixBase + 1).toNat = x.toNat % 65536 + 1
+clamp_nat : ∀ (x y : UInt64), 0 < y.toNat → (clampDigit x y).toNat = policyDigit x.toNat y.toNat
+pack_bound : ∀ (x p y q : ℕ), x < p → y < q → x * q + y < p * q
+digit_bound : ∀ (a b : ℕ), 0 < b → policyDigit a b < b
+index_bound : ∀ (a f : ℕ), policyIndex a f < 2 ^ 64
+a f : UInt64
+clamp_radix : ∀ (x y : UInt64), (clampDigit x (y % radixBase + 1)).toNat = policyDigit x.toNat (y.toNat % 65536 + 1)
+⊢ (policyDigit (a.toNat % (65536 % 2 ^ 64)) (f.toNat % 65536 + 1) *
+              ((f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+                ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1))) +
+            policyDigit (a.toNat / (65536 % 2 ^ 64) % (65536 % 2 ^ 64)) (f.toNat / (65536 % 2 ^ 64) % 65536 + 1) *
+              ((f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) * (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) +
+          policyDigit (a.toNat / (4294967296 % 2 ^ 64) % (65536 % 2 ^ 64))
+              (f.toNat / (4294967296 % 2 ^ 64) % 65536 + 1) *
+            (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1) +
+        policyDigit (a.toNat / (281474976710656 % 2 ^ 64) % (65536 % 2 ^ 64))
+          (f.toNat / (281474976710656 % 2 ^ 64) % 65536 + 1)) %
+      2 ^ 64 =
+    policyIndex a.toNat f.toNat % 2 ^ 64
+CandidateProof.lean:73:42: warning: This simp argument is unused:
+  Nat.mod_mul_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [radixBase, shift16, shift32, shift48, UInt64.toNat_ofNat, Nat.mod_add_mod,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Nat.add_mod_mod, N̵a̵t̵.̵m̵o̵d̵_̵m̵u̵l̵_̵m̵o̵d̵,̵ ̵Nat.mul_mod_mod]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@abe121926f29:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/Proof.lean'
+[?2004l[?2004h> s=open(p).read().replace('      rfl\n    rw [hm', '      norm_num [policyIndex, component]\n    rw [hm')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@abe121926f29:/workspace# python3 /workspace/lean/check.py
+[?2004lCandidateProof.lean:73:42: warning: This simp argument is unused:
+  Nat.mod_mul_mod
+
+Hint: Omit it from the simp argument list.
+  simp only [radixBase, shift16, shift32, shift48, UInt64.toNat_ofNat, Nat.mod_add_mod,
+  ̲  ̲ ̲ ̲ ̲ ̲ ̲ ̲Nat.add_mod_mod, N̵a̵t̵.̵m̵o̵d̵_̵m̵u̵l̵_̵m̵o̵d̵,̵ ̵Nat.mul_mod_mod]
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+[?2004hroot@abe121926f29:/workspace# 
+[?2004l[?2004hroot@abe121926f29:/workspace# find /workspace/submission -maxdepth 2 -type f -print; cat /workspace/challenge/Cargo.toml; cd /workspace/challenge && cargo test
+[?2004l/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+[1m[32m     Running[0m unittests src/lib.rs (target/debug/deps/settlement_gate-66f23bc290c8a00c)
+
+running 3 tests
+test tests::small_mixed_radix_coordinates_match_policy ... [32mok[m
+test tests::clamps_digits_to_radix_minus_one ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@abe121926f29:/workspace/challenge# sed -i 's/Nat.add_mod_mod, Nat.mod_mul_mod, Nat.mul_mod_mod/Nat.add_mod_mod, Nat.mul_mod_mod/' /workspace/submission/Proof.lean
+[?2004l[?2004hroot@abe121926f29:/workspace/challenge# python3 /workspace/lean/check.py
+[?2004lpython3 - <<'PY'
+p='/workspace/lean/check.py'
+s=open(p).read()
+s=s.replace("+ '\\n)\\n'", "+ '\\n)\\n#print axioms auditEvidence\\n'")
+exec(compile(s,p,'exec'), {'__file__': p, '__name__': '__main__'})
+PY
+[?2004hroot@abe121926f29:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/lean/check.py'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=s.replace("+ '\\n)\\n'", "+ '\\n)\\n#print axioms auditEvidence\\n'")
+[?2004l[?2004h> exec(compile(s,p,'exec'), {'__file__': p, '__name__': '__main__'})
+[?2004l[?2004h> PY
+[?2004l
+
+'auditEvidence' depends on axioms: [propext, Classical.choice, Quot.sound]
+[?2004hroot@abe121926f29:/workspace/challenge# 
+[?2004l[?2004hroot@abe121926f29:/workspace/challenge# 
+[?2004l[?2004hroot@abe121926f29:/workspace/challenge# 
+[?2004l[?2004hroot@abe121926f29:/workspace/challenge# 

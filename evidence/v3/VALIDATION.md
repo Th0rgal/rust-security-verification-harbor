@@ -48,9 +48,15 @@ and the verifier supports recursive Lean definition unfolding, general `Nat.mul`
 variable-divisor `Nat.div`/`Nat.mod`, Euclidean Z3 purification for large/variable
 divisors, and bitwise/shift/tuple-destructuring Rust symbolic semantics.
 
-All 14 reference solutions and skeletons pass `scripts/selftest.py` (`selftest v3: PASS`,
+All 20 reference solutions and skeletons pass `scripts/selftest.py` (`selftest v3: PASS`,
 recorded in `evidence/v3/*-reference.json`). Full Harbor 0.9.0 evaluations across
-all 12 tasks (`24` trials total) were completed for `claude-opus-5-5` (12/12 at `1.00`)
-and `gpt-6.1-sol-high` (11/12 at `1.00`, scoring `0.25` on `plonky3-safe` after
-exhausting 25 turns on the 64-bit BabyBear Montgomery reduction Lean proof).
+all 18 benchmarked tasks (`36` trials total across `settlement*`, `goldilocks`,
+`whirlpool`, `plonky3`, `succinct`, `openpql`, `ruint`) were completed for
+`claude-opus-5-5` (18/18 at `1.00`, mean `1.000`) and `gpt-6.1-sol-high`
+(15/18 at `1.00`, mean `0.875`), which scored `0.25` on three `.safe` universal
+Lean 4 proof tasks:
+- `plonky3-safe`: exhausted 25 turns on the 64-bit BabyBear Montgomery reduction Lean proof (`by sorry`).
+- `succinct-safe` (Non-Web3 SWAR broadword kernel from `tov/succinct-rs`): exhausted 25 turns and left a `bv_decide` helper rejected by the transitive axiom auditor (`count_correct._native.bv_decide.ax_1_5`).
+- `ruint-safe` (Web3 Möller-Granlund 2-by-1 normalized division kernel from `alloy-rs/ruint`): exhausted 25 turns unable to discharge the universal `omega` proof over the reciprocal approximation (`D = 32771`, `V = 65524`).
+
 

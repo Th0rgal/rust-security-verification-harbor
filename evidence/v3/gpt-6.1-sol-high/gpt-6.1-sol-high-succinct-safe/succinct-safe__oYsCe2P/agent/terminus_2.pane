@@ -1,0 +1,1683 @@
+[?2004hroot@d4dcfb267f27:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@d4dcfb267f27:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod broadword {
+    pub const L8: u64 = 0x0101_0101_0101_0101u64;
+    pub const H8: u64 = 0x8080_8080_8080_8080u64;
+    pub const M16: u64 = 0x00FF_00FF_00FF_00FFu64;
+    pub const L16: u64 = 0x0001_0001_0001_0001u64;
+
+    /// Vigna's SWAR broadword non-zero byte indicator (`tov/succinct-rs` `src/broadword.rs`):
+    /// Sets bit `8*i + 7` iff byte `i` of `x` is non-zero.
+    #[inline]
+    pub fn u_nz8(x: u64) -> u64 {
+        (((x | H8) - L8) | x) & H8
+    }
+
+    /// Count non-zero bytes in `x` in parallel using SWAR multiplication by `L8`.
+    #[inline]
+    pub fn count_nz_bytes(x: u64) -> u64 {
+        ((u_nz8(x) >> 7u64).wrapping_mul(L8)) >> 56u64
+    }
+
+    /// Sum all 8 bytes of `x` in parallel using 16-bit lane folding and `L16`.
+    #[inline]
+    pub fn sum_bytes(x: u64) -> u64 {
+        let pairs: u64 = (x & M16) + ((x >> 8u64) & M16);
+        (pairs.wrapping_mul(L16) >> 48u64) & 0xFFFFu64
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::broadword;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SuccinctQuote {
+        pub principal_share: u64,
+        pub active_bytes: u64,
+        pub byte_sum: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<SuccinctQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let active_bytes: u64 = broadword::count_nz_bytes(fee);
+        let byte_sum: u64 = broadword::sum_bytes(fee);
+        let total_debit: u64 = principal_share + (active_bytes << 8u64) + byte_sum;
+        Some(SuccinctQuote {
+            principal_share,
+            active_bytes,
+            byte_sum,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: SuccinctQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Succinct SWAR broadword byte-schedule settlement against `balance`.
+///
+/// In exact integer arithmetic, let the 8 bytes of `fee` be
+/// `b_i = (fee >> (8 * i)) & 0xFF` for `i in {0, ..., 7}`:
+/// - `active_bytes = sum_{i=0..7} (if b_i > 0 then 1 else 0)`
+/// - `byte_sum = sum_{i=0..7} b_i`
+/// - `total_debit = floor(amount / 2) + 256 * active_bytes + byte_sum`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::SuccinctQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn low_bit_bytes_are_counted_and_summed() {
+        // fee = 0x0000_0000_0000_0201 -> b0 = 1, b1 = 2 -> active = 2, sum = 3
+        // total_debit = 50 + 2 * 256 + 3 = 565
+        assert_eq!(
+            authorize(565, 100, 0x0201),
+            Some(Authorization { total_debit: 565 })
+        );
+        assert_eq!(authorize(564, 100, 0x0201), None);
+    }
+
+    #[test]
+    fn full_low_bits_across_all_bytes() {
+        // fee = L8 -> all 8 bytes = 1 -> active = 8, sum = 8 -> surcharge = 8 * 256 + 8 = 2056
+        assert_eq!(
+            authorize(2056, 0, broadword::L8),
+            Some(Authorization { total_debit: 2056 })
+        );
+    }
+}
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004lnamespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def l8Mask : UInt64 := 0x0101010101010101
+def h8Mask : UInt64 := 0x8080808080808080
+def m16Mask : UInt64 := 0x00FF00FF00FF00FF
+def l16Mask : UInt64 := 0x0001000100010001
+
+structure SuccinctQuote where
+  principalShare : UInt64
+  activeBytes : UInt64
+  byteSum : UInt64
+  totalDebit : UInt64
+
+def uNz8 (x : UInt64) : UInt64 :=
+  (((x ||| h8Mask) - l8Mask) ||| x) &&& h8Mask
+
+def countNzBytes (x : UInt64) : UInt64 :=
+  (((uNz8 x) >>> 7) * l8Mask) >>> 56
+
+def sumBytes (x : UInt64) : UInt64 :=
+  let pairs := (x &&& m16Mask) + ((x >>> 8) &&& m16Mask)
+  ((pairs * l16Mask) >>> 48) &&& 0xFFFF
+
+def buildQuote (amount fee : UInt64) : Option SuccinctQuote :=
+  let principalShare := amount >>> 1
+  let activeBytes := countNzBytes fee
+  let byteSum := sumBytes fee
+  let totalDebit := principalShare + (activeBytes <<< 8) + byteSum
+  some {
+    principalShare := principalShare,
+    activeBytes := activeBytes,
+    byteSum := byteSum,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : SuccinctQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/lean/check.py; ls -la /workspace/lean; ls -la /workspace/submission
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+total 176
+drwxr-xr-x 1 root root   4096 Oct  8 11:10 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   2051 Oct  8 11:09 SecurityChallenge.lean
+-rw-r--r-- 1 root root 151560 Oct  8 11:10 SecurityChallenge.olean
+-rw-r--r-- 1 root root    213 Oct  5 19:59 Signature.lean
+-rw-r--r-- 1 root root   2764 Oct  7 08:20 check.py
+-rw-r--r-- 1 root root     25 Oct  5 19:59 lean-toolchain
+total 24
+drwxr-xr-x 1 root root 4096 Oct  8 11:10 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  5 19:59 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  5 19:59 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  5 19:59 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct  8 11:10 [01;34msrc[0m
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/submission/{Spec,Audit,Proof}.lean; cat /workspace/lean/lean-toolchain; which lean; lean --version; ls /opt/rvb-deps; grep -R 'UInt64\|ofNat\|toNat' $(lean --print-prefix)/src/lean/Std/Tactic/BVDecide -n | head -60
+[?2004limport SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+leanprover/lean4:v4.31.0
+/opt/lean/bin/lean
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[0m[01;34mpackages[0m  requirements-verifier.txt
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:93:    Int.ofNat <$> parsePos
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:164:  go (uidx : UInt64) (shift : UInt64) : Parser Int := do
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:171:      let uidx := uidx ||| ((uch &&& 127).toUInt64 <<< shift)
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:175:          return (-(idx).toNat : Int)
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:177:          return (idx.toNat : Int)
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:389:    let mapped := mapped.toUInt64
+/opt/lean/src/lean/Std/Tactic/BVDecide/LRAT/Parser.lean:392:  variableLengthEncode (acc : ByteArray) (lit : UInt64) : ByteArray :=
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/Canonicalize.lean:77:attribute [bv_normalize] BitVec.testBit_toNat
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/Canonicalize.lean:91:attribute [bv_normalize] BitVec.natCast_eq_ofNat
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:62:attribute [bv_normalize] BitVec.ofNat_eq_ofNat
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:65:theorem BitVec.ofNatLT_reduce (n : Nat) (h) : BitVec.ofNatLT n h = BitVec.ofNat w n := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:66:  simp [BitVec.ofNatLT, BitVec.ofNat, Fin.ofNat, Nat.mod_eq_of_lt h]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:240:    BitVec.ofNat w a + (BitVec.ofNat w b + c) = (BitVec.ofNat w a + BitVec.ofNat w b) + c := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:245:    BitVec.ofNat w a + (b + BitVec.ofNat w c) = (BitVec.ofNat w a + BitVec.ofNat w c) + b := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:250:    (BitVec.ofNat w a + b) + BitVec.ofNat w c = (BitVec.ofNat w a + BitVec.ofNat w c) + b := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:255:    (a + BitVec.ofNat w b) + BitVec.ofNat w c = (BitVec.ofNat w b + BitVec.ofNat w c) + a := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:300:    simp_all only [BitVec.lt_def, BitVec.toNat_ofNat, Nat.zero_mod, ne_eq, BitVec.toNat_eq] <;>
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:360:/-- `x / (BitVec.ofNat n)` where `n = 2^k` is the same as shifting `x` right by `k`. -/
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:361:theorem BitVec.udiv_ofNat_eq_of_lt (w : Nat) (x : BitVec w) (n : Nat) (k : Nat) (hk : 2 ^ k = n) (hlt : k < w) :
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:362:    x / (BitVec.ofNat w n) = x >>> k := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:363:  have : BitVec.ofNat w n = BitVec.twoPow w k := by simp [bitvec_to_nat, hk]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:382:    ((a + BitVec.ofNat w b) == BitVec.ofNat w c) = (a == BitVec.ofNat w c - BitVec.ofNat w b) := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:387:    ((BitVec.ofNat w b + a) == BitVec.ofNat w c) = (a == BitVec.ofNat w c - BitVec.ofNat w b) := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:392:    (BitVec.ofNat w c == (a + BitVec.ofNat w b)) = (a == BitVec.ofNat w c - BitVec.ofNat w b) := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:397:    (BitVec.ofNat w c == (BitVec.ofNat w b + a)) = (a == BitVec.ofNat w c - BitVec.ofNat w b) := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:403:    BitVec.ofNat w a &&& (BitVec.ofNat w b &&& c) = (BitVec.ofNat w a &&& BitVec.ofNat w b) &&& c := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:408:    BitVec.ofNat w a &&& (b &&& BitVec.ofNat w c) = (BitVec.ofNat w a &&& BitVec.ofNat w c) &&& b := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:413:    (BitVec.ofNat w a &&& b) &&& BitVec.ofNat w c = (BitVec.ofNat w a &&& BitVec.ofNat w c) &&& b := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:418:    (a &&& BitVec.ofNat w b) &&& BitVec.ofNat w c = (BitVec.ofNat w b &&& BitVec.ofNat w c) &&& a := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:425:      (BitVec.ofNat w1 a)
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:426:      (HAppend.hAppend (γ := BitVec (no_index _)) (BitVec.ofNat w2 b) c)
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:427:    = ((BitVec.ofNat w1 a ++ BitVec.ofNat w2 b) ++ c).cast (Nat.add_assoc ..) := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:434:      (HAppend.hAppend (γ := BitVec (no_index _)) a (BitVec.ofNat w2 b))
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:435:      (BitVec.ofNat w3 c)
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:436:    = (a ++ (BitVec.ofNat w2 b ++ BitVec.ofNat w3 c)).cast (Eq.symm <| Nat.add_assoc ..) := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:500:theorem UInt64.toBitVec_cond :
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:501:    UInt64.toBitVec (bif c then t else e) = bif c then t.toBitVec else e.toBitVec := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:502:  rw [Bool.apply_cond UInt64.toBitVec]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:550:theorem UInt64.toBitVec_ite [Decidable c] :
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:551:    UInt64.toBitVec (if c then t else e) = if c then t.toBitVec else e.toBitVec := by
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:552:  rw [apply_ite UInt64.toBitVec]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Normalize/BitVec.lean:594:theorem UInt64.beq_eq_decide_eq {a b : UInt64} : (a == b) = decide (a = b) := Bool.beq_eq_decide_eq ..
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Basic.lean:251:  hashCode : (w : Nat) → BVExpr w → UInt64
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Mul.lean:92:        simp only [RefVec.denote_ite, RefVec.get_cast, Ref.cast_eq, BitVec.ofNat_eq_ofNat]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Mul.lean:177:        BitVec.ofNat_eq_ofNat, BitVec.getLsbD_zero, Bool.if_false_right,
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/ShiftRight.lean:299:      · simp only [BitVec.ushiftRight_eq', BitVec.toNat_twoPow, BitVec.getLsbD_ushiftRight,
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Clz.lean:40:      if curr = 0 then ⟦aig, acc.get idx hidx, assign⟧ = (BitVec.ofNat w w).getLsbD idx
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Clz.lean:56:      simp only [BitVec.natCast_eq_ofNat, BitVec.ofNat_eq_ofNat] at hgo
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Clz.lean:71:          · simp [denote_blastConst, BitVec.clzAuxRec_zero, h, BitVec.ofNat_sub_ofNat_of_le (x := w) (y := 1) (by omega) (by omega)]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Clz.lean:75:            rw [BitVec.ofNat_sub_ofNat_of_le (x := w) (y := 1) (by omega) (by omega),
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Clz.lean:76:                BitVec.ofNat_sub_ofNat_of_le (x := w - 1) (y := curr + 1) (by omega) (by omega)]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/Clz.lean:108:    simp only [reduceIte, BitVec.natCast_eq_ofNat]
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/ShiftLeft.lean:207:      · simp only [BitVec.shiftLeft_eq', BitVec.toNat_twoPow, BitVec.getLsbD_shiftLeft,
+/opt/lean/src/lean/Std/Tactic/BVDecide/Bitblast/BVExpr/Circuit/Lemmas/Operations/ShiftLeft.lean:214:        simp only [BitVec.shiftLeft_eq', BitVec.toNat_twoPow, hmod, BitVec.getLsbD_shiftLeft, hidx,
+[?2004hroot@d4dcfb267f27:/workspace# ls /opt/rvb-deps/.lake/build/lib/lean/Mathlib/Tactic | head; cat /workspace/challenge/Cargo.toml
+[?2004lls: cannot access '/opt/rvb-deps/.lake/build/lib/lean/Mathlib/Tactic': No such file or directory
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+[?2004hroot@d4dcfb267f27:/workspace# grep -n 'theorem.*\(toNat_\|le_iff\|lt_iff\)' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | tail -90; ls /opt/lean/bin; find /opt/rvb-deps/packages -maxdepth 2 -type d | head
+[?2004l1502:theorem USize.toNat_ofNatTruncate_of_le {n : Nat} (hn : USize.size ≤ n) :
+1922:theorem UInt64.toUSize_div_of_toNat_lt (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) :
+1997:theorem UInt64.toUSize_mod_of_toNat_lt (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) : (a % b).toUSize = a.toUSize % b.toUSize :=
+2159:theorem UInt8.lt_iff_toFin_lt {a b : UInt8} : a < b ↔ a.toFin < b.toFin := Iff.rfl
+2160:theorem UInt16.lt_iff_toFin_lt {a b : UInt16} : a < b ↔ a.toFin < b.toFin := Iff.rfl
+2161:theorem UInt32.lt_iff_toFin_lt {a b : UInt32} : a < b ↔ a.toFin < b.toFin := Iff.rfl
+2162:theorem UInt64.lt_iff_toFin_lt {a b : UInt64} : a < b ↔ a.toFin < b.toFin := Iff.rfl
+2163:theorem USize.lt_iff_toFin_lt {a b : USize} : a < b ↔ a.toFin < b.toFin := Iff.rfl
+2165:theorem UInt8.le_iff_toFin_le {a b : UInt8} : a ≤ b ↔ a.toFin ≤ b.toFin := Iff.rfl
+2166:theorem UInt16.le_iff_toFin_le {a b : UInt16} : a ≤ b ↔ a.toFin ≤ b.toFin := Iff.rfl
+2167:theorem UInt32.le_iff_toFin_le {a b : UInt32} : a ≤ b ↔ a.toFin ≤ b.toFin := Iff.rfl
+2168:theorem UInt64.le_iff_toFin_le {a b : UInt64} : a ≤ b ↔ a.toFin ≤ b.toFin := Iff.rfl
+2169:theorem USize.le_iff_toFin_le {a b : USize} : a ≤ b ↔ a.toFin ≤ b.toFin := Iff.rfl
+2309:@[simp] theorem UInt8.toNat_neg (a : UInt8) : (-a).toNat = (UInt8.size - a.toNat) % UInt8.size := (rfl)
+2310:@[simp] theorem UInt16.toNat_neg (a : UInt16) : (-a).toNat = (UInt16.size - a.toNat) % UInt16.size := (rfl)
+2311:@[simp] theorem UInt32.toNat_neg (a : UInt32) : (-a).toNat = (UInt32.size - a.toNat) % UInt32.size := (rfl)
+2312:@[simp] theorem UInt64.toNat_neg (a : UInt64) : (-a).toNat = (UInt64.size - a.toNat) % UInt64.size := (rfl)
+2313:@[simp] theorem USize.toNat_neg (a : USize) : (-a).toNat = (USize.size - a.toNat) % USize.size := (rfl)
+2787:theorem UInt8.ofFin_lt_iff_lt {a b : Fin UInt8.size} : UInt8.ofFin a < UInt8.ofFin b ↔ a < b := Iff.rfl
+2788:theorem UInt16.ofFin_lt_iff_lt {a b : Fin UInt16.size} : UInt16.ofFin a < UInt16.ofFin b ↔ a < b := Iff.rfl
+2789:theorem UInt32.ofFin_lt_iff_lt {a b : Fin UInt32.size} : UInt32.ofFin a < UInt32.ofFin b ↔ a < b := Iff.rfl
+2790:theorem UInt64.ofFin_lt_iff_lt {a b : Fin UInt64.size} : UInt64.ofFin a < UInt64.ofFin b ↔ a < b := Iff.rfl
+2791:theorem USize.ofFin_lt_iff_lt {a b : Fin USize.size} : USize.ofFin a < USize.ofFin b ↔ a < b := Iff.rfl
+2793:theorem UInt8.ofFin_le_iff_le {a b : Fin UInt8.size} : UInt8.ofFin a ≤ UInt8.ofFin b ↔ a ≤ b := Iff.rfl
+2794:theorem UInt16.ofFin_le_iff_le {a b : Fin UInt16.size} : UInt16.ofFin a ≤ UInt16.ofFin b ↔ a ≤ b := Iff.rfl
+2795:theorem UInt32.ofFin_le_iff_le {a b : Fin UInt32.size} : UInt32.ofFin a ≤ UInt32.ofFin b ↔ a ≤ b := Iff.rfl
+2796:theorem UInt64.ofFin_le_iff_le {a b : Fin UInt64.size} : UInt64.ofFin a ≤ UInt64.ofFin b ↔ a ≤ b := Iff.rfl
+2797:theorem USize.ofFin_le_iff_le {a b : Fin USize.size} : USize.ofFin a ≤ USize.ofFin b ↔ a ≤ b := Iff.rfl
+2799:theorem UInt8.ofBitVec_lt_iff_lt {a b : BitVec 8} : UInt8.ofBitVec a < UInt8.ofBitVec b ↔ a < b := Iff.rfl
+2800:theorem UInt16.ofBitVec_lt_iff_lt {a b : BitVec 16} : UInt16.ofBitVec a < UInt16.ofBitVec b ↔ a < b := Iff.rfl
+2801:theorem UInt32.ofBitVec_lt_iff_lt {a b : BitVec 32} : UInt32.ofBitVec a < UInt32.ofBitVec b ↔ a < b := Iff.rfl
+2802:theorem UInt64.ofBitVec_lt_iff_lt {a b : BitVec 64} : UInt64.ofBitVec a < UInt64.ofBitVec b ↔ a < b := Iff.rfl
+2803:theorem USize.ofBitVec_lt_iff_lt {a b : BitVec System.Platform.numBits} : USize.ofBitVec a < USize.ofBitVec b ↔ a < b := Iff.rfl
+2805:theorem UInt8.ofBitVec_le_iff_le {a b : BitVec 8} : UInt8.ofBitVec a ≤ UInt8.ofBitVec b ↔ a ≤ b := Iff.rfl
+2806:theorem UInt16.ofBitVec_le_iff_le {a b : BitVec 16} : UInt16.ofBitVec a ≤ UInt16.ofBitVec b ↔ a ≤ b := Iff.rfl
+2807:theorem UInt32.ofBitVec_le_iff_le {a b : BitVec 32} : UInt32.ofBitVec a ≤ UInt32.ofBitVec b ↔ a ≤ b := Iff.rfl
+2808:theorem UInt64.ofBitVec_le_iff_le {a b : BitVec 64} : UInt64.ofBitVec a ≤ UInt64.ofBitVec b ↔ a ≤ b := Iff.rfl
+2809:theorem USize.ofBitVec_le_iff_le {a b : BitVec System.Platform.numBits} : USize.ofBitVec a ≤ USize.ofBitVec b ↔ a ≤ b := Iff.rfl
+2811:theorem UInt8.ofNatLT_lt_iff_lt {a b : Nat} (ha : a < UInt8.size) (hb : b < UInt8.size) :
+2813:theorem UInt16.ofNatLT_lt_iff_lt {a b : Nat} (ha : a < UInt16.size) (hb : b < UInt16.size) :
+2815:theorem UInt32.ofNatLT_lt_iff_lt {a b : Nat} (ha : a < UInt32.size) (hb : b < UInt32.size) :
+2817:theorem UInt64.ofNatLT_lt_iff_lt {a b : Nat} (ha : a < UInt64.size) (hb : b < UInt64.size) :
+2819:theorem USize.ofNatLT_lt_iff_lt {a b : Nat} (ha : a < USize.size) (hb : b < USize.size) :
+2822:theorem UInt8.ofNatLT_le_iff_le {a b : Nat} (ha : a < UInt8.size) (hb : b < UInt8.size) :
+2824:theorem UInt16.ofNatLT_le_iff_le {a b : Nat} (ha : a < UInt16.size) (hb : b < UInt16.size) :
+2826:theorem UInt32.ofNatLT_le_iff_le {a b : Nat} (ha : a < UInt32.size) (hb : b < UInt32.size) :
+2828:theorem UInt64.ofNatLT_le_iff_le {a b : Nat} (ha : a < UInt64.size) (hb : b < UInt64.size) :
+2830:theorem USize.ofNatLT_le_iff_le {a b : Nat} (ha : a < USize.size) (hb : b < USize.size) :
+2833:theorem UInt8.ofNat_lt_iff_lt {a b : Nat} (ha : a < UInt8.size) (hb : b < UInt8.size) :
+2836:theorem UInt16.ofNat_lt_iff_lt {a b : Nat} (ha : a < UInt16.size) (hb : b < UInt16.size) :
+2839:theorem UInt32.ofNat_lt_iff_lt {a b : Nat} (ha : a < UInt32.size) (hb : b < UInt32.size) :
+2842:theorem UInt64.ofNat_lt_iff_lt {a b : Nat} (ha : a < UInt64.size) (hb : b < UInt64.size) :
+2845:theorem USize.ofNat_lt_iff_lt {a b : Nat} (ha : a < USize.size) (hb : b < USize.size) :
+2849:theorem UInt8.ofNat_le_iff_le {a b : Nat} (ha : a < UInt8.size) (hb : b < UInt8.size) :
+2852:theorem UInt16.ofNat_le_iff_le {a b : Nat} (ha : a < UInt16.size) (hb : b < UInt16.size) :
+2855:theorem UInt32.ofNat_le_iff_le {a b : Nat} (ha : a < UInt32.size) (hb : b < UInt32.size) :
+2858:theorem UInt64.ofNat_le_iff_le {a b : Nat} (ha : a < UInt64.size) (hb : b < UInt64.size) :
+2861:theorem USize.ofNat_le_iff_le {a b : Nat} (ha : a < USize.size) (hb : b < USize.size) :
+2865:theorem UInt8.toNat_one : (1 : UInt8).toNat = 1 := (rfl)
+2866:theorem UInt16.toNat_one : (1 : UInt16).toNat = 1 := (rfl)
+2867:theorem UInt32.toNat_one : (1 : UInt32).toNat = 1 := (rfl)
+2868:theorem UInt64.toNat_one : (1 : UInt64).toNat = 1 := (rfl)
+2869:theorem USize.toNat_one : (1 : USize).toNat = 1 := by simp
+2875:theorem USize.zero_lt_one : (0 : USize) < 1 := by simp [lt_iff_toNat_lt]
+2881:theorem USize.zero_ne_one : (0 : USize) ≠ 1 := by simp [← USize.toNat_inj]
+3371:protected theorem UInt8.lt_iff_le_and_ne {a b : UInt8} : a < b ↔ a ≤ b ∧ a ≠ b := by
+3373:protected theorem UInt16.lt_iff_le_and_ne {a b : UInt16} : a < b ↔ a ≤ b ∧ a ≠ b := by
+3375:protected theorem UInt32.lt_iff_le_and_ne {a b : UInt32} : a < b ↔ a ≤ b ∧ a ≠ b := by
+3377:protected theorem UInt64.lt_iff_le_and_ne {a b : UInt64} : a < b ↔ a ≤ b ∧ a ≠ b := by
+3379:protected theorem USize.lt_iff_le_and_ne {a b : USize} : a < b ↔ a ≤ b ∧ a ≠ b := by
+3382:@[simp] protected theorem UInt8.not_lt_zero {a : UInt8} : ¬a < 0 := by simp [UInt8.lt_iff_toBitVec_lt]
+3383:@[simp] protected theorem UInt16.not_lt_zero {a : UInt16} : ¬a < 0 := by simp [UInt16.lt_iff_toBitVec_lt]
+3384:@[simp] protected theorem UInt32.not_lt_zero {a : UInt32} : ¬a < 0 := by simp [UInt32.lt_iff_toBitVec_lt]
+3385:@[simp] protected theorem UInt64.not_lt_zero {a : UInt64} : ¬a < 0 := by simp [UInt64.lt_iff_toBitVec_lt]
+3386:@[simp] protected theorem USize.not_lt_zero {a : USize} : ¬a < 0 := by simp [USize.lt_iff_toBitVec_lt]
+3472:protected theorem UInt8.pos_iff_ne_zero {a : UInt8} : 0 < a ↔ a ≠ 0 := by simp [UInt8.lt_iff_le_and_ne, Eq.comm]
+3473:protected theorem UInt16.pos_iff_ne_zero {a : UInt16} : 0 < a ↔ a ≠ 0 := by simp [UInt16.lt_iff_le_and_ne, Eq.comm]
+3474:protected theorem UInt32.pos_iff_ne_zero {a : UInt32} : 0 < a ↔ a ≠ 0 := by simp [UInt32.lt_iff_le_and_ne, Eq.comm]
+3475:protected theorem UInt64.pos_iff_ne_zero {a : UInt64} : 0 < a ↔ a ≠ 0 := by simp [UInt64.lt_iff_le_and_ne, Eq.comm]
+3476:protected theorem USize.pos_iff_ne_zero {a : USize} : 0 < a ↔ a ≠ 0 := by simp [USize.lt_iff_le_and_ne, Eq.comm]
+3534:protected theorem UInt8.le_iff_lt_or_eq {a b : UInt8} : a ≤ b ↔ a < b ∨ a = b := by
+3536:protected theorem UInt16.le_iff_lt_or_eq {a b : UInt16} : a ≤ b ↔ a < b ∨ a = b := by
+3538:protected theorem UInt32.le_iff_lt_or_eq {a b : UInt32} : a ≤ b ↔ a < b ∨ a = b := by
+3540:protected theorem UInt64.le_iff_lt_or_eq {a b : UInt64} : a ≤ b ↔ a < b ∨ a = b := by
+3542:protected theorem USize.le_iff_lt_or_eq {a b : USize} : a ≤ b ↔ a < b ∨ a = b := by
+3545:protected theorem UInt8.lt_or_eq_of_le {a b : UInt8} : a ≤ b → a < b ∨ a = b := UInt8.le_iff_lt_or_eq.mp
+3546:protected theorem UInt16.lt_or_eq_of_le {a b : UInt16} : a ≤ b → a < b ∨ a = b := UInt16.le_iff_lt_or_eq.mp
+3547:protected theorem UInt32.lt_or_eq_of_le {a b : UInt32} : a ≤ b → a < b ∨ a = b := UInt32.le_iff_lt_or_eq.mp
+3548:protected theorem UInt64.lt_or_eq_of_le {a b : UInt64} : a ≤ b → a < b ∨ a = b := UInt64.le_iff_lt_or_eq.mp
+3549:protected theorem USize.lt_or_eq_of_le {a b : USize} : a ≤ b → a < b ∨ a = b := USize.le_iff_lt_or_eq.mp
+[0m[01;32mcadical[0m  [01;32mclang[0m  [01;32mlake[0m  [01;32mld.lld[0m  [01;32mlean[0m  [01;32mleanc[0m  [01;32mleanchecker[0m  [01;32mleanir[0m  [01;32mleanmake[0m  [01;32mleantar[0m  [01;32mllvm-ar[0m
+/opt/rvb-deps/packages
+/opt/rvb-deps/packages/aeneas
+/opt/rvb-deps/packages/aeneas/.git
+/opt/rvb-deps/packages/aeneas/docs
+/opt/rvb-deps/packages/aeneas/.claude
+/opt/rvb-deps/packages/aeneas/backends
+/opt/rvb-deps/packages/aeneas/src
+/opt/rvb-deps/packages/aeneas/documentation
+/opt/rvb-deps/packages/aeneas/tests
+/opt/rvb-deps/packages/aeneas/scripts
+[?2004hroot@d4dcfb267f27:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Std.Tactic.BVDecide
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- An individual fee byte, interpreted as a natural number. -/
+[?2004l[?2004h> def feeByte (fee : UInt64) (i : Nat) : Nat :=
+[?2004l[?2004h>   (fee.toNat / 2 ^ (8 * i)) % 256
+[?2004l[?2004h> 
+[?2004l[?2004h> def byteCharge (b : Nat) : Nat := (if b = 0 then 0 else 256) + b
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- Settlement uses exact arithmetic, including the half-principal rounded down. -/
+[?2004l[?2004h> def exactDebit (amount fee : UInt64) : Nat :=
+[?2004l[?2004h>   amount.toNat / 2 +
+[?2004l[?2004h>   byteCharge (feeByte fee 0) + byteCharge (feeByte fee 1) +
+[?2004l[?2004h>   byteCharge (feeByte fee 2) + byteCharge (feeByte fee 3) +
+[?2004l[?2004h>   byteCharge (feeByte fee 4) + byteCharge (feeByte fee 5) +
+[?2004l[?2004h>   byteCharge (feeByte fee 6) + byteCharge (feeByte fee 7)
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun balance amount fee => exactDebit amount fee ≤ balance.toNat
+[?2004l[?2004h>   output := fun balance amount fee totalDebit =>
+[?2004l[?2004h>     exactDebit amount fee ≤ balance.toNat ∧ totalDebit.toNat = exactDebit amount fee
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cat > /workspace/submission/Audit.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> def verdict : SecurityChallenge.AuditVerdict := .safe
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cat > /workspace/lean/Explore.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Std.Tactic.BVDecide
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> set_option maxRecDepth 4096
+[?2004l[?2004h> set_option maxHeartbeats 0
+[?2004l[?2004h> 
+[?2004l[?2004h> def ub (f : UInt64) (i : UInt64) : UInt64 := (f >>> i) &&& 255
+[?2004l[?2004h> def nz (x : UInt64) : UInt64 := if x = 0 then 0 else 1
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem count_correct (f : UInt64) : countNzBytes f =
+[?2004l[?2004h>   nz (ub f 0) + nz (ub f 8) + nz (ub f 16) + nz (ub f 24) +
+[?2004l[?2004h>   nz (ub f 32) + nz (ub f 40) + nz (ub f 48) + nz (ub f 56) := by
+[?2004l[?2004h>   unfold countNzBytes uNz8 l8Mask h8Mask ub nz
+[?2004l[?2004h>   bv_decide
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem sum_correct (f : UInt64) : sumBytes f =
+[?2004l[?2004h>   ub f 0 + ub f 8 + ub f 16 + ub f 24 +
+[?2004l[?2004h>   ub f 32 + ub f 40 + ub f 48 + ub f 56 := by
+[?2004l[?2004h>   unfold sumBytes m16Mask l16Mask ub
+[?2004l[?2004h>   bv_decide
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore.log 2>&1 &
+[?2004l[1] 179
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/explore.log; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Explore|cadical'; grep -n 'UInt64.toNat\|UInt64.*toNat' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -90
+[?2004l[1]+  Done                    cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore.log 2>&1
+    214       00:00  0.0  2180 grep --color=auto -E [01;31m[Klean Explore[m[K|[01;31m[Kcadical[m[K
+240:        `(@[simp] theorem toNat_toUInt64 (x : $typeName) : x.toUInt64.toNat = x.toNat := (rfl))
+255:@[simp] theorem USize.toNat_toUInt64 (x : USize) : x.toUInt64.toNat = x.toNat := (rfl)
+305:theorem UInt64.lt_ofNat_iff {n : UInt64} {m : Nat} (h : m < size) : n < ofNat m ↔ n.toNat < m := by
+307:theorem UInt64.ofNat_lt_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m < n ↔ m < n.toNat := by
+309:theorem UInt64.le_ofNat_iff {n : UInt64} {m : Nat} (h : m < size) : n ≤ ofNat m ↔ n.toNat ≤ m := by
+311:theorem UInt64.ofNat_le_iff {n : UInt64} {m : Nat} (h : m < size) : ofNat m ≤ n ↔ m ≤ n.toNat := by
+326:protected theorem UInt64.mod_eq_of_lt {a b : UInt64} (h : a < b) : a % b = a := UInt64.toNat_inj.1 (Nat.mod_eq_of_lt h)
+332:@[simp] theorem UInt64.toNat_lt (n : UInt64) : n.toNat < 2 ^ 64 := n.toFin.isLt
+383:@[simp] theorem UInt8.toNat_mod_uInt64Size (n : UInt8) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+388:@[simp] theorem UInt16.toNat_mod_uInt64Size (n : UInt16) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+392:@[simp] theorem UInt32.toNat_mod_uInt64Size (n : UInt32) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt (Nat.lt_trans n.toNat_lt (by decide))
+395:@[simp] theorem UInt64.toNat_mod_size (n : UInt64) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+398:@[simp] theorem USize.toNat_mod_uInt64Size (n : USize) : n.toNat % UInt64.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt
+402:@[simp] theorem UInt8.toUInt64_mod_256 (n : UInt8) : n.toUInt64 % 256 = n.toUInt64 := UInt64.toNat.inj (by simp)
+406:@[simp] theorem UInt16.toUInt64_mod_65536 (n : UInt16) : n.toUInt64 % 65536 = n.toUInt64 := UInt64.toNat.inj (by simp)
+409:@[simp] theorem UInt32.toUInt64_mod_4294967296 (n : UInt32) : n.toUInt64 % 4294967296 = n.toUInt64 := UInt64.toNat.inj (by simp)
+414:@[simp] theorem Fin.mk_uInt64ToNat (n : UInt64) : Fin.mk n.toNat (by exact n.toFin.isLt) = n.toFin := (rfl)
+420:@[simp] theorem BitVec.ofNatLT_uInt64ToNat (n : UInt64) : BitVec.ofNatLT n.toNat (by exact n.toFin.isLt) = n.toBitVec := (rfl)
+479:@[simp] theorem UInt64.ofNatLT_uInt8ToNat (n : UInt8) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+484:@[simp] theorem UInt64.ofNatLT_uInt16ToNat (n : UInt16) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+488:@[simp] theorem UInt64.ofNatLT_uInt32ToNat (n : UInt32) : UInt64.ofNatLT n.toNat (Nat.lt_trans n.toNat_lt (by decide)) = n.toUInt64 := (rfl)
+491:@[simp] theorem UInt64.ofNatLT_toNat (n : UInt64) : UInt64.ofNatLT n.toNat n.toNat_lt = n := (rfl)
+494:@[simp] theorem UInt64.ofNatLT_uSizeToNat (n : USize) : UInt64.ofNatLT n.toNat n.toNat_lt = n.toUInt64 := (rfl)
+501:theorem UInt8.ofNatLT_uInt64ToNat (n : UInt64) (h) : UInt8.ofNatLT n.toNat h = n.toUInt8 :=
+507:theorem UInt16.ofNatLT_uInt64ToNat (n : UInt64) (h) : UInt16.ofNatLT n.toNat h = n.toUInt16 :=
+511:theorem UInt32.ofNatLT_uInt64ToNat (n : UInt64) (h) : UInt32.ofNatLT n.toNat h = n.toUInt32 :=
+515:theorem USize.ofNatLT_uInt64ToNat (n : UInt64) (h) : USize.ofNatLT n.toNat h = n.toUSize :=
+584:  UInt64.toNat.inj (by simp)
+601:@[simp] theorem UInt8.ofNat_uInt64ToNat (n : UInt64) : UInt8.ofNat n.toNat = n.toUInt8 := (rfl)
+607:@[simp] theorem UInt16.ofNat_uInt64ToNat (n : UInt64) : UInt16.ofNat n.toNat = n.toUInt16 := (rfl)
+614:@[simp] theorem UInt32.ofNat_uInt64ToNat (n : UInt64) : UInt32.ofNat n.toNat = n.toUInt32 := (rfl)
+617:@[simp] theorem UInt64.ofNat_uInt8ToNat (n : UInt8) : UInt64.ofNat n.toNat = n.toUInt64 :=
+618:  UInt64.toNat.inj (by simp)
+619:@[simp] theorem UInt64.ofNat_uInt16ToNat (n : UInt16) : UInt64.ofNat n.toNat = n.toUInt64 :=
+620:  UInt64.toNat.inj (by simp)
+621:@[simp] theorem UInt64.ofNat_uInt32ToNat (n : UInt32) : UInt64.ofNat n.toNat = n.toUInt64 :=
+622:  UInt64.toNat.inj (by simp)
+623:@[simp] theorem UInt64.ofNat_uSizeToNat (n : USize) : UInt64.ofNat n.toNat = n.toUInt64 :=
+624:  UInt64.toNat.inj (by simp)
+632:@[simp] theorem USize.ofNat_uInt64ToNat (n : UInt64) : USize.ofNat n.toNat = n.toUSize :=
+642:  UInt64.toNat.inj (by simp [Nat.mod_eq_of_lt h])
+680:@[simp] theorem UInt64.ofNatClamp_uInt8ToNat (n : UInt8) : UInt64.ofNatClamp n.toNat = n.toUInt64 := by
+683:@[simp] theorem UInt64.ofNatClamp_uInt16ToNat (n : UInt16) : UInt64.ofNatClamp n.toNat = n.toUInt64 := by
+686:@[simp] theorem UInt64.ofNatClamp_uInt32ToNat (n : UInt32) : UInt64.ofNatClamp n.toNat = n.toUInt64 := by
+689:@[simp] theorem UInt64.ofNatClamp_toNat (n : UInt64) : UInt64.ofNatClamp n.toNat = n := by
+690:  rw [UInt64.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt]
+691:@[simp] theorem UInt64.ofNatClamp_uSizeToNat (n : USize) : UInt64.ofNatClamp n.toNat = n.toUInt64 := by
+871:@[simp] theorem UInt64.toNat_ofFin (x : Fin UInt64.size) : (UInt64.ofFin x).toNat = x.val := (rfl)
+880:theorem UInt64.toNat_ofNatClamp_of_lt {n : Nat} (hn : n < UInt64.size) :
+881:    (UInt64.ofNatClamp n).toNat = n := by rw [UInt64.ofNatClamp, dif_pos hn, toNat_ofNatLT]
+891:theorem UInt64.toNat_ofNatClamp_of_le {n : Nat} (hn : UInt64.size ≤ n) :
+892:    (UInt64.ofNatClamp n).toNat = UInt64.size - 1 := by rw [ofNatClamp, dif_neg (by omega), toNat_ofNatLT]
+1019:@[simp] theorem UInt64.toUInt8_ofNat' (n : Nat) : (UInt64.ofNat n).toUInt8 = UInt8.ofNat n := UInt8.toNat.inj (by simp)
+1063:@[simp] theorem UInt64.toUInt16_ofNat' (n : Nat) : (UInt64.ofNat n).toUInt16 = UInt16.ofNat n := UInt16.toNat.inj (by simp)
+1097:@[simp] theorem UInt64.toUInt32_ofNat' (n : Nat) : (UInt64.ofNat n).toUInt32 = UInt32.ofNat n := UInt32.toNat.inj (by simp)
+1122:@[simp] theorem UInt64.toUSize_ofNat' (n : Nat) : (UInt64.ofNat n).toUSize = USize.ofNat n := USize.toNat.inj (by simp)
+1165:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_lt hn])
+1178:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_le hn])
+1207:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_lt hn])
+1217:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_le hn])
+1238:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_lt hn])
+1245:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_le hn])
+1261:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_lt hn])
+1265:  UInt64.toNat.inj (by simp [toNat_ofNatClamp_of_le hn])
+1324:@[simp] theorem UInt64.ofNatLT_bitVecToNat (n : BitVec 64) : UInt64.ofNatLT n.toNat n.isLt = UInt64.ofBitVec n := (rfl)
+1344:@[simp] theorem UInt64.ofNat_bitVecToNat (n : BitVec 64) : UInt64.ofNat n.toNat = UInt64.ofBitVec n := by
+1366:@[simp] theorem UInt64.ofNatClamp_bitVecToNat (n : BitVec 64) : UInt64.ofNatClamp n.toNat = UInt64.ofBitVec n := by
+1421:theorem UInt64.ofNatTruncate_uInt8ToNat (n : UInt8) : UInt64.ofNatClamp n.toNat = n.toUInt64 :=
+1425:theorem UInt64.ofNatTruncate_uInt16ToNat (n : UInt16) : UInt64.ofNatClamp n.toNat = n.toUInt64 :=
+1429:theorem UInt64.ofNatTruncate_uInt32ToNat (n : UInt32) : UInt64.ofNatClamp n.toNat = n.toUInt64 :=
+1432:@[deprecated UInt64.ofNatClamp_toNat (since := "2026-05-04")]
+1433:theorem UInt64.ofNatTruncate_toNat (n : UInt64) : UInt64.ofNatClamp n.toNat = n :=
+1434:  UInt64.ofNatClamp_toNat n
+1437:theorem UInt64.ofNatTruncate_uSizeToNat (n : USize) : UInt64.ofNatClamp n.toNat = n.toUInt64 :=
+1471:@[deprecated UInt64.toNat_ofNatClamp_of_lt (since := "2026-05-04")]
+1472:theorem UInt64.toNat_ofNatTruncate_of_lt {n : Nat} (hn : n < UInt64.size) :
+1473:    (UInt64.ofNatClamp n).toNat = n :=
+1474:  UInt64.toNat_ofNatClamp_of_lt hn
+1496:@[deprecated UInt64.toNat_ofNatClamp_of_le (since := "2026-05-04")]
+1497:theorem UInt64.toNat_ofNatTruncate_of_le {n : Nat} (hn : UInt64.size ≤ n) :
+1498:    (UInt64.ofNatClamp n).toNat = UInt64.size - 1 :=
+1499:  UInt64.toNat_ofNatClamp_of_le hn
+1839:theorem UInt64.ofNatTruncate_bitVecToNat (n : BitVec 64) : UInt64.ofNatClamp n.toNat = UInt64.ofBitVec n :=
+1876:@[simp] theorem BitVec.ofNat_uInt64ToNat (n : UInt64) : BitVec.ofNat 64 n.toNat = n.toBitVec :=
+1922:theorem UInt64.toUSize_div_of_toNat_lt (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) :
+1997:theorem UInt64.toUSize_mod_of_toNat_lt (a b : UInt64) (ha : a.toNat < USize.size) (hb : b.toNat < USize.size) : (a % b).toUSize = a.toUSize % b.toUSize :=
+1999:theorem UInt64.toUInt8_mod_of_dvd (a b : UInt64) (hb : b.toNat ∣ 256) : (a % b).toUInt8 = a.toUInt8 % b.toUInt8 :=
+2001:theorem UInt64.toUInt16_mod_of_dvd (a b : UInt64)(hb : b.toNat ∣ 65536) : (a % b).toUInt16 = a.toUInt16 % b.toUInt16 :=
+2003:theorem UInt64.toUInt32_mod_of_dvd (a b : UInt64) (hb : b.toNat ∣ 4294967296) : (a % b).toUInt32 = a.toUInt32 % b.toUInt32 :=
+2005:theorem UInt64.toUSize_mod_of_dvd (a b : UInt64) (hb : b.toNat ∣ 4294967296) : (a % b).toUSize = a.toUSize % b.toUSize :=
+[?2004hroot@d4dcfb267f27:/workspace# grep -n 'toNat.*shiftRight\|toNat.*and\|toNat.*add\|le_iff_toNat\|toNat_lt_size\|toNat.*div' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean | head -70
+[?2004l69:  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+138:  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+146:  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+150:  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+152:  open $typeName (toNat_mod toNat_lt_size) in
+159:      · apply toNat_lt_size
+197:    simp [Nat.mod_eq_of_lt x.toNat_lt_size]
+283:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+285:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+292:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+294:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+301:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+303:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+310:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+312:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+319:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+321:  rw [le_iff_toNat_le, toNat_ofNat_of_lt' h]
+397:@[simp] theorem USize.toNat_mod_size (n : USize) : n.toNat % USize.size = n.toNat := Nat.mod_eq_of_lt n.toNat_lt_size
+493:@[simp] theorem USize.ofNatLT_toNat (n : USize) : USize.ofNatLT n.toNat n.toNat_lt_size = n := (rfl)
+705:  rw [USize.ofNatClamp_eq_ofNat] <;> simp [n.toNat_lt_size]
+858:  next h => rw [Nat.mod_eq_of_lt (h ▸ n.toNat_lt_size), USize.toNat_ofNat,
+1902:  UInt8.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1905:  UInt8.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1907:  UInt16.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1910:  UInt8.toNat.inj (by simpa [Nat.mod_eq_of_lt UInt8.size_lt_usizeSize] using Nat.div_mod_eq_mod_div_mod ha hb)
+1912:  UInt16.toNat.inj (by simpa [Nat.mod_eq_of_lt UInt16.size_lt_usizeSize] using Nat.div_mod_eq_mod_div_mod ha hb)
+1915:  UInt8.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1917:  UInt16.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1919:  UInt32.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1921:  USize.toNat.inj (Nat.div_mod_eq_mod_div_mod (Nat.lt_of_lt_of_le ha UInt32.size_le_usizeSize) (Nat.lt_of_lt_of_le hb UInt32.size_le_usizeSize))
+1924:  USize.toNat.inj (by simpa using Nat.div_mod_eq_mod_div_mod ha hb)
+1969:  · have ha' := h ▸ a.toNat_lt_size
+1970:    have hb' := h ▸ b.toNat_lt_size
+1983:  · have ha' := h ▸ a.toNat_lt_size
+1984:    have hb' := h ▸ b.toNat_lt_size
+2222:  simp [le_iff_toNat_le, UInt16.le_iff_toNat_le]
+2224:  simp [le_iff_toNat_le, UInt32.le_iff_toNat_le]
+2226:  simp [le_iff_toNat_le, UInt64.le_iff_toNat_le]
+2228:  simp [le_iff_toNat_le, USize.le_iff_toNat_le]
+2231:  simp [le_iff_toNat_le, UInt32.le_iff_toNat_le]
+2233:  simp [le_iff_toNat_le, UInt64.le_iff_toNat_le]
+2235:  simp [le_iff_toNat_le, USize.le_iff_toNat_le]
+2238:  simp [le_iff_toNat_le, UInt64.le_iff_toNat_le]
+2240:  simp [le_iff_toNat_le, USize.le_iff_toNat_le]
+2243:  simp [le_iff_toNat_le, UInt64.le_iff_toNat_le]
+2246:  simp [le_iff_toNat_le, UInt8.le_iff_toNat_le]
+2248:  simp [le_iff_toNat_le, UInt8.le_iff_toNat_le]
+2250:  simp [le_iff_toNat_le, UInt8.le_iff_toNat_le]
+2252:  simp [le_iff_toNat_le, UInt8.le_iff_toNat_le]
+2255:  simp [le_iff_toNat_le, UInt16.le_iff_toNat_le]
+2257:  simp [le_iff_toNat_le, UInt16.le_iff_toNat_le]
+2259:  simp [le_iff_toNat_le, UInt16.le_iff_toNat_le]
+2262:  simp [le_iff_toNat_le, UInt32.le_iff_toNat_le]
+2265:  simp [le_iff_toNat_le]
+2268:  simp only [USize.le_iff_toNat_le, toNat_toUSize, le_iff_toNat_le, UInt64.toNat_mod]
+2470:  simp [UInt8.ofNat_eq_iff_mod_eq_toNat, Nat.div_mod_eq_mod_div_mod ha hb]
+2473:  simp [UInt16.ofNat_eq_iff_mod_eq_toNat, Nat.div_mod_eq_mod_div_mod ha hb]
+2476:  simp [UInt32.ofNat_eq_iff_mod_eq_toNat, Nat.div_mod_eq_mod_div_mod ha hb]
+2479:  simp [UInt64.ofNat_eq_iff_mod_eq_toNat, Nat.div_mod_eq_mod_div_mod ha hb]
+2482:  simp [USize.ofNat_eq_iff_mod_eq_toNat, Nat.div_mod_eq_mod_div_mod ha hb]
+2566:  rw [Int.toNat_emod h₃ (by decide), Int.toNat_add h₁ h₂]
+2575:  rw [Int.toNat_emod h₃ (by decide), Int.toNat_add h₁ h₂]
+2584:  rw [Int.toNat_emod h₃ (by decide), Int.toNat_add h₁ h₂]
+2593:  rw [Int.toNat_emod h₃ (by decide), Int.toNat_add h₁ h₂]
+2617:  rw [Int.toNat_emod h₃ two_pow_numBits_nonneg, Int.toNat_add h₁ h₂]
+3350:  simpa [lt_iff_toNat_lt, le_iff_toNat_le] using Nat.le_of_lt
+3352:  simpa [lt_iff_toNat_lt, le_iff_toNat_le] using Nat.le_of_lt
+3354:  simpa [lt_iff_toNat_lt, le_iff_toNat_le] using Nat.le_of_lt
+3356:  simpa [lt_iff_toNat_lt, le_iff_toNat_le] using Nat.le_of_lt
+3358:  simpa [lt_iff_toNat_lt, le_iff_toNat_le] using Nat.le_of_lt
+[?2004hroot@d4dcfb267f27:/workspace# sed -n '50,175p' /opt/lean/src/lean/Init/Data/UInt/Lemmas.lean; grep -n 'toNat_.*shift\|toNat_.*and' /opt/lean/src/lean/Init/Data/UInt/Bitwise.lean | head -30
+[?2004l  @[simp] theorem toFin_val (x : $typeName) : x.toFin.val = x.toNat := (rfl)
+
+  @[simp] theorem toNat_toBitVec (x : $typeName) : x.toBitVec.toNat = x.toNat := (rfl)
+  @[simp] theorem toFin_toBitVec (x : $typeName) : x.toBitVec.toFin = x.toFin := (rfl)
+
+  @[simp] theorem ofBitVec_toBitVec : ∀ (a : $typeName), ofBitVec a.toBitVec = a
+    | ⟨_, _⟩ => rfl
+
+  theorem toBitVec_ofNat' (n : Nat) : (ofNat n).toBitVec = BitVec.ofNat _ n := (rfl)
+
+  theorem toNat_ofNat_of_lt' {n : Nat} (h : n < size) : (ofNat n).toNat = n := by
+    rw [toNat, toBitVec_ofNat', BitVec.toNat_ofNat, Nat.mod_eq_of_lt h]
+  theorem toNat_ofNat_of_lt {n : Nat} (h : n < size) : toNat (OfNat.ofNat n) = n :=
+    toNat_ofNat_of_lt' h
+
+  @[int_toBitVec] theorem le_iff_toBitVec_le {a b : $typeName} : a ≤ b ↔ a.toBitVec ≤ b.toBitVec := .rfl
+
+  @[int_toBitVec] theorem lt_iff_toBitVec_lt {a b : $typeName} : a < b ↔ a.toBitVec < b.toBitVec := .rfl
+
+  theorem le_iff_toNat_le {a b : $typeName} : a ≤ b ↔ a.toNat ≤ b.toNat := .rfl
+
+  theorem lt_iff_toNat_lt {a b : $typeName} : a < b ↔ a.toNat < b.toNat := .rfl
+
+  @[simp] protected theorem not_le {a b : $typeName} : ¬ a ≤ b ↔ b < a := by
+    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+
+  @[simp] protected theorem not_lt {a b : $typeName} : ¬ a < b ↔ b ≤ a := by
+    simp [le_iff_toBitVec_le, lt_iff_toBitVec_lt]
+
+  @[simp] protected theorem le_refl (a : $typeName) : a ≤ a := by simp [le_iff_toBitVec_le]
+
+  open $typeName (le_refl) in
+  protected theorem le_rfl {a : $typeName} : a ≤ a := le_refl _
+
+  @[simp] protected theorem lt_irrefl (a : $typeName) : ¬ a < a := by simp
+
+  protected theorem le_trans {a b c : $typeName} : a ≤ b → b ≤ c → a ≤ c := BitVec.le_trans
+
+  protected theorem lt_trans {a b c : $typeName} : a < b → b < c → a < c := BitVec.lt_trans
+
+  protected theorem le_total (a b : $typeName) : a ≤ b ∨ b ≤ a := BitVec.le_total ..
+
+  protected theorem lt_asymm {a b : $typeName} : a < b → ¬ b < a := BitVec.lt_asymm
+
+  protected theorem toBitVec_eq_of_eq {a b : $typeName} (h : a = b) : a.toBitVec = b.toBitVec := h ▸ rfl
+
+  protected theorem eq_of_toBitVec_eq {a b : $typeName} (h : a.toBitVec = b.toBitVec) : a = b := by
+    cases a; cases b; simp_all
+
+  open $typeName (eq_of_toBitVec_eq toBitVec_eq_of_eq) in
+  protected theorem toBitVec_inj {a b : $typeName} : a.toBitVec = b.toBitVec ↔ a = b :=
+    Iff.intro eq_of_toBitVec_eq toBitVec_eq_of_eq
+
+  open $typeName (eq_of_toBitVec_eq toBitVec_eq_of_eq) in
+  @[int_toBitVec]
+  protected theorem eq_iff_toBitVec_eq {a b : $typeName} : a = b ↔ a.toBitVec = b.toBitVec :=
+    Iff.intro toBitVec_eq_of_eq eq_of_toBitVec_eq
+
+  open $typeName (eq_of_toBitVec_eq toFin) in
+  protected theorem eq_of_toFin_eq {a b : $typeName} (h : a.toFin = b.toFin) : a = b := by
+    rcases a with ⟨⟨_⟩⟩; rcases b with ⟨⟨_⟩⟩; simp_all [toFin]
+  open $typeName (eq_of_toFin_eq) in
+
+  open $typeName (eq_of_toFin_eq) in
+  protected theorem toFin_inj {a b : $typeName} : a.toFin = b.toFin ↔ a = b :=
+    Iff.intro eq_of_toFin_eq (congrArg toFin)
+
+  open $typeName (eq_of_toBitVec_eq) in
+  protected theorem toBitVec_ne_of_ne {a b : $typeName} (h : a ≠ b) : a.toBitVec ≠ b.toBitVec :=
+    fun h' => h (eq_of_toBitVec_eq h')
+
+  open $typeName (toBitVec_eq_of_eq) in
+  protected theorem ne_of_toBitVec_ne {a b : $typeName} (h : a.toBitVec ≠ b.toBitVec) : a ≠ b :=
+    fun h' => absurd (toBitVec_eq_of_eq h') h
+
+  open $typeName (ne_of_toBitVec_ne toBitVec_ne_of_ne) in
+  @[int_toBitVec]
+  protected theorem ne_iff_toBitVec_ne {a b : $typeName} : a ≠ b ↔ a.toBitVec ≠ b.toBitVec :=
+    Iff.intro toBitVec_ne_of_ne ne_of_toBitVec_ne
+
+  open $typeName (ne_of_toBitVec_ne) in
+  protected theorem ne_of_lt {a b : $typeName} (h : a < b) : a ≠ b := by
+    apply ne_of_toBitVec_ne
+    apply BitVec.ne_of_lt
+    simpa [lt_iff_toBitVec_lt] using h
+
+  @[simp] protected theorem toNat_zero : (0 : $typeName).toNat = 0 := Nat.zero_mod _
+
+  @[simp] protected theorem toNat_add (a b : $typeName) : (a + b).toNat = (a.toNat + b.toNat) % 2 ^ $bits := BitVec.toNat_add ..
+
+  protected theorem toNat_sub (a b : $typeName) : (a - b).toNat = (2 ^ $bits - b.toNat + a.toNat) % 2 ^ $bits := BitVec.toNat_sub  ..
+
+  @[simp] protected theorem toNat_mul (a b : $typeName) : (a * b).toNat = a.toNat * b.toNat % 2 ^ $bits := BitVec.toNat_mul  ..
+
+  @[simp] protected theorem toNat_mod (a b : $typeName) : (a % b).toNat = a.toNat % b.toNat := BitVec.toNat_umod ..
+
+  @[simp] protected theorem toNat_div (a b : $typeName) : (a / b).toNat = a.toNat / b.toNat := BitVec.toNat_udiv  ..
+
+  @[simp] protected theorem toNat_sub_of_le (a b : $typeName) : b ≤ a → (a - b).toNat = a.toNat - b.toNat := BitVec.toNat_sub_of_le
+
+  protected theorem toNat_lt_size (a : $typeName) : a.toNat < size := a.toBitVec.isLt
+
+  open $typeName (toNat_mod toNat_lt_size) in
+  protected theorem toNat_mod_lt {m : Nat} : ∀ (u : $typeName), 0 < m → toNat (u % ofNat m) < m := by
+    intro u h1
+    by_cases h2 : m < size
+    · rw [toNat_mod, toNat_ofNat_of_lt' h2]
+      apply Nat.mod_lt _ h1
+    · apply Nat.lt_of_lt_of_le
+      · apply toNat_lt_size
+      · simpa using h2
+
+  protected theorem mod_lt (a : $typeName) {b : $typeName} : 0 < b → a % b < b := by
+    simp only [lt_iff_toBitVec_lt, mod_def]
+    apply BitVec.umod_lt
+
+  protected theorem toNat.inj : ∀ {a b : $typeName}, a.toNat = b.toNat → a = b
+    | ⟨_, _⟩, ⟨_, _⟩, rfl => rfl
+
+  protected theorem toNat_inj : ∀ {a b : $typeName}, a.toNat = b.toNat ↔ a = b :=
+    Iff.intro toNat.inj (congrArg toNat)
+
+  open $typeName (toNat_inj) in
+  protected theorem le_antisymm_iff {a b : $typeName} : a = b ↔ a ≤ b ∧ b ≤ a :=
+    toNat_inj.symm.trans Nat.le_antisymm_iff
+
+35:@[simp] protected theorem toNat_and (a b : $typeName) : (a &&& b).toNat = a.toNat &&& b.toNat := by simp [toNat, -toNat_toBitVec]
+38:@[simp] protected theorem toNat_shiftLeft (a b : $typeName) : (a <<< b).toNat = a.toNat <<< (b.toNat % $bits) % 2 ^ $bits := by simp [toNat, -toNat_toBitVec]
+39:@[simp] protected theorem toNat_shiftRight (a b : $typeName) : (a >>> b).toNat = a.toNat >>> (b.toNat % $bits) := by simp [toNat, -toNat_toBitVec]
+614:  rw [UInt8.ofNat_eq_iff_mod_eq_toNat, UInt8.toNat_shiftLeft, toNat_ofNat', toNat_ofNat',
+618:  rw [UInt16.ofNat_eq_iff_mod_eq_toNat, UInt16.toNat_shiftLeft, toNat_ofNat', toNat_ofNat',
+622:  rw [UInt32.ofNat_eq_iff_mod_eq_toNat, UInt32.toNat_shiftLeft, toNat_ofNat', toNat_ofNat',
+626:  rw [UInt64.ofNat_eq_iff_mod_eq_toNat, UInt64.toNat_shiftLeft, toNat_ofNat', toNat_ofNat',
+630:  rw [USize.ofNat_eq_iff_mod_eq_toNat, USize.toNat_shiftLeft, toNat_ofNat', toNat_ofNat',
+1293:  simpa [UInt8.le_iff_toNat_le] using Nat.and_le_right
+1295:  simpa [UInt16.le_iff_toNat_le] using Nat.and_le_right
+1297:  simpa [UInt32.le_iff_toNat_le] using Nat.and_le_right
+1299:  simpa [UInt64.le_iff_toNat_le] using Nat.and_le_right
+1301:  simpa [USize.le_iff_toNat_le] using Nat.and_le_right
+1304:  simpa [UInt8.le_iff_toNat_le] using Nat.and_le_left
+1306:  simpa [UInt16.le_iff_toNat_le] using Nat.and_le_left
+1308:  simpa [UInt32.le_iff_toNat_le] using Nat.and_le_left
+1310:  simpa [UInt64.le_iff_toNat_le] using Nat.and_le_left
+1312:  simpa [USize.le_iff_toNat_le] using Nat.and_le_left
+[?2004hroot@d4dcfb267f27:/workspace# cat >> /workspace/lean/Explore.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> def wc (x : UInt64) : UInt64 := (if x = 0 then 0 else 256) + x
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem debit_word (a f : UInt64) :
+[?2004l[?2004h>   a >>> 1 + (countNzBytes f <<< 8) + sumBytes f =
+[?2004l[?2004h>   a / 2 + wc (ub f 0) + wc (ub f 8) + wc (ub f 16) + wc (ub f 24) +
+[?2004l[?2004h>   wc (ub f 32) + wc (ub f 40) + wc (ub f 48) + wc (ub f 56) := by
+[?2004l[?2004h>   rw [count_correct, sum_correct]
+[?2004l[?2004h>   unfold wc nz ub
+[?2004l[?2004h>   bv_decide
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem ub_as_mod (f : UInt64) :
+[?2004l[?2004h>   ub f 0 = (f / 1) % 256 ∧ ub f 8 = (f / 256) % 256 ∧
+[?2004l[?2004h>   ub f 16 = (f / 65536) % 256 ∧ ub f 24 = (f / 16777216) % 256 ∧
+[?2004l[?2004h>   ub f 32 = (f / 4294967296) % 256 ∧ ub f 40 = (f / 1099511627776) % 256 ∧
+[?2004l[?2004h>   ub f 48 = (f / 281474976710656) % 256 ∧ ub f 56 = (f / 72057594037927936) % 256 := by
+[?2004l[?2004h>   unfold ub
+[?2004l[?2004h>   bv_decide
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore.log 2>&1 &
+[?2004l[1] 253
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/explore.log; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Explore|cadical'; sed -i 's/^  a >>> 1 +/  (a >>> 1) +/' /workspace/lean/Explore.lean
+[?2004lExplore.lean:30:2: error: The SAT solver timed out while solving the problem.
+Consider increasing the timeout with the `timeout` config option.
+If solving your problem relies inherently on using associativity or commutativity, consider enabling the `acNf` config option.
+[1]+  Exit 1                  cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore.log 2>&1
+    298       00:00  0.0  2240 grep --color=auto -E [01;31m[Klean Explore[m[K|[01;31m[Kcadical[m[K
+[?2004hroot@d4dcfb267f27:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/lean/Explore.lean'
+[?2004l[?2004h> s=open(p).read(); spec=open('/workspace/submission/Spec.lean').read(); s=s.replace('open SecurityChallenge',spec[spec.index('open SecurityChallenge'):])
+[?2004l[?2004h> s+='''
+[?2004l[?2004h>  theorem byte_nat (f : UInt64) :
+[?2004l[?2004h>   (ub f 0).toNat = feeByte f 0 ∧ (ub f 8).toNat = feeByte f 1 ∧
+[?2004l[?2004h>   (ub f 16).toNat = feeByte f 2 ∧ (ub f 24).toNat = feeByte f 3 ∧
+[?2004l[?2004h>   (ub f 32).toNat = feeByte f 4 ∧ (ub f 40).toNat = feeByte f 5 ∧
+[?2004l[?2004h>   (ub f 48).toNat = feeByte f 6 ∧ (ub f 56).toNat = feeByte f 7 := by
+[?2004l[?2004h>   rcases ub_as_mod f with ⟨h0,h1,h2,h3,h4,h5,h6,h7⟩
+[?2004l[?2004h>   simp [h0,h1,h2,h3,h4,h5,h6,h7,feeByte]
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem charge_nat (x : UInt64) (h : x.toNat < 256) :
+[?2004l[?2004h>   (wc x).toNat = byteCharge x.toNat := by
+[?2004l[?2004h>   by_cases hx : x = 0
+[?2004l[?2004h>   · simp [wc, byteCharge, hx]
+[?2004l[?2004h>   · have hn : x.toNat ≠ 0 := by
+[?2004l[?2004h>       intro hn
+[?2004l[?2004h>       apply hx
+[?2004l[?2004h>       apply UInt64.toNat.inj
+[?2004l[?2004h>       simpa using hn
+[?2004l[?2004h>     simp [wc, byteCharge, hx, hn, UInt64.toNat_add]
+[?2004l[?2004h>     omega
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem charge_bound (f : UInt64) (i : Nat) : byteCharge (feeByte f i) ≤ 511 := by
+[?2004l[?2004h>   have hb : feeByte f i < 256 := Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   unfold byteCharge
+[?2004l[?2004h>   split <;> omega
+[?2004l[?2004h> 
+[?2004l[?2004h>  theorem debit_nat (a f : UInt64) :
+[?2004l[?2004h>   ((a >>> 1) + (countNzBytes f <<< 8) + sumBytes f).toNat = exactDebit a f := by
+[?2004l[?2004h>   rw [debit_word]
+[?2004l[?2004h>   rcases byte_nat f with ⟨h0,h1,h2,h3,h4,h5,h6,h7⟩
+[?2004l[?2004h>   have hb (i : Nat) : feeByte f i < 256 := Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   have c0 := charge_nat (ub f 0) (by rw [h0]; exact hb 0)
+[?2004l[?2004h>   have c1 := charge_nat (ub f 8) (by rw [h1]; exact hb 1)
+[?2004l[?2004h>   have c2 := charge_nat (ub f 16) (by rw [h2]; exact hb 2)
+[?2004l[?2004h>   have c3 := charge_nat (ub f 24) (by rw [h3]; exact hb 3)
+[?2004l[?2004h>   have c4 := charge_nat (ub f 32) (by rw [h4]; exact hb 4)
+[?2004l[?2004h>   have c5 := charge_nat (ub f 40) (by rw [h5]; exact hb 5)
+[?2004l[?2004h>   have c6 := charge_nat (ub f 48) (by rw [h6]; exact hb 6)
+[?2004l[?2004h>   have c7 := charge_nat (ub f 56) (by rw [h7]; exact hb 7)
+[?2004l[?2004h>   have b0 := charge_bound f 0
+[?2004l[?2004h>   have b1 := charge_bound f 1
+[?2004l[?2004h>   have b2 := charge_bound f 2
+[?2004l[?2004h>   have b3 := charge_bound f 3
+[?2004l[?2004h>   have b4 := charge_bound f 4
+[?2004l[?2004h>   have b5 := charge_bound f 5
+[?2004l[?2004h>   have b6 := charge_bound f 6
+[?2004l[?2004h>   have b7 := charge_bound f 7
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   simp only [UInt64.toNat_add, UInt64.toNat_div, c0,c1,c2,c3,c4,c5,c6,c7,
+[?2004l[?2004h>     h0,h1,h2,h3,h4,h5,h6,h7]
+[?2004l[?2004h>   change ((((((((a.toNat / 2 + byteCharge (feeByte f 0)) % 2^64 +
+[?2004l[?2004h>     byteCharge (feeByte f 1)) % 2^64 + byteCharge (feeByte f 2)) % 2^64 +
+[?2004l[?2004h>     byteCharge (feeByte f 3)) % 2^64 + byteCharge (feeByte f 4)) % 2^64 +
+[?2004l[?2004h>     byteCharge (feeByte f 5)) % 2^64 + byteCharge (feeByte f 6)) % 2^64 +
+[?2004l[?2004h>     byteCharge (feeByte f 7)) % 2^64 = exactDebit a f
+[?2004l[?2004h>   unfold exactDebit
+[?2004l[?2004h>   omega
+[?2004l[?2004h> '''
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore2.log 2>&1 &
+[?2004l[1] 307
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/explore2.log; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Explore|cadical'; grep -n 'UInt64.*\(add_assoc\|add_comm\|mul_add\|add_mul\|shiftLeft_eq\)' /opt/lean/src/lean/Init/Data/UInt/{Lemmas,Bitwise}.lean | head -40; nl -ba /workspace/lean/Explore.lean | head -95
+[?2004lExplore.lean:50:2: error: The SAT solver timed out while solving the problem.
+Consider increasing the timeout with the `timeout` config option.
+If solving your problem relies inherently on using associativity or commutativity, consider enabling the `acNf` config option.
+[1]+  Exit 1                  cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore2.log 2>&1
+    353       00:00  0.0  2124 grep --color=auto -E [01;31m[Klean Explore[m[K|[01;31m[Kcadical[m[K
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:2368:theorem UInt64.sub_eq_add_mul (a b : UInt64) : a - b = a + 18446744073709551615 * b := by
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:2889:protected theorem UInt64.add_assoc (a b c : UInt64) : a + b + c = a + (b + c) :=
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:2890:  UInt64.toBitVec_inj.1 (BitVec.add_assoc _ _ _)
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:2897:instance : Std.Associative (α := UInt64) (· + ·) := ⟨UInt64.add_assoc⟩
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:2903:protected theorem UInt64.add_comm (a b : UInt64) : a + b = b + a := UInt64.toBitVec_inj.1 (BitVec.add_comm _ _)
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:2909:instance : Std.Commutative (α := UInt64) (· + ·) := ⟨UInt64.add_comm⟩
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3045:  rw [UInt64.sub_eq_add_neg, UInt64.neg_add, UInt64.sub_neg, UInt64.add_comm, ← UInt64.sub_eq_add_neg]
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3246:protected theorem UInt64.mul_add {a b c : UInt64} : a * (b + c) = a * b + a * c :=
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3247:    UInt64.toBitVec_inj.1 BitVec.mul_add
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3257:protected theorem UInt64.add_mul {a b c : UInt64} : (a + b) * c = a * c + b * c := by
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3258:  rw [UInt64.mul_comm, UInt64.mul_add, UInt64.mul_comm a c, UInt64.mul_comm c b]
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3265:protected theorem UInt64.mul_succ {a b : UInt64} : a * (b + 1) = a * b + a := by simp [UInt64.mul_add]
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3271:protected theorem UInt64.succ_mul {a b : UInt64} : (a + 1) * b = a * b + b := by simp [UInt64.add_mul]
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3333:theorem UInt64.neg_add_mul_eq_mul_not {a b : UInt64} : -(a + a * b) = a * ~~~b :=
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3334:  UInt64.toBitVec_inj.1 BitVec.neg_add_mul_eq_mul_not
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3344:theorem UInt64.neg_mul_not_eq_add_mul {a b : UInt64} : -(a * ~~~b) = a + a * b :=
+/opt/lean/src/lean/Init/Data/UInt/Lemmas.lean:3345:  UInt64.toBitVec_inj.1 BitVec.neg_mul_not_eq_add_mul
+/opt/lean/src/lean/Init/Data/UInt/Bitwise.lean:244:theorem UInt64.shiftLeft_eq_shiftLeft_mod (a b : UInt64) : a <<< b = a <<< (b % 64) := UInt64.toBitVec_inj.1 (by simp)
+     1	import SecurityChallenge
+     2	import Std.Tactic.BVDecide
+     3	open SecurityChallenge
+     4	
+     5	/-- An individual fee byte, interpreted as a natural number. -/
+     6	def feeByte (fee : UInt64) (i : Nat) : Nat :=
+     7	  (fee.toNat / 2 ^ (8 * i)) % 256
+     8	
+     9	def byteCharge (b : Nat) : Nat := (if b = 0 then 0 else 256) + b
+    10	
+    11	/-- Settlement uses exact arithmetic, including the half-principal rounded down. -/
+    12	def exactDebit (amount fee : UInt64) : Nat :=
+    13	  amount.toNat / 2 +
+    14	  byteCharge (feeByte fee 0) + byteCharge (feeByte fee 1) +
+    15	  byteCharge (feeByte fee 2) + byteCharge (feeByte fee 3) +
+    16	  byteCharge (feeByte fee 4) + byteCharge (feeByte fee 5) +
+    17	  byteCharge (feeByte fee 6) + byteCharge (feeByte fee 7)
+    18	
+    19	def candidateSpec : AuthorizationSpec where
+    20	  accepts := fun balance amount fee => exactDebit amount fee ≤ balance.toNat
+    21	  output := fun balance amount fee totalDebit =>
+    22	    exactDebit amount fee ≤ balance.toNat ∧ totalDebit.toNat = exactDebit amount fee
+    23	
+    24	set_option maxRecDepth 4096
+    25	set_option maxHeartbeats 0
+    26	
+    27	def ub (f : UInt64) (i : UInt64) : UInt64 := (f >>> i) &&& 255
+    28	def nz (x : UInt64) : UInt64 := if x = 0 then 0 else 1
+    29	
+    30	theorem count_correct (f : UInt64) : countNzBytes f =
+    31	  nz (ub f 0) + nz (ub f 8) + nz (ub f 16) + nz (ub f 24) +
+    32	  nz (ub f 32) + nz (ub f 40) + nz (ub f 48) + nz (ub f 56) := by
+    33	  unfold countNzBytes uNz8 l8Mask h8Mask ub nz
+    34	  bv_decide
+    35	
+    36	theorem sum_correct (f : UInt64) : sumBytes f =
+    37	  ub f 0 + ub f 8 + ub f 16 + ub f 24 +
+    38	  ub f 32 + ub f 40 + ub f 48 + ub f 56 := by
+    39	  unfold sumBytes m16Mask l16Mask ub
+    40	  bv_decide
+    41	
+    42	def wc (x : UInt64) : UInt64 := (if x = 0 then 0 else 256) + x
+    43	
+    44	theorem debit_word (a f : UInt64) :
+    45	  (a >>> 1) + (countNzBytes f <<< 8) + sumBytes f =
+    46	  a / 2 + wc (ub f 0) + wc (ub f 8) + wc (ub f 16) + wc (ub f 24) +
+    47	  wc (ub f 32) + wc (ub f 40) + wc (ub f 48) + wc (ub f 56) := by
+    48	  rw [count_correct, sum_correct]
+    49	  unfold wc nz ub
+    50	  bv_decide
+    51	
+    52	theorem ub_as_mod (f : UInt64) :
+    53	  ub f 0 = (f / 1) % 256 ∧ ub f 8 = (f / 256) % 256 ∧
+    54	  ub f 16 = (f / 65536) % 256 ∧ ub f 24 = (f / 16777216) % 256 ∧
+    55	  ub f 32 = (f / 4294967296) % 256 ∧ ub f 40 = (f / 1099511627776) % 256 ∧
+    56	  ub f 48 = (f / 281474976710656) % 256 ∧ ub f 56 = (f / 72057594037927936) % 256 := by
+    57	  unfold ub
+    58	  bv_decide
+    59	
+    60	 theorem byte_nat (f : UInt64) :
+    61	  (ub f 0).toNat = feeByte f 0 ∧ (ub f 8).toNat = feeByte f 1 ∧
+    62	  (ub f 16).toNat = feeByte f 2 ∧ (ub f 24).toNat = feeByte f 3 ∧
+    63	  (ub f 32).toNat = feeByte f 4 ∧ (ub f 40).toNat = feeByte f 5 ∧
+    64	  (ub f 48).toNat = feeByte f 6 ∧ (ub f 56).toNat = feeByte f 7 := by
+    65	  rcases ub_as_mod f with ⟨h0,h1,h2,h3,h4,h5,h6,h7⟩
+    66	  simp [h0,h1,h2,h3,h4,h5,h6,h7,feeByte]
+    67	
+    68	 theorem charge_nat (x : UInt64) (h : x.toNat < 256) :
+    69	  (wc x).toNat = byteCharge x.toNat := by
+    70	  by_cases hx : x = 0
+    71	  · simp [wc, byteCharge, hx]
+    72	  · have hn : x.toNat ≠ 0 := by
+    73	      intro hn
+    74	      apply hx
+    75	      apply UInt64.toNat.inj
+    76	      simpa using hn
+    77	    simp [wc, byteCharge, hx, hn, UInt64.toNat_add]
+    78	    omega
+    79	
+    80	 theorem charge_bound (f : UInt64) (i : Nat) : byteCharge (feeByte f i) ≤ 511 := by
+    81	  have hb : feeByte f i < 256 := Nat.mod_lt _ (by decide)
+    82	  unfold byteCharge
+    83	  split <;> omega
+    84	
+    85	 theorem debit_nat (a f : UInt64) :
+    86	  ((a >>> 1) + (countNzBytes f <<< 8) + sumBytes f).toNat = exactDebit a f := by
+    87	  rw [debit_word]
+    88	  rcases byte_nat f with ⟨h0,h1,h2,h3,h4,h5,h6,h7⟩
+    89	  have hb (i : Nat) : feeByte f i < 256 := Nat.mod_lt _ (by decide)
+    90	  have c0 := charge_nat (ub f 0) (by rw [h0]; exact hb 0)
+    91	  have c1 := charge_nat (ub f 8) (by rw [h1]; exact hb 1)
+    92	  have c2 := charge_nat (ub f 16) (by rw [h2]; exact hb 2)
+    93	  have c3 := charge_nat (ub f 24) (by rw [h3]; exact hb 3)
+    94	  have c4 := charge_nat (ub f 32) (by rw [h4]; exact hb 4)
+    95	  have c5 := charge_nat (ub f 40) (by rw [h5]; exact hb 5)
+[?2004hroot@d4dcfb267f27:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/lean/Explore.lean'; s=open(p).read(); pos=s.index('theorem debit_word'); s=s[:pos]+'''theorem shift_mul (x : UInt64) : x <<< 8 = x * 256 := by bv_decide
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem half_shift (x : UInt64) : x >>> 1 = x / 2 := by bv_decide
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem nz_scaled (x : UInt64) : nz x * 256 = (if x = 0 then 0 else 256) := by
+[?2004l[?2004h>   unfold nz
+[?2004l[?2004h>   split <;> decide +revert
+[?2004l[?2004h> 
+[?2004l[?2004h> '''+s[pos:]; s=s.replace('  unfold wc nz ub\n  bv_decide','  rw [half_shift, shift_mul]\n  simp only [UInt64.add_mul, nz_scaled, wc]\n  ac_rfl'); open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore3.log 2>&1 &
+[?2004l[1] 377
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/explore3.log; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Explore|cadical'; find /workspace/submission -type f -maxdepth 3 -print
+[?2004l[1]+  Done                    cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore3.log 2>&1
+    419       00:00  0.0  2136 grep --color=auto -E [01;31m[Klean Explore[m[K|[01;31m[Kcadical[m[K
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+[?2004hroot@d4dcfb267f27:/workspace# cat >> /workspace/lean/Explore.lean <<'EOF'
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem universal_conformance : Conforms candidateSpec challengeAuthorize := by
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     have hd := debit_nat a f
+[?2004l[?2004h>     simp only [challengeAuthorize, buildQuote, verifyAffordability]
+[?2004l[?2004h>     change (∃ total, (if (a >>> 1) + (countNzBytes f <<< 8) + sumBytes f ≤ b then
+[?2004l[?2004h>       some ((a >>> 1) + (countNzBytes f <<< 8) + sumBytes f) else none) = some total) ↔
+[?2004l[?2004h>       exactDebit a f ≤ b.toNat
+[?2004l[?2004h>     rw [← hd, ← UInt64.le_iff_toNat_le]
+[?2004l[?2004h>     split <;> simp_all
+[?2004l[?2004h>   · intro b a f total h
+[?2004l[?2004h>     have hd := debit_nat a f
+[?2004l[?2004h>     simp only [challengeAuthorize, buildQuote, verifyAffordability] at h
+[?2004l[?2004h>     change (if (a >>> 1) + (countNzBytes f <<< 8) + sumBytes f ≤ b then
+[?2004l[?2004h>       some ((a >>> 1) + (countNzBytes f <<< 8) + sumBytes f) else none) = some total at h
+[?2004l[?2004h>     split at h
+[?2004l[?2004h>     · rename_i hb
+[?2004l[?2004h>       have ht := Option.some.inj h
+[?2004l[?2004h>       change exactDebit a f ≤ b.toNat ∧ total.toNat = exactDebit a f
+[?2004l[?2004h>       constructor
+[?2004l[?2004h>       · rw [← hd]
+[?2004l[?2004h>         exact UInt64.le_iff_toNat_le.mp hb
+[?2004l[?2004h>       · rw [← ht]
+[?2004l[?2004h>         exact hd
+[?2004l[?2004h>     · contradiction
+[?2004l[?2004h> 
+[?2004l[?2004h> #print axioms universal_conformance
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore4.log 2>&1 &
+[?2004l[1] 428
+[?2004hroot@d4dcfb267f27:/workspace# cat /workspace/explore4.log; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Explore|cadical'
+[?2004l'universal_conformance' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound,
+ count_correct._native.bv_decide.ax_1_5,
+ sum_correct._native.bv_decide.ax_1_5,
+ ub_as_mod._native.bv_decide.ax_1_5]
+[1]+  Done                    cd /workspace/lean && LEAN_PATH=/workspace/lean lean Explore.lean > /workspace/explore4.log 2>&1
+    471       00:00  0.0  2124 grep --color=auto -E [01;31m[Klean Explore[m[K|[01;31m[Kcadical[m[K
+[?2004hroot@d4dcfb267f27:/workspace# python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/lean/Explore.lean'; s=open(p).read(); s=s[:s.index('#print axioms')]; open('/workspace/submission/Spec.lean','w').write(s)
+[?2004l[?2004h> open('/workspace/submission/Proof.lean','w').write('by\n  change SecurityChallenge.Conforms candidateSpec SecurityChallenge.challengeAuthorize\n  exact universal_conformance\n')
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@d4dcfb267f27:/workspace# python3 /workspace/lean/check.py > /workspace/check.log 2>&1 &
+[?2004l[1] 479
+[?2004hroot@d4dcfb267f27:/workspace# cd /workspace/challenge && cargo test
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate                                                                                             [1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.73s
+[1m[32m     Running[0m unittests src/lib.rs (target/debug/deps/settlement_gate-66f23bc290c8a00c)
+
+running 3 tests
+test tests::full_low_bits_across_all_bytes ... [32mok[m
+test tests::low_bit_bytes_are_counted_and_summed ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@d4dcfb267f27:/workspace/challenge# grep -R -n 'structure.*Config\|native\|kernel\|reflection' /opt/lean/src/lean/Std/Tactic/BVDecide/Frontend | head -90; cat /workspace/check.log
+[?2004lgrep: /opt/lean/src/lean/Std/Tactic/BVDecide/Frontend: No such file or directory
+[1]+  Exit 1                  python3 /workspace/lean/check.py > /workspace/check.log 2>&1  (wd: /workspace)
+(wd now: /workspace/challenge)
+CandidateSpec.lean:7:0: error: unexpected token '/'; expected command
+CandidateSpec.lean:13:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:82:14: warning: declaration uses `sorry`
+CandidateSpec.lean:79:9: warning: declaration uses `sorry`
+CandidateSpec.lean:79:34: warning: Variable name `h` is not explicitly referenced.
+
+The binding can be removed (if unused) or named `_` (if used implicitly).
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+CandidateSpec.lean:91:9: warning: declaration uses `sorry`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@d4dcfb267f27:/workspace/challenge# grep -R -n 'structure.*Config\|config.*kernel\|config.*native\|config.*reflection\|kernel :=\|reflection :\|native :' /opt/lean/src/lean/Lean/Elab/Tactic/BVDecide /opt/lean/src/lean/Std/Tactic/BVDecide | head -100; find /opt/lean/src/lean -iname '*bvdecide*'
+[?2004l/opt/lean/src/lean/Std/Tactic/BVDecide/Syntax.lean:40:structure BVDecideConfig where
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide.lean
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide
+/opt/lean/src/lean/Std/Tactic/BVDecide.lean
+/opt/lean/src/lean/Std/Tactic/BVDecide
+[?2004hroot@d4dcfb267f27:/workspace/challenge# sed -i '/^\/-- /d' /workspace/submission/Spec.lean
+[?2004l[?2004hroot@d4dcfb267f27:/workspace/challenge# cat /opt/lean/src/lean/Std/Tactic/BVDecide/Syntax.lean | head -180; grep -R -n 'native\|kernel\|ofReduceBool\|reflection' /opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend | head -90
+[?2004l/-
+Copyright (c) 2024 Lean FRO, LLC. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Henrik Böving
+-/
+module
+
+prelude
+public import Init.Simproc
+public import Init.Grind.Tactics
+public import Init.MetaTypes
+import Init.Data.Nat.Bitwise.Basic
+
+@[expose] public section
+
+set_option linter.missingDocs true -- keep it documented
+
+namespace Lean.Elab.Tactic.BVDecide.Frontend
+
+/--
+The various kinds of configurations offered for the SAT solver.
+-/
+inductive SolverMode where
+  /--
+  Set SAT solver options to improve proof search.
+  -/
+  | proof
+  /--
+  Set SAT solver options to improve counterexample search.
+  -/
+  | counterexample
+  /--
+  Don't set additional SAT solver flags.
+  -/
+  | default
+
+/--
+The configuration options for `bv_decide`.
+-/
+structure BVDecideConfig where
+  /-- The number of seconds that the SAT solver is run before aborting. -/
+  timeout : Nat := 10
+  /-- Whether to run the trimming algorithm on LRAT proofs. -/
+  trimProofs : Bool := true
+  /--
+  Whether to use the binary LRAT proof format.
+  -/
+  binaryProofs : Bool := true
+  /--
+  Canonicalize with respect to associativity and commutativity.
+  -/
+  acNf : Bool := false
+  /--
+  Split hypotheses of the form `h : (x && y) = true` into `h1 : x = true` and `h2 : y = true`.
+  This has synergy potential with embedded constraint substitution. Because embedded constraint
+  substitution is the only use case for this feature it is automatically disabled whenever embedded
+  constraint substitution is disabled.
+  -/
+  andFlattening : Bool := true
+  /--
+  Look at all hypotheses of the form `h : x = true`, if `x` occurs in another hypothesis substitute
+  it with `true`.
+  -/
+  embeddedConstraintSubst : Bool := true
+  /--
+  Split up local declarations of structures that are collections of other supported types into their
+  individual parts automatically.
+  -/
+  structures : Bool := true
+  /--
+  Enable preprocessing with the `int_toBitVec` simp set to reduce `UIntX`/`IntX` to `BitVec` and
+  thus make them accessible for `bv_decide`.
+  -/
+  fixedInt : Bool := true
+  /--
+  Handle equality on enum inductives by turning them into `BitVec`.
+  -/
+  enums : Bool := true
+  /--
+  Output the AIG of bv_decide as graphviz into a file called aig.gv in the working directory of the
+  Lean process.
+  -/
+  graphviz : Bool := false
+  /--
+  The maximum number of subexpressions to visit when performing simplification.
+  -/
+  maxSteps : Nat := Lean.Meta.Simp.defaultMaxSteps
+  /--
+  Short-circuit multiplication as an abstraction-style optimization that triggers
+  if matching multiplications are not needed to proof a goal.
+  -/
+  shortCircuit : Bool := false
+  /--
+  The SAT solver configuration to use. Defaults to `.proof` as that is the most relevant use case
+  for `bv_decide`.
+  -/
+  solverMode : SolverMode := .proof
+
+end Lean.Elab.Tactic.BVDecide.Frontend
+
+
+namespace Lean.Parser
+
+namespace Tactic
+
+/--
+This tactic works just like `bv_decide` but skips calling a SAT solver by using a proof that is
+already stored on disk. It is called with the name of an LRAT file in the same directory as the
+current Lean file:
+```
+bv_check "proof.lrat"
+```
+-/
+syntax (name := bvCheck) "bv_check " optConfig str : tactic
+
+@[tactic_alt bvDecideMacro]
+syntax (name := bvDecide) "bv_decide" optConfig : tactic
+
+
+@[tactic_alt bvTraceMacro]
+syntax (name := bvTrace) "bv_decide?" optConfig : tactic
+
+@[tactic_alt bvNormalizeMacro]
+syntax (name := bvNormalize) "bv_normalize" optConfig : tactic
+
+end Tactic
+
+/--
+Theorems tagged with the `bv_normalize` attribute are used during the rewriting step of the
+`bv_decide` tactic.
+-/
+syntax (name := bv_normalize) "bv_normalize" (Tactic.simpPre <|> Tactic.simpPost)? unicode("← ", "<- ")? (ppSpace prio)? : attr
+
+/--
+Auxiliary attribute for builtin `bv_normalize` simprocs.
+-/
+syntax (name := bvNormalizeProcBuiltinAttr) "builtin_bv_normalize_proc" (Tactic.simpPre <|> Tactic.simpPost)? : attr
+
+macro_rules
+  | `($[$doc?:docComment]? $kind:attrKind builtin_simproc $[$pre?]? [bv_normalize] $n:ident ($pattern:term) := $body) => do
+    `($[$doc?:docComment]? builtin_simproc_decl $n ($pattern) := $body
+      attribute [$kind builtin_bv_normalize_proc $[$pre?]?] $n)
+
+end Lean.Parser
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:33:- `atomsAssignment`: The mapping of the reflection monad from atom indices to `Expr`.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:278:    (reflectionResult : ReflectionResult) : MetaM Expr := do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:280:    mkAuxDecl cfg.exprDef reflectionResult.expr (mkConst ``BVLogicalExpr)
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:287:  let reflectionTerm := mkApp2 (mkConst ``verifyBVExpr) reflectedExpr certExpr
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:289:  withTraceNode `Meta.Tactic.sat (fun _ => return "Compiling and evaluating reflection proof term") do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:290:    match (← nativeEqTrue `bv_decide reflectionTerm (axiomDeclRange? := (← getRef))) with
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:293:        evaluating the following term returned `false`:{indentExpr reflectionTerm}"
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:298:  Add an auxiliary declaration. Only used to create constants that appear in our reflection proof.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:311:def lratBitblaster (goal : MVarId) (ctx : TacticContext) (reflectionResult : ReflectionResult)
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:314:  let bvExpr := reflectionResult.bvExpr
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:348:    let proof ← cert.toReflectionProof ctx reflectionResult
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:353:    return .error { goal, unusedHypotheses := reflectionResult.unusedHypotheses, equations }
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:385:    let reflectionResult ←
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:388:    trace[Meta.Tactic.bv] "Reflected bv logical expression: {reflectionResult.bvExpr}"
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:393:    match ← unsatProver g reflectionResult atomsAssignment with
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:395:      let proveFalse ← reflectionResult.proveFalse bvExprUnsat
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:401:  let unsatProver : UnsatProver := fun g reflectionResult atomsAssignment => do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:402:    withTraceNode `Meta.Tactic.bv (fun _ => return "Preparing LRAT reflection term") do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:403:      lratBitblaster g ctx reflectionResult atomsAssignment
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVTrace.lean:52:    1. Introduce `ByteArray` literals to the kernel.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVCheck.lean:39:Prepare an `Expr` that proves `bvExpr.unsat` using native evaluation.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVCheck.lean:41:def lratChecker (ctx : TacticContext) (reflectionResult : ReflectionResult) : MetaM Expr := do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVCheck.lean:43:  cert.toReflectionProof ctx reflectionResult
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVCheck.lean:47:  let unsatProver : UnsatProver := fun _ reflectionResult _ => do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVCheck.lean:48:    withTraceNode `Meta.Tactic.sat (fun _ => return "Preparing LRAT reflection term") do
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVCheck.lean:49:      let proof ← lratChecker ctx reflectionResult
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:17:This module contains the implementation of the reflection monad, used by all other components of this
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:137:The state of the reflection monad
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:152:  Cached calls to `evalsAtAtoms` of various reflection structures. Whenever `atoms` is modified
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:158:The reflection monad, used to track `BitVec` variables that we see as we traverse the context.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:271:Run a reflection computation as a `MetaM` one.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:353:The state of the lemma reflection monad.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:357:  The list of top level lemmas that got created on the fly during reflection.
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide/Reflect.lean:374:The lemma reflection monad. It extends the usual reflection monad `M` by adding the ability to
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/LRAT.lean:33:  reflectionDef : Name
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/LRAT.lean:42:  let reflectionDef ← Lean.Elab.Term.mkAuxName `_reflection_def
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/LRAT.lean:48:    reflectionDef,
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/LRAT.lean:66:/-- An LRAT proof read from a file. This will get parsed using native evaluation. -/
+[?2004hroot@d4dcfb267f27:/workspace/challenge# grep -R -n 'def nativeEqTrue\|register_option.*native\|debug.*native\|nativeEqTrue' /opt/lean/src/lean/Lean/Meta /opt/lean/src/lean/Lean/Elab/Tactic | head -60
+[?2004l/opt/lean/src/lean/Lean/Meta/Native.lean:31:A call to `nativeEqTrue tacName e`, where `e` is a closed value of type `Bool`, will compile and run
+/opt/lean/src/lean/Lean/Meta/Native.lean:37:public def nativeEqTrue (tacticName : Name) (e : Expr) (axiomDeclRange? : Option Syntax := none) : MetaM NativeEqTrueResult  := do
+/opt/lean/src/lean/Lean/Elab/Tactic/Decide.lean:59:  match (← nativeEqTrue tacticName d (axiomDeclRange? := (← getRef))) with
+/opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean:290:    match (← nativeEqTrue `bv_decide reflectionTerm (axiomDeclRange? := (← getRef))) with
+[?2004hroot@d4dcfb267f27:/workspace/challenge# cat /opt/lean/src/lean/Lean/Meta/Native.lean; sed -n '260,312p' /opt/lean/src/lean/Lean/Elab/Tactic/BVDecide/Frontend/BVDecide.lean
+[?2004l/-
+Copyright (c) 2025 Lean FRO, LLC. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Joachim Breitner
+-/
+
+module
+prelude
+public import Lean.Meta.Basic
+import Lean.Util.CollectLevelParams
+import Lean.Elab.DeclarationRange
+import Lean.Compiler.Options
+
+open Lean Meta
+
+namespace Lean.Meta
+
+/-!
+This module contains infrastructure for proofs by native evaluation (`native decide`, `bv_decide`).
+Such proofs involve a native computation using the Lean kernel, and then asserting the result
+of that computation as an axiom towards the logic.
+-/
+
+public inductive NativeEqTrueResult where
+  /-- The given expression `e` evaluates to true. `prf` is a proof of `e = true`. -/
+  | success (prf : Expr)
+  /-- The given expression `e` evaluates to false. -/
+  | notTrue
+
+/--
+A call to `nativeEqTrue tacName e`, where `e` is a closed value of type `Bool`, will compile and run
+that value, check that it evaluates to `true`, and if so, will add an axiom asserting `e = true` and
+return that axiom.
+
+It is the basis for `native_decide` and `bv_decide` tactics.
+-/
+public def nativeEqTrue (tacticName : Name) (e : Expr) (axiomDeclRange? : Option Syntax := none) : MetaM NativeEqTrueResult  := do
+  let e ← instantiateMVars e
+  if e.hasFVar then
+    throwError m!"Tactic `{tacticName}` failed: Cannot native decide proposition with free variables:{indentExpr e}"
+  if e.hasMVar then
+    throwError m!"Tactic `{tacticName}` failed: Cannot native decide proposition with metavariables:{indentExpr e}"
+  let levels := (collectLevelParams {} e).params.toList
+  let isTrue ← withoutModifyingEnv do
+    let auxDeclName ← mkAuxDeclName <| `_native ++ tacticName ++ `decl
+    let decl := Declaration.defnDecl {
+      name := auxDeclName
+      levelParams := levels
+      type := mkConst ``Bool
+      value := e
+      hints := .abbrev
+      safety := .safe
+    }
+    modifyEnv (markMeta · auxDeclName)
+    try
+      -- disable async/separate codegen so we can catch its exceptions; we don't want to report
+      -- `evalConst` failures below when the actual reason was a codegen failure
+      withOptions (Elab.async.set · false) do
+      withOptions (Compiler.compiler.postponeCompile.set · false) do
+      withOptions (Compiler.compiler.relaxedMetaCheck.set · true) do
+        addAndCompile decl
+    catch ex =>
+      throwError m!"Tactic `{tacticName}` failed. Error: {ex.toMessageData}"
+
+    -- Now evaluate the constant, and check that it is true.
+    try
+      unsafe evalConst Bool auxDeclName
+    catch ex =>
+      throwError m!"\
+        Tactic `{tacticName}` failed: Could not evaluate decidable instance. \
+        Error: {ex.toMessageData}"
+
+  unless isTrue do return .notTrue
+
+  let auxAxiomName ← mkAuxDeclName <| `_native ++ tacticName ++ `ax
+  let axDecl := Declaration.axiomDecl {
+    name := auxAxiomName
+    levelParams := levels
+    type := mkApp3 (mkConst ``Eq [1]) (mkConst ``Bool) e (mkConst ``Bool.true)
+    isUnsafe := false
+  }
+  addDecl axDecl
+  if let some ref := axiomDeclRange? then
+    Elab.addDeclarationRangesFromSyntax auxAxiomName ref
+
+  let levelParams := levels.map mkLevelParam
+  return .success <| mkConst auxAxiomName levelParams
+  let mut err := m!""
+
+  if explanations.isEmpty then
+    err := err ++ m!"The prover found a counterexample, consider the following assignment:\n"
+  else
+    err := err ++ m!"The prover found a potentially spurious counterexample:\n"
+    err := err ++ explanations.foldl (init := m!"") (fun acc exp => acc ++ m!"- " ++ exp ++ m!"\n")
+    err := err ++ m!"Consider the following assignment:\n"
+
+
+  let folder := fun error (var, value) => error ++ m!"{var} = {value}\n"
+  err := diagnosis.derivedEquations.foldl (init := err) folder
+  return err
+
+/--
+Turn an `LratCert` into a proof that some `reflectedExpr` is UNSAT.
+-/
+def LratCert.toReflectionProof (cert : LratCert) (cfg : TacticContext)
+    (reflectionResult : ReflectionResult) : MetaM Expr := do
+  withTraceNode `Meta.Tactic.sat (fun _ => return "Compiling expr term") do
+    mkAuxDecl cfg.exprDef reflectionResult.expr (mkConst ``BVLogicalExpr)
+
+  withTraceNode `Meta.Tactic.sat (fun _ => return "Compiling proof certificate term") do
+    mkAuxDecl cfg.certDef (toExpr cert) (mkConst ``String)
+
+  let reflectedExpr := mkConst cfg.exprDef
+  let certExpr := mkConst cfg.certDef
+  let reflectionTerm := mkApp2 (mkConst ``verifyBVExpr) reflectedExpr certExpr
+
+  withTraceNode `Meta.Tactic.sat (fun _ => return "Compiling and evaluating reflection proof term") do
+    match (← nativeEqTrue `bv_decide reflectionTerm (axiomDeclRange? := (← getRef))) with
+    | .notTrue =>
+      throwError m!"Tactic `bv_decide` failed: The LRAT certificate could not be verified; \
+        evaluating the following term returned `false`:{indentExpr reflectionTerm}"
+    | .success auxProof =>
+      return mkApp3 (mkConst ``unsat_of_verifyBVExpr_eq_true) reflectedExpr certExpr auxProof
+where
+  /--
+  Add an auxiliary declaration. Only used to create constants that appear in our reflection proof.
+  -/
+  mkAuxDecl (name : Name) (value type : Expr) : CoreM Unit :=
+    withOptions (fun opt => opt.set `compiler.extract_closed false) do
+      addAndCompile <| .defnDecl {
+        name := name,
+        levelParams := [],
+        type := type,
+        value := value,
+        hints := .abbrev,
+        safety := .safe
+      }
+
+def lratBitblaster (goal : MVarId) (ctx : TacticContext) (reflectionResult : ReflectionResult)
+    (atomsAssignment : Std.HashMap Nat (Nat × Expr × Bool)) :
+[?2004hroot@d4dcfb267f27:/workspace/challenge# cp /workspace/submission/Spec.lean /workspace/lean/Export.lean; cat >> /workspace/lean/Export.lean <<'EOF'
+[?2004l[?2004h> set_option pp.proofs true
+[?2004l[?2004h> set_option pp.all true
+[?2004l[?2004h> #print count_correct
+[?2004l[?2004h> #print count_correct._expr_def
+[?2004l[?2004h> #print count_correct._cert_def
+[?2004l[?2004h> #print sum_correct
+[?2004l[?2004h> #print sum_correct._expr_def
+[?2004l[?2004h> #print sum_correct._cert_def
+[?2004l[?2004h> #print ub_as_mod
+[?2004l[?2004h> #print ub_as_mod._expr_def
+[?2004l[?2004h> #print ub_as_mod._cert_def
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace/challenge# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Export.lean > /workspace/export.log 2>&1 &
+[?2004l[1] 697
+[?2004hroot@d4dcfb267f27:/workspace/challenge# wc -c /workspace/export.log; head -c 3500 /workspace/export.log; tail -c 2000 /workspace/export.log; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Export|cadical'
+[?2004l333952 /workspace/export.log
+[1]+  Exit 1                  cd /workspace/lean && LEAN_PATH=/workspace/lean lean Export.lean > /workspace/export.log 2>&1
+theorem count_correct : ∀ (f : UInt64),
+  @Eq.{1} UInt64 (SecurityChallenge.countNzBytes f)
+    (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+      (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+        (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+          (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+            (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+              (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+                (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+                  (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 0) (@UInt64.instOfNat (nat_lit 0)))))
+                  (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 8) (@UInt64.instOfNat (nat_lit 8))))))
+                (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 16) (@UInt64.instOfNat (nat_lit 16))))))
+              (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 24) (@UInt64.instOfNat (nat_lit 24))))))
+            (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 32) (@UInt64.instOfNat (nat_lit 32))))))
+          (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 40) (@UInt64.instOfNat (nat_lit 40))))))
+        (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 48) (@UInt64.instOfNat (nat_lit 48))))))
+      (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 56) (@UInt64.instOfNat (nat_lit 56)))))) :=
+fun (f : ⋯) =>
+  @id.{0}
+    (@Eq.{1} UInt64 (SecurityChallenge.countNzBytes f)
+      (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+        (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+          (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+            (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+              (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+                (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+                  (@HAdd.hAdd.{0, 0, 0} UInt64 UInt64 UInt64 (@instHAdd.{0} UInt64 instAddUInt64)
+                    (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 0) (@UInt64.instOfNat (nat_lit 0)))))
+                    (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 8) (@UInt64.instOfNat (nat_lit 8))))))
+                  (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 16) (@UInt64.instOfNat (nat_lit 16))))))
+                (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 24) (@UInt64.instOfNat (nat_lit 24))))))
+              (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 32) (@UInt64.instOfNat (nat_lit 32))))))
+            (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 40) (@UInt64.instOfNat (nat_lit 40))))))
+          (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 48) (@UInt64.instOfNat (nat_lit 48))))))
+        (nz (ub f (@OfNat.ofNat.{0} UInt64 (nat_lit 56) (@UInt64.instOfNat (nat_lit 56)))))))
+    (@id.{0}
+      (@Eq.{1} UInt64
+        (@HShiftRight.hShiftRight.{0, 0, 0} UInt64 UInt64 UInt64
+          (@instHShiftRightOfShiftRight.{0} UInt64 instShiftRightUInt64)
+          (@HMul.hMul.{0, 0, 0} UInt64 UInt64 UInt64 (@instHMul.{0} UInt64 instMulUInt64)
+            (@HShiftRight.hShiftRight.{0, 0, 0} UInt64 UInt64 UInt64
+              (@instHShiftRightOfShiftRight.{0} UInt64 instShiftRightUInt64) (SecurityChallenge.uNz8 f)
+              (@OfNat.ofNat.{0} UInt64 (
+                              (@OfNat.ofNat.{0} Nat (nat_lit 40) (instOfNatNat (nat_lit 40)))
+                              (@OfNat.ofNat.{0} Nat (nat_lit 64) (instOfNatNat (nat_lit 64)))
+                              (@Std.Tactic.BVDecide.BVExpr.const
+                                (@OfNat.ofNat.{0} Nat (nat_lit 24) (instOfNatNat (nat_lit 24)))
+                                (BitVec.ofNat (@OfNat.ofNat.{0} Nat (nat_lit 24) (instOfNatNat (nat_lit 24)))
+                                  (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0)))))
+                              (@Std.Tactic.BVDecide.BVExpr.extract
+                                (@OfNat.ofNat.{0} Nat (nat_lit 64) (instOfNatNat (nat_lit 64)))
+                                (@OfNat.ofNat.{0} Nat (nat_lit 24) (instOfNatNat (nat_lit 24)))
+                                (@OfNat.ofNat.{0} Nat (nat_lit 40) (instOfNatNat (nat_lit 40)))
+                                (@Std.Tactic.BVDecide.BVExpr.var
+                                  (@OfNat.ofNat.{0} Nat (nat_lit 64) (instOfNatNat (nat_lit 64)))
+                                  (@OfNat.ofNat.{0} Nat (nat_lit 0) (instOfNatNat (nat_lit 0)))))
+                              (@Eq.refl.{1} Nat (@OfNat.ofNat.{0} Nat (nat_lit 64) (instOfNatNat (nat_lit 64)))))
+                            Std.Tactic.BVDecide.BVBinOp.and
+                            (@Std.Tactic.BVDecide.BVExpr.const
+                              (@OfNat.ofNat.{0} Nat (nat_lit 64) (instOfNatNat (nat_lit 64)))
+                              (BitVec.ofNat (@OfNat.ofNat.{0} Nat (nat_lit 64) (instOfNatNat (nat_lit 64)))
+                                (@OfNat.ofNat.{0} Nat (nat_lit 255) (instOfNatNat (nat_lit 255))))))
+                          ⋯ ⋯))
+                      ⋯))))))
+          ⋯ ⋯ ⋯ ⋯)
+        ⋯)
+Export.lean:159:7: error(lean.unknownIdentifier): Unknown constant `ub_as_mod._expr_def`
+Export.lean:160:7: error(lean.unknownIdentifier): Unknown constant `ub_as_mod._cert_def`
+    742       00:00  0.0  2224 grep --color=auto -E [01;31m[Klean Export[m[K|[01;31m[Kcadical[m[K
+[?2004hroot@d4dcfb267f27:/workspace/challenge# grep -oE '[[:alnum:]_\.]+(expr_def|cert_def|ax)[[:alnum:]_\.]*' /workspace/export.log | sort -u; grep -n 'pp.max\|pp.deepTerms\|pp.proofs' /opt/lean/src/lean/Lean/PrettyPrinter/*.lean | head -40
+[?2004lcount_correct._cert_def
+count_correct._expr_def
+sum_correct._cert_def
+sum_correct._expr_def
+ub_as_mod._cert_def
+ub_as_mod._expr_def
+[?2004hroot@d4dcfb267f27:/workspace/challenge# grep -R -n 'register.*pp.\(max\|deepTerms\|proofs\)' /opt/lean/src/lean/Lean | head -40; cp /workspace/submission/Spec.lean /workspace/lean/Names.lean; cat >> /workspace/lean/Names.lean <<'EOF'
+[?2004l[?2004h> #print prefix count_correct
+[?2004l[?2004h> #print prefix sum_correct
+[?2004l[?2004h> #print prefix ub_as_mod
+[?2004l[?2004h> EOF
+[?2004l/opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean:15:register_builtin_option pp.maxSteps : Nat := {
+/opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean:179:register_builtin_option pp.proofs : Bool := {
+/opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean:183:register_builtin_option pp.proofs.withType : Bool := {
+/opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean:187:register_builtin_option pp.proofs.threshold : Nat := {
+/opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean:199:register_builtin_option pp.deepTerms : Bool := {
+/opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean:203:register_builtin_option pp.deepTerms.threshold : Nat := {
+[?2004hroot@d4dcfb267f27:/workspace/challenge# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Names.lean > /workspace/names.log 2>&1 &
+[?2004l[1] 787
+[?2004hroot@d4dcfb267f27:/workspace/challenge# cat /workspace/names.log; sed -n '175,215p' /opt/lean/src/lean/Lean/PrettyPrinter/Delaborator/Options.lean
+[?2004lNames.lean:150:6: error: unexpected token 'prefix'; expected 'axioms', 'eqns', 'equations', 'sig', 'tactic', identifier or string literal
+Names.lean:150:13: error: unexpected identifier; expected ':'
+Names.lean:151:6: error: unexpected token 'prefix'; expected 'axioms', 'eqns', 'equations', 'sig', 'tactic', identifier or string literal
+Names.lean:151:13: error: unexpected identifier; expected ':'
+Names.lean:152:6: error: unexpected token 'prefix'; expected 'axioms', 'eqns', 'equations', 'sig', 'tactic', identifier or string literal
+Names.lean:152:13: error: unexpected identifier; expected ':'
+[1]+  Exit 1                  cd /workspace/lean && LEAN_PATH=/workspace/lean lean Names.lean > /workspace/names.log 2>&1
+register_builtin_option pp.tagAppFns : Bool := {
+  defValue := false
+  descr    := "(pretty printer) tag all constants that are the function in a function application"
+}
+register_builtin_option pp.proofs : Bool := {
+  defValue := false
+  descr    := "(pretty printer) display proofs when true, and replace proofs appearing within expressions by `⋯` when false"
+}
+register_builtin_option pp.proofs.withType : Bool := {
+  defValue := false
+  descr    := "(pretty printer) when `pp.proofs` is false, adds a type ascription to the omitted proof"
+}
+register_builtin_option pp.proofs.threshold : Nat := {
+  defValue := 0
+  descr    := "(pretty printer) when `pp.proofs` is false, controls the complexity of proofs at which they begin being replaced with `⋯`"
+}
+register_builtin_option pp.instances : Bool := {
+  defValue := true
+  descr    := "(pretty printer) if set to false, replace inst-implicit arguments to explicit applications with placeholders"
+}
+register_builtin_option pp.instanceTypes : Bool := {
+  defValue := false
+  descr    := "(pretty printer) when printing explicit applications, show the types of inst-implicit arguments"
+}
+register_builtin_option pp.deepTerms : Bool := {
+  defValue := false
+  descr    := "(pretty printer) display deeply nested terms, replacing them with `⋯` if set to false"
+}
+register_builtin_option pp.deepTerms.threshold : Nat := {
+  defValue := 50
+  descr    := "(pretty printer) when `pp.deepTerms` is false, the depth at which terms start being replaced with `⋯`"
+}
+register_builtin_option pp.motives.pi : Bool := {
+  defValue := true
+  descr    := "(pretty printer) print all motives that return pi types"
+}
+register_builtin_option pp.motives.nonConst : Bool := {
+  defValue := false
+  descr    := "(pretty printer) print all motives that are not constant functions"
+}
+register_builtin_option pp.motives.all : Bool := {
+[?2004hroot@d4dcfb267f27:/workspace/challenge# cp /workspace/submission/Spec.lean /workspace/lean/Export.lean; cat >> /workspace/lean/Export.lean <<'EOF'
+[?2004l[?2004h> set_option pp.proofs true
+[?2004l[?2004h> set_option pp.deepTerms true
+[?2004l[?2004h> set_option pp.all true
+[?2004l[?2004h> set_option pp.maxSteps 10000000
+[?2004l[?2004h> #print count_correct
+[?2004l[?2004h> #print sum_correct
+[?2004l[?2004h> #print ub_as_mod
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace/challenge# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Export.lean > /workspace/export.log 2>&1 &
+[?2004l[1] 851
+[?2004hroot@d4dcfb267f27:/workspace/challenge# wc -c /workspace/export.log; grep -oE '[[:alnum:]_\.]+(expr_def|cert_def|ax)[[:alnum:]_\.]*' /workspace/export.log | sort -u; grep -n 'unsat_of_verify' /workspace/export.log | head
+[?2004l0 /workspace/export.log
+[?2004hroot@d4dcfb267f27:/workspace/challenge# ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Export|cadical'; cat /workspace/export.log
+[?2004l    852       00:17 94.6 1321760 [01;31m[Klean Export[m[K.lean
+    918       00:00  0.0  2120 grep --color=auto -E [01;31m[Klean Export[m[K|[01;31m[Kcadical[m[K
+[?2004hroot@d4dcfb267f27:/workspace/challenge# wc -c /workspace/export.log; grep -oE '[[:alnum:]_\.]+(expr_def|cert_def|ax)[[:alnum:]_\.]*' /workspace/export.log | sort -u; ps -eo pid,etime,pcpu,rss,args | grep -E 'lean Export|cadical'
+[?2004l18018304 /workspace/export.log
+count_correct._cert_def_1_1
+count_correct._expr_def_1_1
+count_correct._native.bv_decide.ax_1_5
+    852       00:32 96.9 1234956 [01;31m[Klean Export[m[K.lean
+    948       00:00  0.0  2180 grep --color=auto -E [01;31m[Klean Export[m[K|[01;31m[Kcadical[m[K
+[?2004hroot@d4dcfb267f27:/workspace/challenge# wc -c /workspace/export.log; grep -oE '[[:alnum:]_\.]+(expr_def|cert_def|ax)[[:alnum:]_\.]*' /workspace/export.log | sort -u; ps -eo pid,etime,pcpu,rss,args | grep 'lean Export'
+[?2004l26111177 /workspace/export.log
+[1]+  Done                    cd /workspace/lean && LEAN_PATH=/workspace/lean lean Export.lean > /workspace/export.log 2>&1
+count_correct._cert_def_1_1
+count_correct._expr_def_1_1
+count_correct._native.bv_decide.ax_1_5
+sum_correct._cert_def_1_1
+sum_correct._expr_def_1_1
+sum_correct._native.bv_decide.ax_1_5
+ub_as_mod._cert_def_1_1
+ub_as_mod._expr_def_1_1
+ub_as_mod._native.bv_decide.ax_1_5
+    977       00:00  0.0  2128 grep --color=auto [01;31m[Klean Export[m[K
+[?2004hroot@d4dcfb267f27:/workspace/challenge# cp /workspace/submission/Spec.lean /workspace/lean/Compact.lean; cat >> /workspace/lean/Compact.lean <<'EOF'
+[?2004l[?2004h> set_option pp.proofs true
+[?2004l[?2004h> set_option pp.deepTerms true
+[?2004l[?2004h> set_option pp.maxSteps 10000000
+[?2004l[?2004h> #print count_correct._expr_def_1_1
+[?2004l[?2004h> #print count_correct._cert_def_1_1
+[?2004l[?2004h> #print count_correct
+[?2004l[?2004h> #print sum_correct._expr_def_1_1
+[?2004l[?2004h> #print sum_correct._cert_def_1_1
+[?2004l[?2004h> #print sum_correct
+[?2004l[?2004h> #print ub_as_mod._expr_def_1_1
+[?2004l[?2004h> #print ub_as_mod._cert_def_1_1
+[?2004l[?2004h> #print ub_as_mod
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@d4dcfb267f27:/workspace/challenge# cd /workspace/lean && LEAN_PATH=/workspace/lean lean Compact.lean > /workspace/compact.log 2>&1 &
+[?2004l[1] 986
+[?2004hroot@d4dcfb267f27:/workspace/challenge# 

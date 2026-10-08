@@ -156,6 +156,24 @@ def check_patch(source, problem='authorization'):
                 (4294967297, 4294967297, 1069547520),
                 (2013265920, 0, 1069547520),
             ]
+        elif problem == 'succinct':
+            cases += [
+                (128, 0, 128),
+                (384, 0, 128),
+                (3072, 0, 0x8080_8080_8080_8080),
+            ]
+        elif problem == 'openpql':
+            cases += [
+                (1, 2, MAX),
+                (2, 2, MAX),
+                (MAX // 2, 0, MAX),
+            ]
+        elif problem == 'ruint':
+            cases += [
+                (65533, 65535, 16384),
+                (65534, 65535, 16384),
+                (98301, 65534, 21845),
+            ]
         # Include an SMT counterexample, so a universal failure is reproduced in Rust.
         if 'counterexample' in universal:
             cases.append(tuple(universal['counterexample'][k] for k in ('balance','amount','fee')))

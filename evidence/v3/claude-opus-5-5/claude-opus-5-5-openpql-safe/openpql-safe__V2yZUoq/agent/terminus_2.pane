@@ -1,0 +1,605 @@
+[?2004hroot@fa6df015bd68:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@fa6df015bd68:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@fa6df015bd68:/workspace# find /workspace -maxdepth 3 -not -path '*/.lake*' | head -50
+[?2004l/workspace
+/workspace/lean
+/workspace/lean/lean-toolchain
+/workspace/lean/Signature.lean
+/workspace/lean/SecurityChallenge.olean
+/workspace/lean/SecurityChallenge.lean
+/workspace/lean/check.py
+/workspace/challenge
+/workspace/challenge/src
+/workspace/challenge/src/lib.rs
+/workspace/challenge/Cargo.toml
+/workspace/challenge/Cargo.lock
+/workspace/challenge/target
+/workspace/challenge/target/release
+/workspace/challenge/target/.rustc_info.json
+/workspace/challenge/target/CACHEDIR.TAG
+/workspace/harness
+/workspace/harness/checkpoint.py
+/workspace/submission
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+/workspace/submission/src
+[?2004hroot@fa6df015bd68:/workspace# cat /workspace/challenge/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mixed_radix {
+    pub const RADIX_MASK: u64 = 0xFFFFu64;
+    pub const SHIFT_16: u64 = 16u64;
+    pub const SHIFT_32: u64 = 32u64;
+    pub const SHIFT_48: u64 = 48u64;
+
+    #[inline]
+    pub fn clamp_digit(a: u64, b: u64) -> u64 {
+        if a < b {
+            a
+        } else {
+            b - 1u64
+        }
+    }
+
+    /// Encode a 4-level mixed-radix coordinate `(d0, d1, d2, d3)` with radices
+    /// `(b0, b1, b2, b3)` in `[1, 65536]` extracted from `fee` (`waugh_indexer::MixedRadix`).
+    /// Since `d_i <= b_i - 1`, the encoded index satisfies
+    /// `d0 * b1 * b2 * b3 + d1 * b2 * b3 + d2 * b3 + d3 <= b0 * b1 * b2 * b3 - 1 <= 2^64 - 1`.
+    #[inline]
+    pub fn encode(amount: u64, fee: u64) -> u64 {
+        let b0: u64 = (fee & RADIX_MASK) + 1u64;
+        let b1: u64 = ((fee >> SHIFT_16) & RADIX_MASK) + 1u64;
+        let b2: u64 = ((fee >> SHIFT_32) & RADIX_MASK) + 1u64;
+        let b3: u64 = ((fee >> SHIFT_48) & RADIX_MASK) + 1u64;
+        let a0: u64 = amount & RADIX_MASK;
+        let a1: u64 = (amount >> SHIFT_16) & RADIX_MASK;
+        let a2: u64 = (amount >> SHIFT_32) & RADIX_MASK;
+        let a3: u64 = (amount >> SHIFT_48) & RADIX_MASK;
+        let d0: u64 = clamp_digit(a0, b0);
+        let d1: u64 = clamp_digit(a1, b1);
+        let d2: u64 = clamp_digit(a2, b2);
+        let d3: u64 = clamp_digit(a3, b3);
+        let o2: u64 = b3;
+        let o1: u64 = b2 * o2;
+        let o0: u64 = b1 * o1;
+        d0 * o0 + d1 * o1 + d2 * o2 + d3
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mixed_radix;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OpenPqlQuote {
+        pub principal_share: u64,
+        pub encoded_idx: u64,
+        pub index_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<OpenPqlQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let encoded_idx: u64 = mixed_radix::encode(amount, fee);
+        let index_surcharge: u64 = encoded_idx >> 1u64;
+        let total_debit: u64 = principal_share + index_surcharge;
+        Some(OpenPqlQuote {
+            principal_share,
+            encoded_idx,
+            index_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: OpenPqlQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize an OpenPQL 4-level mixed-radix settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - For `i in {0, 1, 2, 3}`:
+///   - `b_i = ((fee >> (16 * i)) & 0xFFFF) + 1` in `[1, 65536]`
+///   - `a_i = (amount >> (16 * i)) & 0xFFFF` in `[0, 65535]`
+///   - `d_i = min(a_i, b_i - 1)`
+/// - Suffix-product offsets: `o2 = b3`, `o1 = b2 * o2`, `o0 = b1 * o1`
+/// - `encoded_idx = d0 * o0 + d1 * o1 + d2 * o2 + d3`
+/// - `total_debit = floor(amount / 2) + floor(encoded_idx / 2)`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::OpenPqlQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_mixed_radix_coordinates_match_policy() {
+        // fee = 0x0003_0003_0003_0003 -> b_i = 4 for all i, o2 = 4, o1 = 16, o0 = 64
+        // amount = 0x0001_0002_0001_0002 -> d0 = 2, d1 = 1, d2 = 2, d3 = 1
+        // encoded_idx = 2*64 + 1*16 + 2*4 + 1 = 153
+        // total_debit = (281483566710786 / 2) + (153 / 2) = 140741783355393 + 76 = 140741783355469
+        let fee: u64 = 0x0003_0003_0003_0003;
+        let amount: u64 = 0x0001_0002_0001_0002;
+        assert_eq!(
+            authorize(140_741_783_355_469, amount, fee),
+            Some(Authorization {
+                total_debit: 140_741_783_355_469
+            })
+        );
+        assert_eq!(authorize(140_741_783_355_468, amount, fee), None);
+    }
+
+    #[test]
+    fn clamps_digits_to_radix_minus_one() {
+        // fee = 0 -> all b_i = 1 -> all d_i = 0 -> encoded_idx = 0
+        assert_eq!(
+            authorize(50, 100, 0),
+            Some(Authorization { total_debit: 50 })
+        );
+    }
+}
+[?2004hroot@fa6df015bd68:/workspace# cat /workspace/lean/SecurityChallenge.lean
+[?2004limport Lean
+
+namespace SecurityChallenge
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def radixBase : UInt64 := 65536
+def shift16 : UInt64 := 65536
+def shift32 : UInt64 := 4294967296
+def shift48 : UInt64 := 281474976710656
+def halfDivisor : UInt64 := 2
+
+structure OpenPqlQuote where
+  principalShare : UInt64
+  encodedIdx : UInt64
+  indexSurcharge : UInt64
+  totalDebit : UInt64
+
+def clampDigit (a b : UInt64) : UInt64 :=
+  if a < b then a else b - 1
+
+def encodeMixedRadix (amount fee : UInt64) : UInt64 :=
+  let b0 := (fee % radixBase) + 1
+  let b1 := ((fee / shift16) % radixBase) + 1
+  let b2 := ((fee / shift32) % radixBase) + 1
+  let b3 := ((fee / shift48) % radixBase) + 1
+  let a0 := amount % radixBase
+  let a1 := (amount / shift16) % radixBase
+  let a2 := (amount / shift32) % radixBase
+  let a3 := (amount / shift48) % radixBase
+  let d0 := clampDigit a0 b0
+  let d1 := clampDigit a1 b1
+  let d2 := clampDigit a2 b2
+  let d3 := clampDigit a3 b3
+  let o2 := b3
+  let o1 := b2 * o2
+  let o0 := b1 * o1
+  d0 * o0 + d1 * o1 + d2 * o2 + d3
+
+def buildQuote (amount fee : UInt64) : Option OpenPqlQuote :=
+  let principalShare := amount / halfDivisor
+  let encodedIdx := encodeMixedRadix amount fee
+  let indexSurcharge := encodedIdx / halfDivisor
+  let totalDebit := principalShare + indexSurcharge
+  some {
+    principalShare := principalShare,
+    encodedIdx := encodedIdx,
+    indexSurcharge := indexSurcharge,
+    totalDebit := totalDebit
+  }
+
+def verifyAffordability (balance : UInt64) (quote : OpenPqlQuote) : Option UInt64 :=
+  if quote.totalDebit ≤ balance then
+    some quote.totalDebit
+  else
+    none
+
+-- Visible program model, not the hidden policy used to grade specifications.
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  match buildQuote amount fee with
+  | some quote => verifyAffordability balance quote
+  | none => none
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (verdict : AuditVerdict) : Prop :=
+  match verdict with
+  | .safe => Conforms spec challengeAuthorize
+  | .vulnerable => ¬ Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@fa6df015bd68:/workspace# cat /workspace/lean/lean-toolchain; cat /workspace/lean/check.py | head -80; ls /workspace/submission/src; cat /workspace/submission/*.lean
+[?2004lleanprover/lean4:v4.31.0
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+[?2004hroot@fa6df015bd68:/workspace# ls /workspace/lean/.lake/packages 2>/dev/null; ls ~/.elan/toolchains 2>/dev/null; cat /workspace/lean/Signature.lean | head -30
+[?2004limport SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+[?2004hroot@fa6df015bd68:/workspace# ls /opt/rvb-deps /opt/rvb-deps/packages 2>/dev/null; which lean; lean --version
+[?2004l/opt/rvb-deps:
+[0m[01;34mpackages[0m  requirements-verifier.txt
+
+/opt/rvb-deps/packages:
+[01;34mCli[0m  [01;34mLeanSearchClient[0m  [01;34mQq[0m  [01;34maeneas[0m  [01;34maesop[0m  [01;34mbatteries[0m  [01;34mhax[0m  [01;34mimportGraph[0m  [01;34mmathlib[0m  [01;34mplausible[0m  [01;34mproofwidgets[0m
+/opt/lean/bin/lean
+Lean (version 4.31.0, x86_64-unknown-linux-gnu, commit 68218e876d2a38b1985b8590fff244a83c321783, Release)
+[?2004hroot@fa6df015bd68:/workspace# mkdir -p /tmp/t && cd /tmp/t && cat > T.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> #check @UInt64.toNat_add
+[?2004l[?2004h> #check @UInt64.toNat_mul
+[?2004l[?2004h> #check @UInt64.toNat_div
+[?2004l[?2004h> #check @UInt64.toNat_mod
+[?2004l[?2004h> #check @UInt64.toNat_sub_of_le
+[?2004l[?2004h> #check @UInt64.le_iff_toNat_le
+[?2004l[?2004h> #check @UInt64.lt_iff_toNat_lt
+[?2004l[?2004h> #check @UInt64.toNat_ofNat
+[?2004l[?2004h> example : (1:UInt64).toNat = 1 := by simp
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fa6df015bd68:/tmp/t# LEAN_PATH=/workspace/lean lean T.lean; cd /workspace
+[?2004lUInt64.toNat_add : ∀ (a b : UInt64), (a + b).toNat = (a.toNat + b.toNat) % 2 ^ 64
+UInt64.toNat_mul : ∀ (a b : UInt64), (a * b).toNat = a.toNat * b.toNat % 2 ^ 64
+UInt64.toNat_div : ∀ (a b : UInt64), (a / b).toNat = a.toNat / b.toNat
+UInt64.toNat_mod : ∀ (a b : UInt64), (a % b).toNat = a.toNat % b.toNat
+UInt64.toNat_sub_of_le : ∀ (a b : UInt64), b ≤ a → (a - b).toNat = a.toNat - b.toNat
+@UInt64.le_iff_toNat_le : ∀ {a b : UInt64}, a ≤ b ↔ a.toNat ≤ b.toNat
+@UInt64.lt_iff_toNat_lt : ∀ {a b : UInt64}, a < b ↔ a.toNat < b.toNat
+@UInt64.toNat_ofNat : ∀ {n : Nat}, (OfNat.ofNat n).toNat = n % 2 ^ 64
+[?2004hroot@fa6df015bd68:/workspace# cat > /workspace/submission/Spec.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> import Mathlib
+[?2004l[?2004h> open SecurityChallenge
+[?2004l[?2004h> 
+[?2004l[?2004h> /-! Intended policy, stated in exact (unbounded) natural-number arithmetic. -/
+[?2004l[?2004h> 
+[?2004l[?2004h> def radB0 (f : Nat) : Nat := f % 65536 + 1
+[?2004l[?2004h> def radB1 (f : Nat) : Nat := f / 65536 % 65536 + 1
+[?2004l[?2004h> def radB2 (f : Nat) : Nat := f / 4294967296 % 65536 + 1
+[?2004l[?2004h> def radB3 (f : Nat) : Nat := f / 281474976710656 % 65536 + 1
+[?2004l[?2004h> def digA0 (a : Nat) : Nat := a % 65536
+[?2004l[?2004h> def digA1 (a : Nat) : Nat := a / 65536 % 65536
+[?2004l[?2004h> def digA2 (a : Nat) : Nat := a / 4294967296 % 65536
+[?2004l[?2004h> def digA3 (a : Nat) : Nat := a / 281474976710656 % 65536
+[?2004l[?2004h> 
+[?2004l[?2004h> /-- `min a (b - 1)` for `b ≥ 1`. -/
+[?2004l[?2004h> def clampN (a b : Nat) : Nat := if a < b then a else b - 1
+[?2004l[?2004h> 
+[?2004l[?2004h> def encN (a f : Nat) : Nat :=
+[?2004l[?2004h>   clampN (digA0 a) (radB0 f) * (radB1 f * (radB2 f * radB3 f))
+[?2004l[?2004h>   + clampN (digA1 a) (radB1 f) * (radB2 f * radB3 f)
+[?2004l[?2004h>   + clampN (digA2 a) (radB2 f) * radB3 f
+[?2004l[?2004h>   + clampN (digA3 a) (radB3 f)
+[?2004l[?2004h> 
+[?2004l[?2004h> def debitN (a f : Nat) : Nat := a / 2 + encN a f / 2
+[?2004l[?2004h> 
+[?2004l[?2004h> def candidateSpec : AuthorizationSpec where
+[?2004l[?2004h>   accepts := fun b a f => debitN a.toNat f.toNat ≤ b.toNat
+[?2004l[?2004h>   output := fun _b a f t => t.toNat = debitN a.toNat f.toNat
+[?2004l[?2004h> 
+[?2004l[?2004h> /-! Proof that the model computes the policy without overflow. -/
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem two64 : (2:Nat)^64 = 18446744073709551616 := by norm_num
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mul_toNat_of_lt (x y : UInt64) (h : x.toNat * y.toNat < 18446744073709551616) :
+[?2004l[?2004h>     (x * y).toNat = x.toNat * y.toNat := by
+[?2004l[?2004h>   rw [UInt64.toNat_mul, two64, Nat.mod_eq_of_lt h]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem add_toNat_of_lt (x y : UInt64) (h : x.toNat + y.toNat < 18446744073709551616) :
+[?2004l[?2004h>     (x + y).toNat = x.toNat + y.toNat := by
+[?2004l[?2004h>   rw [UInt64.toNat_add, two64, Nat.mod_eq_of_lt h]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem key_lt {d b x B : Nat} (hd : d < b) (hx : x < B) : d * B + x < b * B := by
+[?2004l[?2004h>   have : (d + 1) * B ≤ b * B := Nat.mul_le_mul_right B hd
+[?2004l[?2004h>   rw [Nat.add_mul, Nat.one_mul] at this
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem enc_core (b0 b1 b2 b3 d0 d1 d2 d3 : UInt64)
+[?2004l[?2004h>     (hb0 : b0.toNat ≤ 65536) (hb1 : b1.toNat ≤ 65536) (hb2 : b2.toNat ≤ 65536)
+[?2004l[?2004h>     (hb3 : b3.toNat ≤ 65536)
+[?2004l[?2004h>     (hd0 : d0.toNat < b0.toNat) (hd1 : d1.toNat < b1.toNat) (hd2 : d2.toNat < b2.toNat)
+[?2004l[?2004h>     (hd3 : d3.toNat < b3.toNat) :
+[?2004l[?2004h>     (d0 * (b1 * (b2 * b3)) + d1 * (b2 * b3) + d2 * b3 + d3).toNat =
+[?2004l[?2004h>       d0.toNat * (b1.toNat * (b2.toNat * b3.toNat)) + d1.toNat * (b2.toNat * b3.toNat)
+[?2004l[?2004h>         + d2.toNat * b3.toNat + d3.toNat := by
+[?2004l[?2004h>   have h23 : b2.toNat * b3.toNat ≤ 65536 * 65536 := Nat.mul_le_mul hb2 hb3
+[?2004l[?2004h>   have p23 : (b2 * b3).toNat = b2.toNat * b3.toNat := mul_toNat_of_lt _ _ (by omega)
+[?2004l[?2004h>   have h123 : b1.toNat * (b2.toNat * b3.toNat) ≤ 65536 * (65536 * 65536) :=
+[?2004l[?2004h>     Nat.mul_le_mul hb1 h23
+[?2004l[?2004h>   have p123 : (b1 * (b2 * b3)).toNat = b1.toNat * (b2.toNat * b3.toNat) := by
+[?2004l[?2004h>     rw [mul_toNat_of_lt _ _ (by rw [p23]; omega), p23]
+[?2004l[?2004h>   have hall : b0.toNat * (b1.toNat * (b2.toNat * b3.toNat)) ≤ 65536 * (65536 * (65536 * 65536)) :=
+[?2004l[?2004h>     Nat.mul_le_mul hb0 h123
+[?2004l[?2004h>   have s3 := key_lt hd2 hd3
+[?2004l[?2004h>   have s2 := key_lt hd1 s3
+[?2004l[?2004h>   have s1 := key_lt hd0 s2
+[?2004l[?2004h>   have q0 : (d0 * (b1 * (b2 * b3))).toNat = d0.toNat * (b1.toNat * (b2.toNat * b3.toNat)) := by
+[?2004l[?2004h>     rw [mul_toNat_of_lt _ _ (by rw [p123]; omega), p123]
+[?2004l[?2004h>   have q1 : (d1 * (b2 * b3)).toNat = d1.toNat * (b2.toNat * b3.toNat) := by
+[?2004l[?2004h>     rw [mul_toNat_of_lt _ _ (by rw [p23]; omega), p23]
+[?2004l[?2004h>   have q2 : (d2 * b3).toNat = d2.toNat * b3.toNat := mul_toNat_of_lt _ _ (by omega)
+[?2004l[?2004h>   rw [add_toNat_of_lt, add_toNat_of_lt, add_toNat_of_lt, q0, q1, q2]
+[?2004l[?2004h>   · rw [q0, q1]; omega
+[?2004l[?2004h>   · rw [add_toNat_of_lt, q0, q1] <;> (try rw [q0, q1]) <;> omega
+[?2004l[?2004h>   · rw [add_toNat_of_lt, add_toNat_of_lt, q0, q1, q2] <;> (try rw [q0, q1]) <;>
+[?2004l[?2004h>       (try rw [add_toNat_of_lt, q0, q1, q2]) <;> (try rw [q0, q1]) <;> omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem clamp_toNat (a b : UInt64) (hb : 1 ≤ b.toNat) :
+[?2004l[?2004h>     (clampDigit a b).toNat = clampN a.toNat b.toNat := by
+[?2004l[?2004h>   unfold clampDigit clampN
+[?2004l[?2004h>   by_cases h : a < b
+[?2004l[?2004h>   · have h' : a.toNat < b.toNat := UInt64.lt_iff_toNat_lt.mp h
+[?2004l[?2004h>     simp [h, h']
+[?2004l[?2004h>   · have h' : ¬ a.toNat < b.toNat := fun x => h (UInt64.lt_iff_toNat_lt.mpr x)
+[?2004l[?2004h>     simp only [h, h', if_false]
+[?2004l[?2004h>     rw [UInt64.toNat_sub_of_le _ _ (UInt64.le_iff_toNat_le.mpr (by simpa using hb))]
+[?2004l[?2004h>     simp
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem encode_toNat (a f : UInt64) :
+[?2004l[?2004h>     (encodeMixedRadix a f).toNat = encN a.toNat f.toNat := by
+[?2004l[?2004h>   have hr : radixBase.toNat = 65536 := rfl
+[?2004l[?2004h>   have h16 : shift16.toNat = 65536 := rfl
+[?2004l[?2004h>   have h32 : shift32.toNat = 4294967296 := rfl
+[?2004l[?2004h>   have h48 : shift48.toNat = 281474976710656 := rfl
+[?2004l[?2004h>   have one : (1 : UInt64).toNat = 1 := rfl
+[?2004l[?2004h>   have B0 : ((f % radixBase) + 1).toNat = radB0 f.toNat := by
+[?2004l[?2004h>     rw [add_toNat_of_lt, UInt64.toNat_mod, hr, one] <;> simp only [UInt64.toNat_mod, hr, one, radB0] <;> omega
+[?2004l[?2004h>   have B1 : (((f / shift16) % radixBase) + 1).toNat = radB1 f.toNat := by
+[?2004l[?2004h>     rw [add_toNat_of_lt, UInt64.toNat_mod, UInt64.toNat_div, hr, h16, one] <;>
+[?2004l[?2004h>       simp only [UInt64.toNat_mod, UInt64.toNat_div, hr, h16, one, radB1] <;> omega
+[?2004l[?2004h>   have B2 : (((f / shift32) % radixBase) + 1).toNat = radB2 f.toNat := by
+[?2004l[?2004h>     rw [add_toNat_of_lt, UInt64.toNat_mod, UInt64.toNat_div, hr, h32, one] <;>
+[?2004l[?2004h>       simp only [UInt64.toNat_mod, UInt64.toNat_div, hr, h32, one, radB2] <;> omega
+[?2004l[?2004h>   have B3 : (((f / shift48) % radixBase) + 1).toNat = radB3 f.toNat := by
+[?2004l[?2004h>     rw [add_toNat_of_lt, UInt64.toNat_mod, UInt64.toNat_div, hr, h48, one] <;>
+[?2004l[?2004h>       simp only [UInt64.toNat_mod, UInt64.toNat_div, hr, h48, one, radB3] <;> omega
+[?2004l[?2004h>   have A0 : (a % radixBase).toNat = digA0 a.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, hr, digA0]
+[?2004l[?2004h>   have A1 : ((a / shift16) % radixBase).toNat = digA1 a.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_div, hr, h16, digA1]
+[?2004l[?2004h>   have A2 : ((a / shift32) % radixBase).toNat = digA2 a.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_div, hr, h32, digA2]
+[?2004l[?2004h>   have A3 : ((a / shift48) % radixBase).toNat = digA3 a.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_div, hr, h48, digA3]
+[?2004l[?2004h>   have rb0 : 1 ≤ radB0 f.toNat ∧ radB0 f.toNat ≤ 65536 := by unfold radB0; omega
+[?2004l[?2004h>   have rb1 : 1 ≤ radB1 f.toNat ∧ radB1 f.toNat ≤ 65536 := by unfold radB1; omega
+[?2004l[?2004h>   have rb2 : 1 ≤ radB2 f.toNat ∧ radB2 f.toNat ≤ 65536 := by unfold radB2; omega
+[?2004l[?2004h>   have rb3 : 1 ≤ radB3 f.toNat ∧ radB3 f.toNat ≤ 65536 := by unfold radB3; omega
+[?2004l[?2004h>   have cl : ∀ x y : Nat, 1 ≤ y → clampN x y < y := by
+[?2004l[?2004h>     intro x y hy; unfold clampN; split <;> omega
+[?2004l[?2004h>   unfold encodeMixedRadix
+[?2004l[?2004h>   simp only []
+[?2004l[?2004h>   have D0 := clamp_toNat (a % radixBase) ((f % radixBase) + 1) (by rw [B0]; exact rb0.1)
+[?2004l[?2004h>   have D1 := clamp_toNat ((a / shift16) % radixBase) (((f / shift16) % radixBase) + 1) (by rw [B1]; exact rb1.1)
+[?2004l[?2004h>   have D2 := clamp_toNat ((a / shift32) % radixBase) (((f / shift32) % radixBase) + 1) (by rw [B2]; exact rb2.1)
+[?2004l[?2004h>   have D3 := clamp_toNat ((a / shift48) % radixBase) (((f / shift48) % radixBase) + 1) (by rw [B3]; exact rb3.1)
+[?2004l[?2004h>   rw [B0, A0] at D0
+[?2004l[?2004h>   rw [B1, A1] at D1
+[?2004l[?2004h>   rw [B2, A2] at D2
+[?2004l[?2004h>   rw [B3, A3] at D3
+[?2004l[?2004h>   rw [enc_core _ _ _ _ _ _ _ _ (by rw [B0]; exact rb0.2) (by rw [B1]; exact rb1.2)
+[?2004l[?2004h>     (by rw [B2]; exact rb2.2) (by rw [B3]; exact rb3.2)
+[?2004l[?2004h>     (by rw [D0, B0]; exact cl _ _ rb0.1) (by rw [D1, B1]; exact cl _ _ rb1.1)
+[?2004l[?2004h>     (by rw [D2, B2]; exact cl _ _ rb2.1) (by rw [D3, B3]; exact cl _ _ rb3.1)]
+[?2004l[?2004h>   rw [D0, D1, D2, D3, B1, B2, B3]
+[?2004l[?2004h>   rfl
+[?2004l[?2004h> 
+[?2004l[?2004h> def quoteDebit (a f : UInt64) : UInt64 :=
+[?2004l[?2004h>   a / halfDivisor + encodeMixedRadix a f / halfDivisor
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem auth_eq (b a f : UInt64) :
+[?2004l[?2004h>     challengeAuthorize b a f = if quoteDebit a f ≤ b then some (quoteDebit a f) else none := rfl
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem debit_toNat (a f : UInt64) : (quoteDebit a f).toNat = debitN a.toNat f.toNat := by
+[?2004l[?2004h>   have h2 : halfDivisor.toNat = 2 := rfl
+[?2004l[?2004h>   have ha := a.toNat_lt
+[?2004l[?2004h>   have he := (encodeMixedRadix a f).toNat_lt
+[?2004l[?2004h>   rw [two64] at ha he
+[?2004l[?2004h>   unfold quoteDebit debitN
+[?2004l[?2004h>   rw [add_toNat_of_lt, UInt64.toNat_div, UInt64.toNat_div, h2, encode_toNat]
+[?2004l[?2004h>   rw [UInt64.toNat_div, UInt64.toNat_div, h2]
+[?2004l[?2004h>   omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem candidate_conforms : Conforms candidateSpec challengeAuthorize := by
+[?2004l[?2004h>   constructor
+[?2004l[?2004h>   · intro b a f
+[?2004l[?2004h>     show (∃ total, challengeAuthorize b a f = some total) ↔ debitN a.toNat f.toNat ≤ b.toNat
+[?2004l[?2004h>     rw [auth_eq]
+[?2004l[?2004h>     constructor
+[?2004l[?2004h>     · rintro ⟨t, ht⟩
+[?2004l[?2004h>       split at ht
+[?2004l[?2004h>       · rename_i h
+[?2004l[?2004h>         rw [← debit_toNat]; exact UInt64.le_iff_toNat_le.mp h
+[?2004l[?2004h>       · cases ht
+[?2004l[?2004h>     · intro h
+[?2004l[?2004h>       refine ⟨quoteDebit a f, ?_⟩
+[?2004l[?2004h>       rw [if_pos (UInt64.le_iff_toNat_le.mpr (by rw [debit_toNat]; exact h))]
+[?2004l[?2004h>   · intro b a f t ht
+[?2004l[?2004h>     show t.toNat = debitN a.toNat f.toNat
+[?2004l[?2004h>     rw [auth_eq] at ht
+[?2004l[?2004h>     split at ht
+[?2004l[?2004h>     · cases ht; exact debit_toNat a f
+[?2004l[?2004h>     · cases ht
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fa6df015bd68:/workspace# printf 'import SecurityChallenge\nopen SecurityChallenge\n\ndef verdict : AuditVerdict := .safe\n' > /workspace/submission/Audit.lean
+[?2004l[?2004hroot@fa6df015bd68:/workspace# printf 'candidate_conforms\n' > /workspace/submission/Proof.lean
+[?2004l[?2004hroot@fa6df015bd68:/workspace# rmdir /workspace/submission/src 2>/dev/null; ls /workspace/submission
+[?2004lAudit.lean  Proof.lean  Spec.lean
+[?2004hroot@fa6df015bd68:/workspace# cd /workspace/lean && python3 check.py 2>&1 | head -60; cd /workspace
+[?2004lCandidateSpec.lean:18:1: error: unexpected token 'def'; expected term
+CandidateSpec.lean:115:65: error: unsolved goals
+a f : UInt64
+hr : radixBase.toNat = 65536
+h16 : shift16.toNat = 65536
+h32 : shift32.toNat = 4294967296
+h48 : shift48.toNat = 281474976710656
+one : UInt64.toNat 1 = 1
+B0 : (f % radixBase + 1).toNat = radB0 f.toNat
+B1 : (f / shift16 % radixBase + 1).toNat = radB1 f.toNat
+B2 : (f / shift32 % radixBase + 1).toNat = radB2 f.toNat
+B3 : (f / shift48 % radixBase + 1).toNat = radB3 f.toNat
+A0 : (a % radixBase).toNat = digA0 a.toNat
+A1 : (a / shift16 % radixBase).toNat = digA1 a.toNat
+A2 : (a / shift32 % radixBase).toNat = digA2 a.toNat
+⊢ a.toNat / 281474976710656 % 65536 = a.toNat / 281474976710656 % 65536 / sorry
+CandidateSpec.lean:116:60: warning: declaration uses `sorry`
+Traceback (most recent call last):
+  File "/workspace/lean/check.py", line 64, in <module>
+    subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['lean', '-o', 'CandidateSpec.olean', 'CandidateSpec.lean']' returned non-zero exit status 1.
+[?2004hroot@fa6df015bd68:/workspace# cd /workspace/submission && sed -i 's|^/-- `min a (b - 1)` for `b ≥ 1`. -/$|/- clamp: min a (b - 1) for b at least 1 -/|' Spec.lean && grep -n -- '--' Spec.lean; cd /workspace/lean && python3 check.py 2>&1 | head -60; cd /workspace
+[?2004lCandidateSpec.lean:99:101: warning: Used `tac1 <;> tac2` where `(tac1; tac2)` would suffice
+
+Note: This linter can be disabled with `set_option linter.unnecessarySeqFocus false`
+CandidateSpec.lean:102:74: warning: Used `tac1 <;> tac2` where `(tac1; tac2)` would suffice
+
+Note: This linter can be disabled with `set_option linter.unnecessarySeqFocus false`
+CandidateSpec.lean:105:74: warning: Used `tac1 <;> tac2` where `(tac1; tac2)` would suffice
+
+Note: This linter can be disabled with `set_option linter.unnecessarySeqFocus false`
+CandidateSpec.lean:108:74: warning: Used `tac1 <;> tac2` where `(tac1; tac2)` would suffice
+
+Note: This linter can be disabled with `set_option linter.unnecessarySeqFocus false`
+[?2004hroot@fa6df015bd68:/workspace# cd /workspace/lean && python3 check.py >/tmp/chk.log 2>&1; echo EXIT=$?; grep -i error /tmp/chk.log; cd /workspace
+[?2004lEXIT=0
+[?2004hroot@fa6df015bd68:/workspace# mkdir -p /tmp/ax && cd /tmp/ax && cp /workspace/submission/Spec.lean CandidateSpec.lean && LEAN_PATH=/workspace/lean:/tmp/ax:$(ls -d /opt/rvb-deps/packages/*/.lake/build/lib/lean | tr '\n' ':') lean -o CandidateSpec.olean CandidateSpec.lean >/dev/null 2>&1; printf 'import CandidateSpec\n#print axioms candidate_conforms\n' > Ax.lean && LEAN_PATH=/workspace/lean:/tmp/ax:$(ls -d /opt/rvb-deps/packages/*/.lake/build/lib/lean | tr '\n' ':') lean Ax.lean; cd /workspace
+[?2004l'candidate_conforms' depends on axioms: [propext, Classical.choice, Quot.sound]
+[?2004hroot@fa6df015bd68:/workspace# cd /workspace/challenge && cargo test --offline 2>&1 | tail -8; cd /workspace; ls -la /workspace/submission
+[?2004ltest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+total 36
+drwxr-xr-x 1 root root 4096 Oct  8 11:21 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct  6 05:03 [01;34m..[0m
+-rw-r--r-- 1 root root   85 Oct  8 11:20 Audit.lean
+-rw-r--r-- 1 root root   19 Oct  8 11:20 Proof.lean
+-rw-r--r-- 1 root root 8379 Oct  8 11:21 Spec.lean
+[?2004hroot@fa6df015bd68:/workspace# 

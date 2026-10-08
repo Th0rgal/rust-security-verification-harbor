@@ -9,14 +9,20 @@ mathematical debit defined by the task family (`problem.txt`):
   `gross_fee = ceil((amount + fee) / 10_000)`, `rebate = floor(gross_fee / 10)`,
   and `S = amount + (gross_fee - rebate)`.
 - In `goldilocks` (Goldilocks prime `P = 2^64 - 2^32 + 1`),
-  `fee = ((amount mod P) * (feeRate mod P)) mod P`, and `S = amount + fee`.
-- In `whirlpool` (fee rate denominator `1_000_000`, accepts only when `feeRate < 1_000_000`),
-  `fee = ceil(amount * feeRate / (1_000_000 - feeRate))`, and `S = amount + fee`.
-- In `plonky3` (BabyBear prime `P = 2013265921`),
-  `fee = ((amount mod P) * (feeRate mod P)) mod P`, and `S = amount + fee`.
+  `S = floor(amount / 2^32) + ((amount + fee * 2^64) mod P)`.
+- In `whirlpool` (fee rate denominator `1_000_000`),
+  `S = floor(amount / 2) + ceil((amount + fee * 2^64) / 1_000_000)`.
+- In `plonky3` (BabyBear prime `P = 2013265921`, `R^{-1} mod P = 943718400`),
+  `S = amount + ((((amount mod 2^32) + (fee mod P) * 2^32) * 943718400) mod P)`.
+- In `succinct` (`tov/succinct-rs` SWAR broadword byte detection, `b_i(fee) = floor(fee / 256^i) mod 256`),
+  `S = floor(amount / 2) + sum_{i=0..7} b_i(fee) + 256 * |{i in 0..7 | b_i(fee) > 0}|`.
+- In `openpql` (`solve-poker/Poker-Query-Language` 4-level mixed-radix indexing),
+  `S = floor(amount / 2) + min(fee mod 65536, 32767)`.
+- In `ruint` (`alloy-rs/ruint` Möller-Granlund 2-by-1 normalized division, `D = 32771`, `B = 65536`),
+  `S = floor(amount / 2) + floor(((fee mod D) * B + (amount mod B)) / D)`.
 
-The hidden business contract accepts iff S <= balance (and `feeRate < 1_000_000`
-in `whirlpool`), and returns S on acceptance. Because balance is a u64, S <= balance
+The hidden business contract accepts iff S <= balance, and returns S on
+acceptance. Because balance is a u64, S <= balance
 also implies S fits u64; no separate overflow point is double-counted.
 
 The four spec facets are:
