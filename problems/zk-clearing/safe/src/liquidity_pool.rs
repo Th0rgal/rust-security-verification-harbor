@@ -47,6 +47,19 @@ pub fn assess_flash_fee_ceil(principal: u64, surcharge: u64) -> u64 {
     ceil_div_flash_u64(sum)
 }
 
+/// Quotes the protocol treasury cut (`floor(flash_levy / 4)`) and liquidity-provider
+/// retention (`flash_levy - treasury_cut`) on the ceiling flash-settlement levy.
+#[inline]
+pub fn quote_flash_lp_retention(principal: u64, surcharge: u64) -> PoolReserveQuote {
+    let flash_levy: u64 = assess_flash_fee_ceil(principal, surcharge);
+    let treasury_cut: u64 = flash_levy / TREASURY_CUT_DIVISOR;
+    let lp_retention: u64 = flash_levy - treasury_cut;
+    PoolReserveQuote {
+        treasury_cut,
+        lp_retention,
+    }
+}
+
 /// Computes the floor flash-settlement levy `floor((principal + surcharge) / 5_000)`
 /// in pure `u64` arithmetic.
 #[inline]
@@ -98,6 +111,9 @@ mod tests {
         let r = quote_flash_repayment(100_000u64, 1u64).unwrap();
         assert_eq!(r.flash_levy, 21u64);
         assert_eq!(r.total_repayment, 100_021u64);
+        let flp = quote_flash_lp_retention(100_000u64, 1u64);
+        assert_eq!(flp.treasury_cut, 5u64);
+        assert_eq!(flp.lp_retention, 16u64);
         assert_eq!(assess_flash_fee_floor(100_000u64, 1u64), 20u64);
         assert_eq!(quote_flash_repayment(u64::MAX, 1u64), None);
     }

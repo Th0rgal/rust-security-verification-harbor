@@ -15,7 +15,7 @@ structure TranscriptHeader where
 
 def decodeDomainTag (word : UInt64) : UInt64 :=
   let rawTag : UInt64 := word &&& codecTagMask
-  if rawTag == 0 then
+  if rawTag = 0 then
     sequencerDomainTag
   else
     rawTag

@@ -7,29 +7,14 @@
 //!
 //! ### Clearing Protocol Contract
 //! Given an account `balance`, transfer `amount` (principal), and `fee` parameter word
-//! (each a `u64`), the clearing pipeline (`clearing_pipeline::quote_clearing_ticket`)
-//! computes the exact mathematical settlement debit as the sum of `amount` and four
-//! protocol surcharge components evaluated in unbounded integer arithmetic:
-//!
-//! 1. **Protocol Settlement Fee (`word_math`, `fee_schedule`):**
-//!    The combined notional `amount + fee` is divided by the basis-point denominator
-//!    (`constants::BPS_DENOM`), rounded up to the ceiling integer, and reduced by the
-//!    floor tier rebate (`constants::REBATE_DIVISOR`).
-//! 2. **L1 Blob Gas Slot Quotient (`reciprocal_div`):**
-//!    The two-limb normalized dividend formed by high limb `fee mod MG10_DIVISOR` and
-//!    low 16-bit limb `amount mod 2^16` is divided by `constants::MG10_DIVISOR`,
-//!    rounded down.
-//! 3. **Calldata Byte-Lane Surcharge (`broadword_swar`):**
-//!    Across the 8 byte lanes of `fee`, each non-zero byte lane incurs the fixed
-//!    activation surcharge (`1 << constants::CALLDATA_NZ_BYTE_SHIFT`) plus the numeric
-//!    value of each byte lane.
-//! 4. **Prover Transcript Montgomery Levy (`montgomery_field`):**
-//!    The 64-bit transcript state packed from `amount mod LIMB_BASE` and
-//!    `(fee mod BABYBEAR_P) * LIMB_BASE` is reduced modulo `constants::BABYBEAR_P` via
-//!    canonical 32-bit Montgomery reduction (`montgomery_field::monty_reduce`).
+//! (each a `u64`), the clearing pipeline (`clearing_pipeline::quote_clearing_ticket`
+//! and `clearing_pipeline::commit_clearing_ticket`) evaluates all active protocol
+//! surcharge stages in `clearing_pipeline::compute_clearing_breakdown(amount, fee)`
+//! and adds their combined surcharge to `amount`.
 //!
 //! A clearing request must be authorized (`Some(Authorization { total_debit })`) if and
-//! only if the exact mathematical `total_debit` is at most `balance`, and rejected
+//! only if the exact mathematical `total_debit` across `amount` and all active stages
+//! of `clearing_pipeline::compute_clearing_breakdown` is at most `balance`, and rejected
 //! (`None`) whenever `total_debit > balance`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,24 +47,28 @@ mod tests {
 
     #[test]
     fn authorize_zero_transfer() {
-        assert_eq!(authorize(0u64, 0u64, 0u64), Some(Authorization { total_debit: 0u64 }));
+        assert_eq!(authorize(90u64, 0u64, 0u64), Some(Authorization { total_debit: 90u64 }));
+        assert_eq!(authorize(89u64, 0u64, 0u64), None);
     }
 
     #[test]
     fn authorize_single_fee_unit_exact_boundary() {
-        assert_eq!(authorize(260u64, 0u64, 1u64), Some(Authorization { total_debit: 260u64 }));
-        assert_eq!(authorize(259u64, 0u64, 1u64), None);
+        assert_eq!(
+            authorize(4_294_967_557u64, 0u64, 1u64),
+            Some(Authorization { total_debit: 4_294_967_557u64 })
+        );
+        assert_eq!(authorize(4_294_967_556u64, 0u64, 1u64), None);
     }
 
     #[test]
     fn authorize_ordinary_commercial_transfers() {
         let cases: [(u64, u64, u64); 6] = [
-            (100_000u64, 25_000u64, 2_013_394_831u64),
-            (32_771u64, 10u64, 817_906_990u64),
-            (1_000_000_000u64, 0x8080_8080_8080_8080u64, 833_361_442_500_589u64),
-            (4_294_967_297u64, 1_069_547_520u64, 6_308_717_576u64),
-            (65_535u64, 16_384u64, 1_069_631_816u64),
-            (65_534u64, 21_845u64, 125_930_159u64),
+            (100_000u64, 25_000u64, 107_376_195_870_018u64),
+            (32_771u64, 10u64, 43_767_612_727u64),
+            (1_000_000_000u64, 0x8080_8080_8080_8080u64, 9_261_764_410_567_240_478u64),
+            (4_294_967_297u64, 1_069_547_520u64, 4_593_671_629_452_848_041u64),
+            (65_535u64, 16_384u64, 70_369_813_858_734u64),
+            (65_534u64, 21_845u64, 93_823_686_555_067u64),
         ];
         for (amount, fee, expected) in cases {
             assert_eq!(
@@ -91,11 +80,11 @@ mod tests {
     }
 
     #[test]
-    fn authorize_wide_carry_folding_at_u64_max() {
+    fn authorize_wide_carry_folding_at_goldilocks_modulus() {
         let cases: [(u64, u64, u64); 3] = [
-            (0u64, u64::MAX, 1_660_208_138_808_700u64),
-            (10_000u64, u64::MAX, 1_660_207_132_181_054u64),
-            (1_000_000u64, u64::MAX - 500u64, 1_660_208_139_338_296u64),
+            (0u64, constants::GOLDILOCKS_P, 4_427_219_480_397_035u64),
+            (10_000u64, constants::GOLDILOCKS_P, 4_427_220_487_045_311u64),
+            (1_000_000u64, constants::GOLDILOCKS_P + 1u64, 4_427_223_776_895_826u64),
         ];
         for (amount, fee, expected) in cases {
             assert_eq!(

@@ -102,7 +102,7 @@ def _needs_divmod_purification(expr):
             continue
         if e.decl().kind() in (z3.Z3_OP_IDIV, z3.Z3_OP_MOD) and e.num_args() == 2:
             c_simp = z3.simplify(e.arg(1))
-            if z3.is_int_value(c_simp) and (c_simp.as_long() >= 1_000_000 or c_simp.as_long() in (128, 256, 32771, 65536)):
+            if z3.is_int_value(c_simp) and (c_simp.as_long() >= 1_000_000 or c_simp.as_long() in (128, 256, 5000, 10000, 32771, 65536)):
                 return True
         for i in range(e.num_args()):
             stack.append(e.arg(i))
@@ -299,13 +299,13 @@ def purify_divmod(expr):
         changed = False
         acc = z3.IntVal(c0)
         for vid, (cf, vexpr) in terms.items():
-            if is_pow2 and vid in pow2_var_splits:
+            if (is_pow2 or c_val == GOLDILOCKS_P) and vid in pow2_var_splits:
                 acc = acc + z3.IntVal(cf) * pow2_var_splits[vid]
                 changed = True
             elif (vid, c_val) in var_splits:
                 acc = acc + z3.IntVal(cf) * var_splits[(vid, c_val)]
                 changed = True
-            elif not is_pow2 and vid in var_splits and c_val not in (32771, 2013265921):
+            elif not is_pow2 and vid in var_splits and c_val not in (32771, 2013265921, GOLDILOCKS_P):
                 acc = acc + z3.IntVal(cf) * var_splits[vid]
                 changed = True
             else:
@@ -348,6 +348,27 @@ def purify_divmod(expr):
             if lo is not None and hi is not None:
                 _cache_bound(q_ite, (lo // c_val, hi // c_val))
             return (q_ite, r_ite)
+        if (
+            c_val in (1 << 64, GOLDILOCKS_P)
+            and z3.is_app(a_s)
+            and a_s.decl().kind() == z3.Z3_OP_ADD
+            and a_s.num_args() <= 3
+            and not _mentions_int_const(a_s, SUCCINCT_L8)
+            and not _mentions_int_const(a_s, SUCCINCT_L16)
+        ):
+            ite_idx = next(
+                (i for i in range(a_s.num_args()) if z3.is_app(a_s.arg(i)) and a_s.arg(i).decl().kind() == z3.Z3_OP_ITE),
+                None,
+            )
+            if ite_idx is not None:
+                ite_arg = a_s.arg(ite_idx)
+                others = [a_s.arg(i) for i in range(a_s.num_args()) if i != ite_idx]
+                rest = sum(others)
+                return get_qr(
+                    z3.If(ite_arg.arg(0), rest + ite_arg.arg(1), rest + ite_arg.arg(2)),
+                    c_val,
+                    c_expr,
+                )
         a_exp = expand_rems(a_s)
         keep_alive.append(a_exp)
         c0, terms = _extract_linear(a_exp)
@@ -454,6 +475,22 @@ def purify_divmod(expr):
                     if lo is not None and hi is not None:
                         _cache_bound(q_tot, (lo // c_val, hi // c_val))
                     return (q_tot, r_sub)
+        if (
+            lo is not None
+            and hi is not None
+            and lo >= 0
+            and lo // c_val == 0
+            and hi // c_val == 1
+            and c_val in (1 << 64, GOLDILOCKS_P)
+            and not _mentions_int_const(a_s, SUCCINCT_L8)
+            and not _mentions_int_const(a_s, SUCCINCT_L16)
+        ):
+            q_exact = z3.If(a_s >= c_expr, z3.IntVal(1), z3.IntVal(0))
+            r_exact = z3.If(a_s >= c_expr, z3.simplify(a_s - c_expr), a_s)
+            keep_alive.extend((q_exact, r_exact))
+            _cache_bound(q_exact, (0, 1))
+            _cache_bound(r_exact, (0, min(hi, c_val - 1)))
+            return (q_exact, r_exact)
         target_s = a_vexp if (is_monty_mu or has_monty_hi_terms) else a_s
         key = _linear_key(target_s, c_val)
         if key not in dm_cache:
@@ -571,7 +608,7 @@ def purify_divmod(expr):
         return False
 
     for name in ('balance', 'amount', 'fee'):
-        for pre_d in (10000, 1000000):
+        for pre_d in (10000, 5000, 1000000):
             if name in var_divs and pre_d in var_divs[name]:
                 get_qr(z3.Int(name), pre_d, z3.IntVal(pre_d))
     if _mentions_int_const(expr, 2281701377):
@@ -784,6 +821,8 @@ def expected_debit_z3(amount, fee, problem='authorization'):
     if problem=='zk-clearing':
         gross_fee = (amount + fee + 9999) / 10000
         net_bps_fee = gross_fee - (gross_fee / 10)
+        flash_levy = (amount + fee + 4999) / 5000
+        flash_lp_fee = flash_levy - (flash_levy / 4)
         b16 = 1 << 16
         blob_quot = ((fee % RUINT_MG10_D) * b16 + (amount % b16)) / RUINT_MG10_D
         bs = [_byte_at_z3(fee, i) for i in range(8)]
@@ -793,7 +832,18 @@ def expected_debit_z3(amount, fee, problem='authorization'):
         b32 = 1 << 32
         x = (amount % b32) + (fee % PLONKY3_P) * b32
         prover_levy = (x * PLONKY3_R_INV) % PLONKY3_P
-        return amount + net_bps_fee + blob_quot + calldata_surcharge + prover_levy
+        domain_surcharge = z3.If(bs[0] == 0, z3.IntVal(90), bs[0])
+        bridge_surcharge = (amount + fee * (1 << 64)) % GOLDILOCKS_P
+        return (
+            amount
+            + net_bps_fee
+            + flash_lp_fee
+            + blob_quot
+            + calldata_surcharge
+            + prover_levy
+            + domain_surcharge
+            + bridge_surcharge
+        )
     raise ValueError(f'unknown problem: {problem}')
 
 def expected_debit_py(amount, fee, problem='authorization'):
@@ -834,6 +884,8 @@ def expected_debit_py(amount, fee, problem='authorization'):
     if problem=='zk-clearing':
         gross_fee = (amount + fee + 9999) // 10000
         net_bps_fee = gross_fee - (gross_fee // 10)
+        flash_levy = (amount + fee + 4999) // 5000
+        flash_lp_fee = flash_levy - (flash_levy // 4)
         b16 = 1 << 16
         blob_quot = ((fee % RUINT_MG10_D) * b16 + (amount % b16)) // RUINT_MG10_D
         bs = [(fee >> (8 * i)) & 0xFF for i in range(8)]
@@ -843,7 +895,18 @@ def expected_debit_py(amount, fee, problem='authorization'):
         b32 = 1 << 32
         x = (amount % b32) + (fee % PLONKY3_P) * b32
         prover_levy = (x * PLONKY3_R_INV) % PLONKY3_P
-        return amount + net_bps_fee + blob_quot + calldata_surcharge + prover_levy
+        domain_surcharge = 90 if bs[0] == 0 else bs[0]
+        bridge_surcharge = (amount + (fee << 64)) % GOLDILOCKS_P
+        return (
+            amount
+            + net_bps_fee
+            + flash_lp_fee
+            + blob_quot
+            + calldata_surcharge
+            + prover_levy
+            + domain_surcharge
+            + bridge_surcharge
+        )
     raise ValueError(f'unknown problem: {problem}')
 
 def check(obj, problem='authorization'):

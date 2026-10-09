@@ -216,9 +216,9 @@ mod tests {
 
     #[test]
     fn flash_floor_and_ceil_across_boundaries() {
-        let s = add_u64_with_carry(0u64, u64::MAX - 2_500u64);
-        assert_eq!(ceil_div_flash_u64(s), 3_689_348_814_741_910u64);
-        assert_eq!(floor_div_flash_u64(s), 3_689_348_814_741_909u64);
+        let s = add_u64_with_carry(0u64, u64::MAX - 500u64);
+        assert_eq!(ceil_div_flash_u64(s), 3_689_348_814_741_911u64);
+        assert_eq!(floor_div_flash_u64(s), 3_689_348_814_741_910u64);
 
         let s_hi = add_u64_with_carry(u64::MAX, 5_000u64);
         assert!(is_institutional_notional(s_hi));

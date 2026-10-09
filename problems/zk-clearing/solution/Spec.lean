@@ -11,6 +11,8 @@ def zkClearingDebit (amount fee : UInt64) : Nat :=
   let f := fee.toNat
   let grossBps := (a + f + 9999) / 10000
   let netBpsFee := grossBps - (grossBps / 10)
+  let flashLevy := (a + f + 4999) / 5000
+  let flashLpFee := flashLevy - (flashLevy / 4)
   let blobSlotQuotient := ((f % 32771) * 65536 + (a % 65536)) / 32771
   let b0 := f % 256
   let b1 := (f / 256) % 256
@@ -24,7 +26,9 @@ def zkClearingDebit (amount fee : UInt64) : Nat :=
   let bsum := b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7
   let calldataSurcharge := active * 256 + bsum
   let proverLevy := (((a % 4294967296) + (f % 2013265921) * 4294967296) * 943718400) % 2013265921
-  a + netBpsFee + blobSlotQuotient + calldataSurcharge + proverLevy
+  let domainSurcharge := if b0 = 0 then 90 else b0
+  let bridgeSurcharge := (a + 18446744073709551616 * f) % 18446744069414584321
+  a + netBpsFee + flashLpFee + blobSlotQuotient + calldataSurcharge + proverLevy + domainSurcharge + bridgeSurcharge
 
 def candidateSpec : AuthorizationSpec where
   accepts := fun balance amount fee =>

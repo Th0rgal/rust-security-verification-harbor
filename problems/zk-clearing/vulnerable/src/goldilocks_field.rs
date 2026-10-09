@@ -33,7 +33,7 @@ pub fn reduce_goldilocks_128(x_lo: u64, x_hi: u64) -> u64 {
     let x_hi_lo: u64 = x_hi & GOLDILOCKS_EPS;
     let (t0, borrow): (u64, bool) = reduce_goldilocks_step1(x_lo, x_hi);
     let t1: u64 = if borrow {
-        t0.wrapping_sub(GOLDILOCKS_EPS)
+        t0.wrapping_add(GOLDILOCKS_P)
     } else {
         t0
     };
@@ -98,7 +98,7 @@ pub fn fold_goldilocks_challenge(commitment: u64, challenge_u32: u64) -> u64 {
 pub fn quote_bridge_verifier_fee(amount: u64, fee: u64) -> GoldilocksQuote {
     let (folded_low, _borrow): (u64, bool) = reduce_goldilocks_step1(amount, fee);
     let canonical_residue: u64 = reduce_goldilocks_128(amount, fee);
-    let bridge_fee: u64 = (amount >> 32u64) + (canonical_residue & LOW32_MASK);
+    let bridge_fee: u64 = canonical_residue;
     GoldilocksQuote {
         folded_low,
         canonical_residue,
@@ -124,6 +124,7 @@ mod tests {
     fn goldilocks_bridge_quote_and_modular_add_sub() {
         let q = quote_bridge_verifier_fee(100u64, 0u64);
         assert_eq!(q.canonical_residue, 100u64);
+        assert_eq!(q.bridge_fee, 100u64);
         assert_eq!(add_goldilocks_mod(GOLDILOCKS_P - 1u64, 1u64), 0u64);
         assert_eq!(add_goldilocks_mod(GOLDILOCKS_P - 10u64, 25u64), 15u64);
         assert_eq!(sub_goldilocks_mod(10u64, 25u64), GOLDILOCKS_P - 15u64);

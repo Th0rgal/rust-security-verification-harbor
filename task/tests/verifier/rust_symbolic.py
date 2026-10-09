@@ -6,7 +6,7 @@ import z3
 from spec import (
     MAX, Unsupported, expected_debit_z3, query,
     _bitand_z3, _bitor_z3, _bitxor_z3, _byte_at_z3,
-    RUINT_MG10_D, PLONKY3_P, PLONKY3_R_INV,
+    RUINT_MG10_D, PLONKY3_P, PLONKY3_R_INV, GOLDILOCKS_P,
 )
 
 TOKEN = re.compile(r'\s+|//[^\n]*|/\*|"(?:\\.|[^"\\])*"|0x[0-9A-Fa-f_]+(?:u32|u64|u128)?|[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9_]*(?:u32|u64|u128)?|::|->|=>|<<|>>|<=|>=|==|!=|&&|\|\||[^\s]')
@@ -497,6 +497,12 @@ class Interpreter:
     def _record_stage_cex(self, cond, vdict, fallback_res):
         if self.stage_counterexample is not None:
             return
+        if 'amount' in vdict and 'fee' in vdict:
+            gl_res = (vdict['amount'] + vdict['fee'] * (1 << 64)) % GOLDILOCKS_P
+            rb = query(z3.And(cond, vdict['amount'] <= (1 << 62), gl_res <= (1 << 62)), vdict)
+            if rb['status'] == 'fail':
+                self.stage_counterexample = rb['counterexample']
+                return
         if 'amount' in vdict:
             rb = query(z3.And(cond, vdict['amount'] <= (1 << 62)), vdict)
             if rb['status'] == 'fail':
@@ -529,6 +535,21 @@ class Interpreter:
                 nd['gross_fee'] = Value('u64', t_gross)
                 nd['rebate'] = Value('u64', t_reb)
                 nd['net_fee'] = Value('u64', t_net)
+                return [(g, Value(rval.ty, nd))]
+            self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
+        elif short == 'quote_flash_lp_retention' and rval.ty[1] == 'PoolReserveQuote':
+            t_flash = (a_var + f_var + 4999) / 5000
+            t_cut = t_flash / 4
+            t_lp = t_flash - t_cut
+            cond = z3.Or(
+                rval.data['treasury_cut'].data != t_cut,
+                rval.data['lp_retention'].data != t_lp,
+            )
+            res = query(cond, {'amount': a_var, 'fee': f_var})
+            if res['status'] == 'pass':
+                nd = dict(rval.data)
+                nd['treasury_cut'] = Value('u64', t_cut)
+                nd['lp_retention'] = Value('u64', t_lp)
                 return [(g, Value(rval.ty, nd))]
             self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
         elif short == 'quote_blob_gas_slots' and rval.ty[1] == 'BlobSlotQuote':
@@ -582,6 +603,19 @@ class Interpreter:
                 nd = dict(rval.data)
                 nd['packed_transcript'] = Value('u64', t_pack)
                 nd['prover_levy'] = Value('u64', t_levy)
+                return [(g, Value(rval.ty, nd))]
+            self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
+        elif short == 'quote_bridge_verifier_fee' and rval.ty[1] == 'GoldilocksQuote':
+            t_res = (a_var + f_var * (1 << 64)) % GOLDILOCKS_P
+            cond = z3.Or(
+                rval.data['canonical_residue'].data != t_res,
+                rval.data['bridge_fee'].data != t_res,
+            )
+            res = query(cond, {'amount': a_var, 'fee': f_var})
+            if res['status'] == 'pass':
+                nd = dict(rval.data)
+                nd['canonical_residue'] = Value('u64', t_res)
+                nd['bridge_fee'] = Value('u64', t_res)
                 return [(g, Value(rval.ty, nd))]
             self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
         return out

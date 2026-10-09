@@ -17,7 +17,7 @@ def reduceGoldilocksStep1 (xLo xHi : UInt64) : UInt64 × Bool :=
 def reduceGoldilocks128 (xLo xHi : UInt64) : UInt64 :=
   let xHiLo : UInt64 := xHi &&& goldilocksEps
   let (t0, borrow) := reduceGoldilocksStep1 xLo xHi
-  let t1 : UInt64 := if borrow then t0 - goldilocksEps else t0
+  let t1 : UInt64 := if borrow then t0 + goldilocksP else t0
   let prod : UInt64 := xHiLo * goldilocksEps
   let t2 : UInt64 := t1 + prod
   let carry : Bool := decide (t2 < t1)
@@ -53,7 +53,7 @@ def foldGoldilocksChallenge (commitment challengeU32 : UInt64) : UInt64 :=
 def quoteBridgeVerifierFee (amount fee : UInt64) : GoldilocksQuote :=
   let (foldedLow, _) := reduceGoldilocksStep1 amount fee
   let canonicalResidue : UInt64 := reduceGoldilocks128 amount fee
-  let bridgeFee : UInt64 := (amount >>> 32) + (canonicalResidue &&& low32Mask)
+  let bridgeFee : UInt64 := canonicalResidue
   {
     foldedLow := foldedLow
     canonicalResidue := canonicalResidue

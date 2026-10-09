@@ -46,7 +46,7 @@ export LeanModel.FeeSchedule (
 )
 export LeanModel.LiquidityPool (
   PoolReserveQuote FlashLoanReceipt splitPoolReserve quoteLpRetention
-  assessFlashFeeCeil assessFlashFeeFloor quoteFlashRepayment
+  assessFlashFeeCeil quoteFlashLpRetention assessFlashFeeFloor quoteFlashRepayment
   checkPoolReserveSolvency
 )
 export LeanModel.TranscriptCodec (

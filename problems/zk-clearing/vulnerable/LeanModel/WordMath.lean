@@ -59,7 +59,7 @@ def ceilDivBpsU64 (sum : WordSum) : UInt64 :=
   else
     let biased := sum.lowWord + bpsMaxRem
     if biased < sum.lowWord then
-      (sum.lowWord / bpsDenom) + ((biased + u64ModBpsRem) / bpsDenom)
+      (sum.lowWord / bpsDenom) + (((sum.lowWord % bpsDenom) + bpsMaxRem) / bpsDenom)
     else
       biased / bpsDenom
 
@@ -77,7 +77,7 @@ def ceilDivFlashU64 (sum : WordSum) : UInt64 :=
   else
     let biased := sum.lowWord + flashMaxRem
     if biased < sum.lowWord then
-      (sum.lowWord / flashDenom) + (((sum.lowWord % flashDenom) + flashMaxRem) / flashDenom)
+      (sum.lowWord / flashDenom) + ((biased + u64ModFlashRem) / flashDenom)
     else
       biased / flashDenom
 

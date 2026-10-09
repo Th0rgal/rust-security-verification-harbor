@@ -713,41 +713,214 @@ by
     have ⟨hx_eq, hx_lt⟩ := h_pack amount fee
     dsimp only [quoteProverTranscriptLevy]
     rw [h_red (packTranscript amount fee) hx_lt, hx_eq]
-  -- Cross-module pipeline composition: totalSurcharge and ticket conservation
+  -- Stage 5: Flash-settlement LP reserve retention (WordMath + LiquidityPool)
+  have h_flash_eq : ∀ (amount fee : UInt64),
+      (quoteFlashLpRetention amount fee).lpRetention.toNat =
+        (amount.toNat + fee.toNat + 4999) / 5000 - (amount.toNat + fee.toNat + 4999) / 5000 / 4 := by
+    clear hbps hmaxrem hq64 hr64 hreb hmax h_net_eq h_blob_eq h_swar_eq h_monty_eq
+    have hfl : flashDenom.toNat = 5000 := rfl
+    have hflmax : flashMaxRem.toNat = 4999 := rfl
+    have hflq64 : u64ModFlashQuot.toNat = 3689348814741910 := rfl
+    have hflr64 : u64ModFlashRem.toNat = 1616 := rfl
+    have htr : treasuryCutDivisor.toNat = 4 := rfl
+    intro amount fee
+    have ha := amount.toNat_lt_size
+    have hf := fee.toNat_lt_size
+    have h_levy :
+        (assessFlashFeeCeil amount fee).toNat =
+        (amount.toNat + fee.toNat + 4999) / 5000 := by
+      dsimp only [assessFlashFeeCeil, ceilDivFlashU64, addU64WithCarry]
+      simp only [decide_eq_true_eq]
+      split
+      · next hwrap =>
+        rw [UInt64.lt_iff_toNat_lt, UInt64.toNat_add] at hwrap
+        simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hfl, hflmax, hflq64, hflr64]
+        omega
+      · next hnowrap =>
+        rw [UInt64.lt_iff_toNat_lt, UInt64.toNat_add] at hnowrap
+        split
+        · next hbias =>
+          rw [UInt64.lt_iff_toNat_lt] at hbias
+          simp only [UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, hfl, hflmax] at hbias ⊢
+          omega
+        · next hnobias =>
+          rw [UInt64.lt_iff_toNat_lt] at hnobias
+          simp only [UInt64.toNat_add, UInt64.toNat_div, hfl, hflmax] at hnobias ⊢
+          omega
+    dsimp only [quoteFlashLpRetention]
+    generalize assessFlashFeeCeil amount fee = L at h_levy ⊢
+    have h_cut_le : L / treasuryCutDivisor ≤ L := by
+      rw [UInt64.le_iff_toNat_le, UInt64.toNat_div, htr]
+      omega
+    rw [UInt64.toNat_sub_of_le _ _ h_cut_le, UInt64.toNat_div, htr, h_levy]
+  -- Stage 6: Sequencer transcript domain tag decoding (TranscriptCodec)
+  have h_dom_eq : ∀ (fee : UInt64),
+      (decodeDomainTag fee).toNat = (if fee.toNat % 256 = 0 then 90 else fee.toNat % 256) ∧
+      (decodeDomainTag fee).toNat ≤ 255 := by
+    clear hbps hmaxrem hq64 hr64 hreb hmax hsize h_net_eq h_blob_eq h_swar_eq h_monty_eq h_flash_eq
+    have hseq : sequencerDomainTag.toNat = 90 := rfl
+    have h_and8 : ∀ (n : UInt64), (n &&& codecTagMask).toNat = n.toNat % 256 := by
+      intro n
+      simp only [UInt64.toNat_and]
+      exact Nat.and_two_pow_sub_one_eq_mod n.toNat 8
+    intro fee
+    dsimp only [decodeDomainTag]
+    have hr := h_and8 fee
+    by_cases h0 : fee &&& codecTagMask = 0
+    · have h0_nat : fee.toNat % 256 = 0 := by
+        have h := congrArg UInt64.toNat h0
+        rwa [hr] at h
+      rw [if_pos h0, if_pos h0_nat, hseq]
+      omega
+    · have h0_nat : ¬ (fee.toNat % 256 = 0) := by
+        intro h_eq
+        apply h0
+        have h_toNat : (fee &&& codecTagMask).toNat = 0 := by omega
+        exact UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h_toNat)
+      rw [if_neg h0, if_neg h0_nat, hr]
+      omega
+  -- Stage 7: Goldilocks 128-bit prime field reduction (GoldilocksField)
+  have h_gl_eq : ∀ (amount fee : UInt64),
+      (quoteBridgeVerifierFee amount fee).bridgeFee.toNat =
+        (amount.toNat + 18446744073709551616 * fee.toNat) % 18446744069414584321 := by
+    clear hbps hmaxrem hq64 hr64 hreb hmax hsize h_net_eq h_blob_eq h_swar_eq h_monty_eq h_flash_eq h_dom_eq
+    have hmod : goldilocksP.toNat = 18446744069414584321 := rfl
+    have heps : goldilocksEps.toNat = 4294967295 := rfl
+    have hpow : (2 : Nat) ^ 64 = 18446744073709551616 := rfl
+    have h_shr32 : ∀ (n : UInt64), (n >>> 32).toNat = n.toNat / 4294967296 := by
+      intro n
+      simp only [UInt64.toNat_shiftRight, Nat.shiftRight_eq_div_pow]
+      rfl
+    have h_and32 : ∀ (n : UInt64), (n &&& goldilocksEps).toNat = n.toNat % 4294967296 := by
+      intro n
+      simp only [UInt64.toNat_and]
+      exact Nat.and_two_pow_sub_one_eq_mod n.toNat 32
+    let foldHigh (low high : UInt64) : UInt64 :=
+      if decide (low < high) then (low - high) + goldilocksP else low - high
+    let foldMid (low2 mid : UInt64) : UInt64 :=
+      let prod : UInt64 := mid * goldilocksEps
+      let t2 : UInt64 := low2 + prod
+      if decide (t2 < low2) then t2 + goldilocksEps else t2
+    let canonGl (t3 : UInt64) : UInt64 :=
+      if goldilocksP ≤ t3 then t3 - goldilocksP else t3
+    have h_high : ∀ (low high : UInt64),
+        high.toNat < 4294967296 →
+        ((foldHigh low high).toNat + high.toNat = 18446744069414584321 + low.toNat ∨
+         (foldHigh low high).toNat + high.toNat = low.toNat) := by
+      intro low high hhi
+      have hlo : low.toNat < 18446744073709551616 := low.toNat_lt_size
+      dsimp only [foldHigh]
+      simp only [decide_eq_true_eq]
+      split
+      · next hlt =>
+        left
+        rw [UInt64.lt_iff_toNat_lt] at hlt
+        simp only [UInt64.toNat_add, UInt64.toNat_sub, hmod, hpow]
+        omega
+      · next hlt =>
+        right
+        rw [UInt64.lt_iff_toNat_lt] at hlt
+        have hle : high ≤ low := by rw [UInt64.le_iff_toNat_le]; omega
+        rw [UInt64.toNat_sub_of_le _ _ hle]
+        omega
+    have h_mid : ∀ (low2 mid : UInt64),
+        mid.toNat < 4294967296 →
+        ((foldMid low2 mid).toNat = low2.toNat + 4294967295 * mid.toNat ∨
+         (foldMid low2 mid).toNat + 18446744069414584321 = low2.toNat + 4294967295 * mid.toNat) := by
+      intro low2 mid hmid
+      have hlo2 : low2.toNat < 18446744073709551616 := low2.toNat_lt_size
+      dsimp only [foldMid]
+      simp only [decide_eq_true_eq]
+      have hprod : (mid * goldilocksEps).toNat = 4294967295 * mid.toNat := by
+        simp only [UInt64.toNat_mul, heps, hpow]
+        omega
+      split
+      · next hlt =>
+        right
+        rw [UInt64.lt_iff_toNat_lt, UInt64.toNat_add, hprod, hpow] at hlt
+        simp only [UInt64.toNat_add, hprod, heps, hpow]
+        omega
+      · next hlt =>
+        left
+        rw [UInt64.lt_iff_toNat_lt, UInt64.toNat_add, hprod, hpow] at hlt
+        simp only [UInt64.toNat_add, hprod, hpow]
+        omega
+    have h_canon : ∀ (folded : UInt64),
+        (canonGl folded).toNat < 18446744069414584321 ∧
+        ((canonGl folded).toNat = folded.toNat ∨
+         (canonGl folded).toNat + 18446744069414584321 = folded.toNat) := by
+      intro folded
+      have hf : folded.toNat < 18446744073709551616 := folded.toNat_lt_size
+      dsimp only [canonGl]
+      split
+      · next hle =>
+        rw [UInt64.toNat_sub_of_le _ _ hle, hmod]
+        rw [UInt64.le_iff_toNat_le, hmod] at hle
+        omega
+      · next hle =>
+        rw [UInt64.le_iff_toNat_le, hmod] at hle
+        omega
+    intro amount fee
+    have ha : amount.toNat < 18446744073709551616 := amount.toNat_lt_size
+    have hf : fee.toNat < 18446744073709551616 := fee.toNat_lt_size
+    change (canonGl (foldMid (foldHigh amount (fee >>> 32)) (fee &&& goldilocksEps))).toNat =
+      (amount.toNat + 18446744073709551616 * fee.toNat) % 18446744069414584321
+    have hhi_lt : (fee >>> 32).toNat < 4294967296 := by rw [h_shr32]; omega
+    have hmid_lt : (fee &&& goldilocksEps).toNat < 4294967296 := by rw [h_and32]; omega
+    have hh := h_high amount (fee >>> 32) hhi_lt
+    rw [h_shr32] at hh
+    generalize foldHigh amount (fee >>> 32) = low2 at hh ⊢
+    have hlo2_lt : low2.toNat < 18446744073709551616 := low2.toNat_lt_size
+    have hm := h_mid low2 (fee &&& goldilocksEps) hmid_lt
+    rw [h_and32] at hm
+    generalize foldMid low2 (fee &&& goldilocksEps) = folded at hm ⊢
+    have hfold_lt : folded.toNat < 18446744073709551616 := folded.toNat_lt_size
+    have ⟨hc_lt, hc_eq⟩ := h_canon folded
+    generalize canonGl folded = res at hc_lt hc_eq ⊢
+    rcases hh with hh | hh <;> rcases hm with hm | hm <;> rcases hc_eq with hc_eq | hc_eq <;> omega
+  -- Cross-module pipeline composition: baseSurcharge + bridgeSurcharge and ticket conservation
   have h_surcharge_eq : ∀ (amount fee : UInt64),
-      amount.toNat + (computeClearingBreakdown amount fee).totalSurcharge.toNat =
-        zkClearingDebit amount fee := by
+      amount.toNat +
+        (computeClearingBreakdown amount fee).baseSurcharge.toNat +
+        (computeClearingBreakdown amount fee).bridgeSurcharge.toNat =
+          zkClearingDebit amount fee := by
     intro amount fee
     have ha := amount.toNat_lt_size
     have hf := fee.toNat_lt_size
     have h1 := h_net_eq amount fee
-    have h2 := h_blob_eq amount fee
-    have ⟨h3, h3_le⟩ := h_swar_eq fee
-    have h4 := h_monty_eq amount fee
-    clear h_net_eq h_blob_eq h_swar_eq h_monty_eq
+    have h2 := h_flash_eq amount fee
+    have h3 := h_blob_eq amount fee
+    have ⟨h4, h4_le⟩ := h_swar_eq fee
+    have h5 := h_monty_eq amount fee
+    have ⟨h6, h6_le⟩ := h_dom_eq fee
+    have h7 := h_gl_eq amount fee
+    clear h_net_eq h_flash_eq h_blob_eq h_swar_eq h_monty_eq h_dom_eq h_gl_eq
     dsimp only [computeClearingBreakdown]
     generalize (evaluateSettlementFee (addU64WithCarry amount fee)).netFee = S1 at h1 ⊢
-    generalize (quoteBlobGasSlots amount fee).slotQuotient = S2 at h2 ⊢
-    generalize (quoteCalldataLaneSurcharge fee).surcharge = S3 at h3 h3_le ⊢
-    generalize (quoteProverTranscriptLevy amount fee).proverLevy = S4 at h4 ⊢
-    have h_sum4 : (S1 + S2 + S3 + S4).toNat = S1.toNat + S2.toNat + S3.toNat + S4.toNat := by
+    generalize (quoteFlashLpRetention amount fee).lpRetention = S2 at h2 ⊢
+    generalize (quoteBlobGasSlots amount fee).slotQuotient = S3 at h3 ⊢
+    generalize (quoteCalldataLaneSurcharge fee).surcharge = S4 at h4 h4_le ⊢
+    generalize (quoteProverTranscriptLevy amount fee).proverLevy = S5 at h5 ⊢
+    generalize decodeDomainTag fee = S6 at h6 h6_le ⊢
+    generalize (quoteBridgeVerifierFee amount fee).bridgeFee = S7 at h7 ⊢
+    have h_sum6 : (S1 + S2 + S3 + S4 + S5 + S6).toNat =
+        S1.toNat + S2.toNat + S3.toNat + S4.toNat + S5.toNat + S6.toNat := by
       have h1_le : S1.toNat ≤ 3689348814741911 := by
-        clear h2 h3 h3_le h4
-        omega
-      have h2_le : S2.toNat ≤ 65535 := by
-        clear h1 h3 h3_le h4 h1_le
-        omega
-      have h4_le : S4.toNat ≤ 2013265920 := by
-        clear h1 h2 h3 h3_le h1_le h2_le
-        omega
-      clear h1 h2 h3 h4
+        clear h2 h3 h4 h4_le h5 h6 h6_le h7; omega
+      have h2_le : S2.toNat ≤ 7378697629483821 := by
+        clear h1 h3 h4 h4_le h5 h6 h6_le h7 h1_le; omega
+      have h3_le : S3.toNat ≤ 65535 := by
+        clear h1 h2 h4 h4_le h5 h6 h6_le h7 h1_le h2_le; omega
+      have h5_le : S5.toNat ≤ 2013265920 := by
+        clear h1 h2 h3 h4 h4_le h6 h6_le h7 h1_le h2_le h3_le; omega
+      clear h1 h2 h3 h4 h5 h6 h7
       simp only [UInt64.toNat_add]
       omega
-    have h_assoc : amount.toNat + (S1.toNat + S2.toNat + S3.toNat + S4.toNat) =
-        amount.toNat + S1.toNat + S2.toNat + S3.toNat + S4.toNat := by
-      clear h1 h2 h3 h3_le h4 h_sum4
+    have h_assoc : amount.toNat + (S1.toNat + S2.toNat + S3.toNat + S4.toNat + S5.toNat + S6.toNat) + S7.toNat =
+        amount.toNat + S1.toNat + S2.toNat + S3.toNat + S4.toNat + S5.toNat + S6.toNat + S7.toNat := by
+      clear h1 h2 h3 h4 h4_le h5 h6 h6_le h7 h_sum6
       omega
-    rw [h_sum4, h_assoc, h1, h2, h3, h4]
+    rw [h_sum6, h_assoc, h1, h2, h3, h4, h5, h6, h7]
     rfl
   have h_sub_max : ∀ (a : UInt64), (u64Max - a).toNat = 18446744073709551615 - a.toNat := by
     intro a
@@ -757,7 +930,7 @@ by
       clear h_surcharge_eq
       omega
     rw [UInt64.toNat_sub_of_le _ _ h_le, hmax]
-  clear h_net_eq h_blob_eq h_swar_eq h_monty_eq
+  clear h_net_eq h_flash_eq h_blob_eq h_swar_eq h_monty_eq h_dom_eq h_gl_eq
   constructor
   · intro balance amount fee
     change (∃ total, challengeAuthorize balance amount fee = some total) ↔ zkClearingDebit amount fee ≤ balance.toNat
@@ -766,41 +939,62 @@ by
     have hs := h_surcharge_eq amount fee
     dsimp only [challengeAuthorize, authorizeBreakdown]
     clear hbps hmaxrem hq64 hr64 hreb hmax hsize h_surcharge_eq
-    generalize (computeClearingBreakdown amount fee).totalSurcharge = S at hs ⊢
+    generalize (computeClearingBreakdown amount fee).baseSurcharge = B_base at hs ⊢
+    generalize (computeClearingBreakdown amount fee).bridgeSurcharge = B_gl at hs ⊢
     generalize zkClearingDebit amount fee = D at hs ⊢
-    have hS : S.toNat < 18446744073709551616 := S.toNat_lt_size
-    by_cases hfit : S ≤ u64Max - amount
-    · rw [if_pos hfit]
-      have hfit_nat : S.toNat ≤ 18446744073709551615 - amount.toNat := by
-        have h := UInt64.le_iff_toNat_le.mp hfit
+    have hB_base : B_base.toNat < 18446744073709551616 := B_base.toNat_lt_size
+    have hB_gl : B_gl.toNat < 18446744073709551616 := B_gl.toNat_lt_size
+    by_cases hfit1 : B_gl ≤ u64Max - B_base
+    · rw [if_pos hfit1]
+      have hfit1_nat : B_gl.toNat ≤ 18446744073709551615 - B_base.toNat := by
+        have h := UInt64.le_iff_toNat_le.mp hfit1
         rwa [h_sub_max] at h
-      by_cases hbal : amount + S ≤ balance
-      · rw [if_pos hbal]
-        constructor
-        · intro _
-          have hbal_nat : (amount + S).toNat ≤ balance.toNat := UInt64.le_iff_toNat_le.mp hbal
-          rw [UInt64.toNat_add] at hbal_nat
-          clear h_sub_max hfit hbal
-          omega
-        · intro _
-          exact ⟨amount + S, rfl⟩
-      · rw [if_neg hbal]
+      have h_tot_sur : (B_base + B_gl).toNat = B_base.toNat + B_gl.toNat := by
+        rw [UInt64.toNat_add]
+        clear h_sub_max hfit1
+        omega
+      by_cases hfit2 : B_base + B_gl ≤ u64Max - amount
+      · rw [if_pos hfit2]
+        have hfit2_nat : (B_base + B_gl).toNat ≤ 18446744073709551615 - amount.toNat := by
+          have h := UInt64.le_iff_toNat_le.mp hfit2
+          rwa [h_sub_max] at h
+        by_cases hbal : amount + (B_base + B_gl) ≤ balance
+        · rw [if_pos hbal]
+          constructor
+          · intro _
+            have hbal_nat : (amount + (B_base + B_gl)).toNat ≤ balance.toNat := UInt64.le_iff_toNat_le.mp hbal
+            rw [UInt64.toNat_add, h_tot_sur] at hbal_nat
+            clear h_sub_max hfit1 hfit2 hbal
+            omega
+          · intro _
+            exact ⟨amount + (B_base + B_gl), rfl⟩
+        · rw [if_neg hbal]
+          constructor
+          · rintro ⟨_, hcall⟩
+            cases hcall
+          · intro h_le_d
+            exfalso
+            apply hbal
+            rw [UInt64.le_iff_toNat_le, UInt64.toNat_add, h_tot_sur]
+            clear h_sub_max hfit1 hfit2
+            omega
+      · rw [if_neg hfit2]
         constructor
         · rintro ⟨_, hcall⟩
           cases hcall
         · intro h_le_d
           exfalso
-          apply hbal
-          rw [UInt64.le_iff_toNat_le, UInt64.toNat_add]
-          clear h_sub_max hfit
+          apply hfit2
+          rw [UInt64.le_iff_toNat_le, h_sub_max, h_tot_sur]
+          clear h_sub_max hfit1
           omega
-    · rw [if_neg hfit]
+    · rw [if_neg hfit1]
       constructor
       · rintro ⟨_, hcall⟩
         cases hcall
       · intro h_le_d
         exfalso
-        apply hfit
+        apply hfit1
         rw [UInt64.le_iff_toNat_le, h_sub_max]
         clear h_sub_max
         omega
@@ -810,22 +1004,35 @@ by
     have hs := h_surcharge_eq amount fee
     dsimp only [challengeAuthorize, authorizeBreakdown] at hcall
     clear hbps hmaxrem hq64 hr64 hreb hmax hsize h_surcharge_eq
-    generalize (computeClearingBreakdown amount fee).totalSurcharge = S at hs hcall
+    generalize (computeClearingBreakdown amount fee).baseSurcharge = B_base at hs hcall
+    generalize (computeClearingBreakdown amount fee).bridgeSurcharge = B_gl at hs hcall
     generalize zkClearingDebit amount fee = D at hs ⊢
-    have hS : S.toNat < 18446744073709551616 := S.toNat_lt_size
-    by_cases hfit : S ≤ u64Max - amount
-    · rw [if_pos hfit] at hcall
-      have hfit_nat : S.toNat ≤ 18446744073709551615 - amount.toNat := by
-        have h := UInt64.le_iff_toNat_le.mp hfit
+    have hB_base : B_base.toNat < 18446744073709551616 := B_base.toNat_lt_size
+    have hB_gl : B_gl.toNat < 18446744073709551616 := B_gl.toNat_lt_size
+    by_cases hfit1 : B_gl ≤ u64Max - B_base
+    · rw [if_pos hfit1] at hcall
+      have hfit1_nat : B_gl.toNat ≤ 18446744073709551615 - B_base.toNat := by
+        have h := UInt64.le_iff_toNat_le.mp hfit1
         rwa [h_sub_max] at h
-      by_cases hbal : amount + S ≤ balance
-      · rw [if_pos hbal] at hcall
-        injection hcall with htot
-        subst htot
+      have h_tot_sur : (B_base + B_gl).toNat = B_base.toNat + B_gl.toNat := by
         rw [UInt64.toNat_add]
-        clear h_sub_max hfit hbal
+        clear h_sub_max hfit1
         omega
-      · rw [if_neg hbal] at hcall
+      by_cases hfit2 : B_base + B_gl ≤ u64Max - amount
+      · rw [if_pos hfit2] at hcall
+        have hfit2_nat : (B_base + B_gl).toNat ≤ 18446744073709551615 - amount.toNat := by
+          have h := UInt64.le_iff_toNat_le.mp hfit2
+          rwa [h_sub_max] at h
+        by_cases hbal : amount + (B_base + B_gl) ≤ balance
+        · rw [if_pos hbal] at hcall
+          injection hcall with htot
+          subst htot
+          rw [UInt64.toNat_add, h_tot_sur]
+          clear h_sub_max hfit1 hfit2 hbal
+          omega
+        · rw [if_neg hbal] at hcall
+          cases hcall
+      · rw [if_neg hfit2] at hcall
         cases hcall
-    · rw [if_neg hfit] at hcall
+    · rw [if_neg hfit1] at hcall
       cases hcall

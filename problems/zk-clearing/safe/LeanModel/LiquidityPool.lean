@@ -33,6 +33,15 @@ def assessFlashFeeCeil (principal surcharge : UInt64) : UInt64 :=
   let sum := addU64WithCarry principal surcharge
   ceilDivFlashU64 sum
 
+def quoteFlashLpRetention (principal surcharge : UInt64) : PoolReserveQuote :=
+  let flashLevy : UInt64 := assessFlashFeeCeil principal surcharge
+  let treasuryCut : UInt64 := flashLevy / treasuryCutDivisor
+  let lpRetention : UInt64 := flashLevy - treasuryCut
+  {
+    treasuryCut := treasuryCut
+    lpRetention := lpRetention
+  }
+
 def assessFlashFeeFloor (principal surcharge : UInt64) : UInt64 :=
   let sum := addU64WithCarry principal surcharge
   floorDivFlashU64 sum
