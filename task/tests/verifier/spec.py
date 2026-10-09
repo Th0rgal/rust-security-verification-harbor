@@ -482,6 +482,7 @@ def purify_divmod(expr):
             and lo // c_val == 0
             and hi // c_val == 1
             and c_val in (1 << 64, GOLDILOCKS_P)
+            and (not z3.is_app(a_s) or a_s.num_args() <= 4)
             and not _mentions_int_const(a_s, SUCCINCT_L8)
             and not _mentions_int_const(a_s, SUCCINCT_L16)
         ):

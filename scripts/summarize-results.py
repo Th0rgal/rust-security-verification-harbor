@@ -47,7 +47,7 @@ def estimate_10t_reward(slug: str, task: str, total_turns: int, final_reward: fl
             ks = tc.get("arguments", {}).get("keystrokes", "")
             if "/workspace/submission/Spec.lean" in ks or ("cd /workspace/submission" in ks and "Spec.lean" in ks):
                 wrote_submission_spec = True
-    return 0.25 if wrote_submission_spec else 0.00
+    return min(final_reward, 0.25) if wrote_submission_spec else 0.00
 
 
 def load_trial(slug: str, task: str) -> dict:

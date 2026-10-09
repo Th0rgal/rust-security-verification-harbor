@@ -21,17 +21,23 @@ Instead of giving the model a pre-written theorem statement or pointing to a spe
 ## Flagship Benchmark (`zk-clearing`) & Results
 
 By default (`python3 scripts/make-family.py /tmp/security-family`), the benchmark generates the flagship symmetric pair (**2 Harbor tasks: `zk-clearing-vulnerable` and `zk-clearing-safe`**) from **[`problems/zk-clearing`](problems/zk-clearing)**:
-- **Codebase Scale:** `1,528` lines of pure-`u64` Rust across `11` modules in `src/` (`constants.rs`, `word_math.rs`, `reciprocal_div.rs`, `broadword_swar.rs`, `montgomery_field.rs`, `goldilocks_field.rs`, `fee_schedule.rs`, `liquidity_pool.rs`, `transcript_codec.rs`, `clearing_pipeline.rs`, `lib.rs`) with `37` unit tests, paired with `10` Lean 4.31 modules in `LeanModel/` (`633` LOC) and `SecurityChallenge.lean`.
-- **Coupled Multi-Module Architecture:** Every clearing transaction sums principal `amount` with four distinct 64-bit arithmetic surcharges (basis-point ceiling fee with 10% floor rebate via `word_math` + `fee_schedule`, Möller-Granlund 2-by-1 reciprocal division slot quotient via `reciprocal_div`, Vigna SWAR broadword byte-lane surcharge via `broadword_swar`, and Plonky3 BabyBear Montgomery reduction levy via `montgomery_field`) surrounded by realistic sibling modules (`goldilocks_field`, `liquidity_pool`, `transcript_codec`).
-- **Hidden Vulnerability in `.vulnerable`:** Inside `word_math::ceil_div_bps_u64`, the non-carry `biased < sum.low_word` wrap branch (`2^64 - 9999 <= amount + fee <= 2^64 - 1`) folds `biased + U64_MOD_BPS_REM` instead of `(sum.low_word % BPS_DENOM) + BPS_MAX_REM`, under-computing the gross basis-point fee by `1` across an interior carry pocket while remaining exact at `0`, ordinary values, and `u64::MAX`.
+- **Codebase Scale:** `1,540` lines of pure-`u64` Rust across `11` modules in `src/` (`constants.rs`, `word_math.rs`, `reciprocal_div.rs`, `broadword_swar.rs`, `montgomery_field.rs`, `goldilocks_field.rs`, `fee_schedule.rs`, `liquidity_pool.rs`, `transcript_codec.rs`, `clearing_pipeline.rs`, `lib.rs`) with `37` unit tests, paired with `10` Lean 4.31 modules in `LeanModel/` (`676` LOC) and `SecurityChallenge.lean` (`1,046` LOC in `Proof.lean`).
+- **6-Stage All-10-Module Coupled Architecture:** Every clearing transaction couples all 10 domain modules into `total_debit = amount + base_surcharge + bridge_surcharge` without a top-level formula cheat-sheet:
+  1. Basis-point ceiling fee with 10% floor tier rebate (`word_math` + `fee_schedule`)
+  2. Flash-settlement LP reserve retention with 25% floor treasury cut (`word_math` + `liquidity_pool`)
+  3. Möller-Granlund 2-by-1 reciprocal division blob slot quotient (`reciprocal_div`)
+  4. Vigna SWAR broadword byte-lane surcharge (`broadword_swar`)
+  5. Plonky3 BabyBear Montgomery reduction prover levy (`montgomery_field`)
+  6. Sequencer transcript domain tag surcharge (`transcript_codec`) + Goldilocks 128-bit field reduction bridge surcharge (`goldilocks_field`)
+- **Hidden Vulnerability & Cross-Module Counterexample Coupling in `.vulnerable`:** While `word_math::ceil_div_bps_u64` (`10_000`) is completely sound (acting as a realistic decoy), `word_math::ceil_div_flash_u64` (`5_000`) folds `biased + U64_MOD_FLASH_REM` in its non-carry `biased < sum.low_word` wrap branch (`2^64 - 4999 <= amount + fee <= 2^64 - 1617`), under-computing the flash LP surcharge across a 3,383-wide interior pocket. Because `bridge_surcharge = (amount + fee * 2^64) mod P_GL` exceeds `2^64 - 7e12` for small `amount` in that pocket, naive `amount = 0` boundary probes always overflow `u64::MAX`; constructing a valid counterexample requires simultaneously satisfying the `WordMath` pocket and keeping the 128-bit `GoldilocksField` residue small (e.g. `fee = GOLDILOCKS_P`).
 
 We evaluate frontier models in Harbor 0.9.0 (`terminus-2`, `reasoning_effort=high`) under a **10-turn budget (`max_turns=10`)** and an **extended 25-turn budget (`max_turns=25`)**:
 
 | Flagship Benchmark (`zk-clearing`, 2 Tasks) | Claude Opus 5.5 (`high`) @ **10T** | Claude Opus 5.5 (`high`) @ **25T** | GPT 6.1 Sol (`high`) @ **10T** | GPT 6.1 Sol (`high`) @ **25T** | Reference Oracle |
 |---|---:|---:|---:|---:|---:|
-| **`zk-clearing-vulnerable`** | **0.000** | **0.000** | **0.000** | **0.250** | **1.000** |
-| **`zk-clearing-safe`** | **0.000** | **0.000** | **0.000** | **0.250** | **1.000** |
-| **Overall Mean (`2` tasks)** | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **0.250** (`0.50 / 2`) | **1.000** (`2.00 / 2`) |
+| **`zk-clearing-vulnerable`** | **0.000** | **0.000** | **0.000** | **0.000** | **1.000** |
+| **`zk-clearing-safe`** | **0.000** | **0.000** | **0.000** | **0.000** | **1.000** |
+| **Overall Mean (`2` tasks)** | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **1.000** (`2.00 / 2`) |
 
 *(Passing `--problem all` to `scripts/make-family.py` or `--all` to `scripts/summarize-results.py` also includes the 9 single-kernel calibration pairs: `ruint`, `succinct`, `plonky3`, `settlement-engine`, `whirlpool`, `goldilocks`, `settlement-modular`, `settlement`, and `openpql`.)*
 

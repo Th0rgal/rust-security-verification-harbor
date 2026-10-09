@@ -64,8 +64,8 @@ def run(cmd, cwd, timeout=120, *, env=None, sandbox=False, read_paths=()):
             except ProcessLookupError: pass
         stdout.seek(0); stderr.seek(0)
         return subprocess.CompletedProcess(cmd, proc.returncode,
-                                           stdout.read(65536).decode(errors='replace'),
-                                           stderr.read(65536).decode(errors='replace'))
+                                           stdout.read(4 * 1024 * 1024).decode(errors='replace'),
+                                           stderr.read(4 * 1024 * 1024).decode(errors='replace'))
 
 
 DRIVER = '''extern crate submitted;
