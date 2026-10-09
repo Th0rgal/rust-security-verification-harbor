@@ -148,10 +148,12 @@ def main():
         r=verify.capture(lambda:verify.check_counterexample(bad,VERIFIER)); expect(r['status']=='fail',r)
     print('Witness: pristine actual Rust and malformed/ordinary inputs passed')
 
+    base_session=verify.LeanSession(VERIFIER)
+    base_session.stage('CandidateSpec',reference,'spec')
+    base_session.stage('CandidateAudit',(TASK/'solution/Audit.lean').read_text(),'verdict')
     def proof_result(term):
         session=verify.LeanSession(VERIFIER)
-        session.stage('CandidateSpec',reference,'spec')
-        session.stage('CandidateAudit',(TASK/'solution/Audit.lean').read_text(),'verdict')
+        session.frozen=dict(base_session.frozen)
         return verify.capture(lambda:session.stage('CandidateProof',term,'proof'))
     proof=(TASK/'solution/Proof.lean').read_text()
     expect(proof_result(proof)['status']=='pass','non-omega proof')
@@ -180,7 +182,10 @@ def main():
         # trusted APIs must remain readable through this temporary parent.
         raw.chmod(0o755)
         family=raw/'family'
-        subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem','all','--build-api'],check=True)
+        raw_probs = os.environ.get('SELFTEST_PROBLEMS', 'authorization,settlement,zk-clearing')
+        selftest_problems = spec.PROBLEMS if raw_probs == 'all' else tuple(p.strip() for p in raw_probs.split(',') if p.strip())
+        for prob in selftest_problems:
+            subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem',prob,'--build-api'],check=True)
 
         # Settlement-specific Rust & Lean checks across isolation levels
         settlement_safe_rs=(ROOT/'problems/settlement/safe/lib.rs').read_text()
@@ -228,7 +233,7 @@ def main():
             expect(check(bad_div)['status']=='unsupported',bad_div)
 
         instructions=[]
-        for problem in spec.PROBLEMS:
+        for problem in selftest_problems:
             for variant in ('vulnerable','safe'):
                 task_name=problem+'-'+variant
                 task=family/task_name
@@ -242,6 +247,13 @@ def main():
                     if (task/'solution'/rel).is_file():
                         (workspace/'submission'/rel).parent.mkdir(parents=True,exist_ok=True)
                         shutil.copy(task/'solution'/rel,workspace/'submission'/rel)
+                for dname in ('src', 'LeanModel'):
+                    if (task/'solution'/dname).is_dir():
+                        dest_dir = workspace/'submission'/dname
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        for child in (task/'solution'/dname).iterdir():
+                            if child.is_file():
+                                shutil.copy(child, dest_dir/child.name)
                 reference_result=verify.grade(workspace,verifier)
                 expect(reference_result['reward']==1,(task_name,reference_result))
                 if os.environ.get('V3_EVIDENCE_DIR'):
@@ -281,7 +293,10 @@ def main():
                     (workspace/'submission/Spec.lean').write_text('NOT LEAN')
                     (workspace/'challenge/src/lib.rs').write_text('NOT RUST')
                     r=verify.grade(workspace,verifier)
-                    expect(r['checkpoints']['verdict']['score']==.15 and r['checkpoints']['response']['score']==.35,r)
+                    if problem == 'zk-clearing':
+                        expect(r['checkpoints']['verdict']['score']==0 and r['checkpoints']['response']['score']==0,r)
+                    else:
+                        expect(r['checkpoints']['verdict']['score']==.15 and r['checkpoints']['response']['score']==.35,r)
                     expect(r['checkpoints']['response']['checks']['counterexample']['status']=='pass',r)
                     if problem=='authorization':
                         symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')

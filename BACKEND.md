@@ -20,6 +20,12 @@ mathematical debit defined by the task family (`problem.txt`):
   `S = floor(amount / 2) + min(fee mod 65536, 32767)`.
 - In `ruint` (`alloy-rs/ruint` Möller-Granlund 2-by-1 normalized division, `D = 32771`, `B = 65536`),
   `S = floor(amount / 2) + floor(((fee mod D) * B + (amount mod B)) / D)`.
+- In `zk-clearing` (flagship 11-module ZK-rollup batch clearing engine),
+  `S = amount + net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy`,
+  where `gross_bps = ceil((amount + fee) / 10_000)`, `net_bps_fee = gross_bps - floor(gross_bps / 10)`,
+  `blob_slot_quotient = floor(((fee mod 32771) * 65536 + (amount mod 65536)) / 32771)`,
+  `calldata_surcharge = sum_{i=0..7} b_i(fee) + 256 * |{i in 0..7 | b_i(fee) > 0}|`, and
+  `prover_levy = (((amount mod 2^32) + (fee mod 2013265921) * 2^32) * 943718400) mod 2013265921`.
 
 The hidden business contract accepts iff S <= balance, and returns S on
 acceptance. Because balance is a u64, S <= balance

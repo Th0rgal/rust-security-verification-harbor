@@ -1,10 +1,50 @@
 """Fail-closed Rust subset interpreter. See BACKEND.md for the correspondence claim."""
 from dataclasses import dataclass
+from pathlib import Path
 import re
 import z3
-from spec import MAX, Unsupported, expected_debit_z3, query, _bitand_z3, _bitor_z3, _bitxor_z3
+from spec import (
+    MAX, Unsupported, expected_debit_z3, query,
+    _bitand_z3, _bitor_z3, _bitxor_z3, _byte_at_z3,
+    RUINT_MG10_D, PLONKY3_P, PLONKY3_R_INV,
+)
 
 TOKEN = re.compile(r'\s+|//[^\n]*|/\*|"(?:\\.|[^"\\])*"|0x[0-9A-Fa-f_]+(?:u32|u64|u128)?|[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9_]*(?:u32|u64|u128)?|::|->|=>|<<|>>|<=|>=|==|!=|&&|\|\||[^\s]')
+MOD_DECL = re.compile(r'^(?P<indent>\s*)(?P<vis>pub\s+)?mod\s+(?P<name>[A-Za-z_][A-Za-z_0-9]*)\s*;', re.M)
+
+
+def bundle_crate_source(source_or_path, fallback_dir=None):
+    src_dir = None
+    fb_dir = Path(fallback_dir) if fallback_dir is not None else None
+    if isinstance(source_or_path, Path):
+        if source_or_path.is_dir():
+            src_dir = source_or_path
+            lib_file = src_dir / 'lib.rs'
+            if not lib_file.exists() and fb_dir is not None:
+                lib_file = fb_dir / 'lib.rs'
+            text = lib_file.read_text()
+        else:
+            src_dir = source_or_path.parent
+            text = source_or_path.read_text()
+    else:
+        text = source_or_path
+
+    def _inline_mod(match):
+        indent = match.group('indent')
+        vis = match.group('vis') or ''
+        mname = match.group('name')
+        candidates = []
+        if src_dir is not None:
+            candidates.append(src_dir / f'{mname}.rs')
+        if fb_dir is not None:
+            candidates.append(fb_dir / f'{mname}.rs')
+        for cand in candidates:
+            if cand.is_file() and not cand.is_symlink():
+                mbody = cand.read_text()
+                return f'{indent}{vis}mod {mname} {{\n{mbody}\n{indent}}}'
+        return match.group(0)
+
+    return MOD_DECL.sub(_inline_mod, text)
 
 
 def tokenize(source):
@@ -22,7 +62,7 @@ def tokenize(source):
             if depth: raise ValueError('unterminated comment')
         elif not t.isspace() and not t.startswith('//'):
             out.append(t)
-    if len(out) > 12000: raise Unsupported('Rust token limit exceeded')
+    if len(out) > 40000: raise Unsupported('Rust token limit exceeded')
     return out
 
 
@@ -421,16 +461,133 @@ def pair(a, b):
     return a, b, 2**_int_width(a.ty)
 
 
+def _merge_ite_values(condition, v_true, v_false):
+    if v_true.ty != v_false.ty:
+        return None
+    if v_true.ty in ('u32', 'u64', 'u128', 'bool'):
+        return Value(v_true.ty, z3.If(condition, v_true.data, v_false.data))
+    if isinstance(v_true.ty, tuple) and v_true.ty[0] == 'tuple' and len(v_true.data) == len(v_false.data):
+        items = []
+        for tv, fv in zip(v_true.data, v_false.data):
+            mv = _merge_ite_values(condition, tv, fv)
+            if mv is None:
+                return None
+            items.append(mv)
+        return Value(v_true.ty, items)
+    if isinstance(v_true.ty, tuple) and v_true.ty[0] == 'struct' and set(v_true.data) == set(v_false.data):
+        fields = {}
+        for k in v_true.data:
+            mv = _merge_ite_values(condition, v_true.data[k], v_false.data[k])
+            if mv is None:
+                return None
+            fields[k] = mv
+        return Value(v_true.ty, fields)
+    return None
+
+
 class Interpreter:
-    def __init__(self, structs=None, funcs=None, const_env=None):
+    def __init__(self, structs=None, funcs=None, const_env=None, problem='authorization'):
         self.steps = 0
         self.structs = structs or {}
         self.funcs = funcs or {}
         self.const_env = const_env or {}
         self.call_depth = 0
+        self.problem = problem
+        self.stage_counterexample = None
+    def _record_stage_cex(self, cond, vdict, fallback_res):
+        if self.stage_counterexample is not None:
+            return
+        if 'amount' in vdict:
+            rb = query(z3.And(cond, vdict['amount'] <= (1 << 62)), vdict)
+            if rb['status'] == 'fail':
+                self.stage_counterexample = rb['counterexample']
+                return
+        if fallback_res['status'] == 'fail':
+            cex = dict(fallback_res['counterexample'])
+            cex.setdefault('amount', 0)
+            self.stage_counterexample = cex
+    def _apply_stage_cut(self, fname, out):
+        if self.problem != 'zk-clearing' or len(out) != 1:
+            return out
+        g, rval = out[0]
+        if rval.ty == 'return' or not (isinstance(rval.ty, tuple) and rval.ty[0] == 'struct'):
+            return out
+        short = fname.split('::')[-1]
+        a_var, f_var = z3.Int('amount'), z3.Int('fee')
+        if short == 'evaluate_settlement_fee' and rval.ty[1] == 'FeeQuote':
+            t_gross = (a_var + f_var + 9999) / 10000
+            t_reb = t_gross / 10
+            t_net = t_gross - t_reb
+            cond = z3.Or(
+                rval.data['gross_fee'].data != t_gross,
+                rval.data['rebate'].data != t_reb,
+                rval.data['net_fee'].data != t_net,
+            )
+            res = query(cond, {'amount': a_var, 'fee': f_var})
+            if res['status'] == 'pass':
+                nd = dict(rval.data)
+                nd['gross_fee'] = Value('u64', t_gross)
+                nd['rebate'] = Value('u64', t_reb)
+                nd['net_fee'] = Value('u64', t_net)
+                return [(g, Value(rval.ty, nd))]
+            self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
+        elif short == 'quote_blob_gas_slots' and rval.ty[1] == 'BlobSlotQuote':
+            b16 = 1 << 16
+            u1 = f_var % RUINT_MG10_D
+            u0 = a_var % b16
+            u = u1 * b16 + u0
+            t_q = u / RUINT_MG10_D
+            t_r = u % RUINT_MG10_D
+            cond = z3.Or(
+                rval.data['slot_quotient'].data != t_q,
+                rval.data['slot_remainder'].data != t_r,
+            )
+            res = query(cond, {'amount': a_var, 'fee': f_var})
+            if res['status'] == 'pass':
+                nd = dict(rval.data)
+                nd['high_limb'] = Value('u64', u1)
+                nd['low_limb'] = Value('u64', u0)
+                nd['slot_quotient'] = Value('u64', t_q)
+                nd['slot_remainder'] = Value('u64', t_r)
+                return [(g, Value(rval.ty, nd))]
+            self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
+        elif short == 'quote_calldata_lane_surcharge' and rval.ty[1] == 'CalldataLaneQuote':
+            bs = [_byte_at_z3(f_var, i) for i in range(8)]
+            t_nz = sum(z3.If(bi > 0, 1, 0) for bi in bs)
+            t_sum = sum(bs)
+            t_sur = t_nz * 256 + t_sum
+            cond = z3.Or(
+                rval.data['surcharge'].data != t_sur,
+                rval.data['active_lanes'].data != t_nz,
+                rval.data['byte_weight_sum'].data != t_sum,
+            )
+            res = query(cond, {'fee': f_var})
+            if res['status'] == 'pass':
+                nd = dict(rval.data)
+                nd['active_lanes'] = Value('u64', t_nz)
+                nd['byte_weight_sum'] = Value('u64', t_sum)
+                nd['surcharge'] = Value('u64', t_sur)
+                return [(g, Value(rval.ty, nd))]
+            self._record_stage_cex(cond, {'fee': f_var}, res)
+        elif short == 'quote_prover_transcript_levy' and rval.ty[1] == 'ProverLevyQuote':
+            b32 = 1 << 32
+            t_pack = (a_var % b32) + (f_var % PLONKY3_P) * b32
+            t_levy = (t_pack * PLONKY3_R_INV) % PLONKY3_P
+            cond = z3.Or(
+                rval.data['prover_levy'].data != t_levy,
+                rval.data['packed_transcript'].data != t_pack,
+            )
+            res = query(cond, {'amount': a_var, 'fee': f_var})
+            if res['status'] == 'pass':
+                nd = dict(rval.data)
+                nd['packed_transcript'] = Value('u64', t_pack)
+                nd['prover_levy'] = Value('u64', t_levy)
+                return [(g, Value(rval.ty, nd))]
+            self._record_stage_cex(cond, {'amount': a_var, 'fee': f_var}, res)
+        return out
     def evaluate(self, e, env, guard):
         self.steps += 1
-        if self.steps > 16384: raise Unsupported('symbolic expansion limit exceeded')
+        if self.steps > 65536: raise Unsupported('symbolic expansion limit exceeded')
         k = e[0]
         if k == 'block':
             active = [(guard, dict(env))]; completed = []
@@ -563,7 +720,7 @@ class Interpreter:
                         out.append((h, check_val_type(rval, ret_ty)))
             finally:
                 self.call_depth -= 1
-            return out
+            return self._apply_stage_cut(fname, out)
         if k in ('some', 'auth', 'return', 'try', 'cast', 'not'):
             out = []
             for g, val in self.evaluate(e[1], env, guard):
@@ -593,13 +750,13 @@ class Interpreter:
                     condition = typed(val, 'bool').data
                     tp = self.evaluate(e[2], env, z3.And(g, condition))
                     fp = self.evaluate(e[3], env, z3.And(g, z3.Not(condition)))
-                    if (
-                        len(tp) == 1
-                        and len(fp) == 1
-                        and tp[0][1].ty == fp[0][1].ty
-                        and tp[0][1].ty in ('u32', 'u64', 'u128', 'bool')
-                    ):
-                        out.append((g, Value(tp[0][1].ty, z3.If(condition, tp[0][1].data, fp[0][1].data))))
+                    merged_val = (
+                        _merge_ite_values(condition, tp[0][1], fp[0][1])
+                        if len(tp) == 1 and len(fp) == 1
+                        else None
+                    )
+                    if merged_val is not None:
+                        out.append((g, merged_val))
                     else:
                         out += tp + fp
                 else:
@@ -712,17 +869,18 @@ class Interpreter:
         raise Unsupported('unsupported AST node ' + k)
 
 
-def check(source, problem='authorization'):
+def check(source, problem='authorization', fallback_dir=None):
+    source = bundle_crate_source(source, fallback_dir=fallback_dir)
     is_extended = (
         problem == 'settlement'
         or problem.startswith('settlement-')
-        or problem in ('goldilocks', 'whirlpool', 'plonky3', 'succinct', 'openpql', 'ruint')
+        or problem in ('goldilocks', 'whirlpool', 'plonky3', 'succinct', 'openpql', 'ruint', 'zk-clearing')
     )
     consts, structs, funcs, names, body = Parser(
         source, allow_u128=not is_extended, allow_modules=is_extended
     ).program()
     const_env = {}
-    boot_interp = Interpreter(structs=structs, funcs=funcs, const_env=const_env)
+    boot_interp = Interpreter(structs=structs, funcs=funcs, const_env=const_env, problem=problem)
     for qual, cname, cty, cexpr in consts:
         cpaths = boot_interp.evaluate(cexpr, const_env, z3.BoolVal(True))
         if len(cpaths) != 1: raise Unsupported('const expression must be unconditional')
@@ -734,7 +892,7 @@ def check(source, problem='authorization'):
         const_env[cname] = v
         const_env[f'crate::{qual}'] = v
         const_env[f'super::{qual}'] = v
-    interp = Interpreter(structs=structs, funcs=funcs, const_env=const_env)
+    interp = Interpreter(structs=structs, funcs=funcs, const_env=const_env, problem=problem)
     env = dict(const_env)
     variables = {k: z3.Int(k) for k in ('balance', 'amount', 'fee')}
     for n, v in zip(names, variables.values()):
@@ -752,7 +910,15 @@ def check(source, problem='authorization'):
         mismatches.append(z3.And(guard, mismatch))
     # Require both path coverage and correct Some/None and exact total.
     counterexample = z3.Or(z3.Not(z3.Or(*[g for g, _ in paths])), *mismatches)
-    result = query(counterexample, variables)
+    result = None
+    if interp.stage_counterexample:
+        pin = [variables[k] == val for k, val in interp.stage_counterexample.items() if k in variables]
+        if pin:
+            seeded = query(z3.And(counterexample, *pin), variables)
+            if seeded['status'] == 'fail':
+                result = seeded
+    if result is None:
+        result = query(counterexample, variables)
     prop = ('Some iff mathematical amount+fee<=balance; Some.total_debit=amount+fee'
             if problem == 'authorization' else
             f'Some iff mathematical {problem} debit<=balance; Some.total_debit={problem} debit')

@@ -81,9 +81,10 @@ fn main() {
 '''
 
 
-def compile_probe(source, tmp):
+def compile_probe(source_or_path, tmp, fallback_dir=None):
     rustc = shutil.which('rustc')
     if not rustc: raise RuntimeError('rustc unavailable')
+    source = rust_symbolic.bundle_crate_source(source_or_path, fallback_dir=fallback_dir)
     (tmp/'lib.rs').write_text(source); (tmp/'driver.rs').write_text(DRIVER)
     for cmd in ([rustc, '--edition=2021', '--crate-name', 'submitted', '--crate-type=rlib', '-O', '-C', 'overflow-checks=off', 'lib.rs'],
                 [rustc, '--edition=2021', '-O', 'driver.rs', '--extern', 'submitted=libsubmitted.rlib', '-o', 'probe']):
@@ -101,6 +102,13 @@ def read_problem(verifier):
     return problem
 
 
+def _pristine_rust_source(verifier):
+    pristine_dir = verifier / 'pristine/src'
+    if pristine_dir.is_dir():
+        return rust_symbolic.bundle_crate_source(pristine_dir)
+    return (verifier / 'pristine/lib.rs').read_text()
+
+
 def check_counterexample(text, verifier, problem=None):
     if problem is None: problem = read_problem(verifier)
     obj = json_object(text)
@@ -108,7 +116,7 @@ def check_counterexample(text, verifier, problem=None):
     inputs = [obj[k] for k in ('balance', 'amount', 'fee')]
     if any(type(x) is not int or not 0 <= x <= MAX for x in inputs): raise ValueError('inputs must be u64 JSON integers')
     balance, amount, fee = inputs
-    pristine = (verifier/'pristine/lib.rs').read_text()
+    pristine = _pristine_rust_source(verifier)
     with tempfile.TemporaryDirectory(prefix='security-witness-') as raw:
         tmp = Path(raw); probe = compile_probe(pristine, tmp)
         result = run([str(probe), *map(str, inputs)], tmp, 5)
@@ -126,8 +134,9 @@ def check_counterexample(text, verifier, problem=None):
             'reason': 'pristine release Rust authorizes an unaffordable mathematical total' if exploited else 'not a reproduced security violation'}
 
 
-def check_patch(source, problem='authorization'):
+def check_patch(source_or_path, problem='authorization', fallback_dir=None):
     # Parse before compiling: unsupported production Rust is never executed.
+    source = rust_symbolic.bundle_crate_source(source_or_path, fallback_dir=fallback_dir)
     universal = rust_symbolic.check(source, problem=problem)
     with tempfile.TemporaryDirectory(prefix='security-patch-') as raw:
         tmp = Path(raw); probe = compile_probe(source, tmp)
@@ -174,6 +183,14 @@ def check_patch(source, problem='authorization'):
                 (65534, 65535, 16384),
                 (98301, 65534, 21845),
             ]
+        elif problem == 'zk-clearing':
+            cases += [
+                (1660208138844189, 0, 18446744073709541617),
+                (1660208138844190, 0, 18446744073709541617),
+                (18446744069414584318, 0, 8589934592),
+                (MAX, 65535, 16384),
+                (MAX, 0, 0x8080_8080_8080_8080),
+            ]
         # Include an SMT counterexample, so a universal failure is reproduced in Rust.
         if 'counterexample' in universal:
             cases.append(tuple(universal['counterexample'][k] for k in ('balance','amount','fee')))
@@ -199,6 +216,7 @@ def check_patch(source, problem='authorization'):
 
 ALLOWED_IMPORT_PREFIXES = (
     'SecurityChallenge',
+    'LeanModel',
     'Lean',
     'Std',
     'Init',
@@ -206,6 +224,37 @@ ALLOWED_IMPORT_PREFIXES = (
     'Batteries',
     'Aesop',
     'Qq',
+)
+
+LEAN_MODEL_ORDER = (
+    'Constants',
+    'WordMath',
+    'ReciprocalDiv',
+    'BroadwordSwar',
+    'MontgomeryField',
+    'GoldilocksField',
+    'FeeSchedule',
+    'LiquidityPool',
+    'TranscriptCodec',
+    'ClearingPipeline',
+)
+
+
+PROTECTED_LEAN_MODULES = (
+    'Constants',
+    'FeeSchedule',
+    'LiquidityPool',
+    'TranscriptCodec',
+    'ClearingPipeline',
+)
+
+PROTECTED_RUST_MODULES = (
+    'lib.rs',
+    'constants.rs',
+    'fee_schedule.rs',
+    'liquidity_pool.rs',
+    'transcript_codec.rs',
+    'clearing_pipeline.rs',
 )
 
 
@@ -255,6 +304,14 @@ def clean_source(text, allowed_prefixes=ALLOWED_IMPORT_PREFIXES):
         raise ValueError('forbidden axiom/import/unsafe elaboration extension')
     return remaining, extra_imports
 
+
+def _write_frozen(tmp: Path, frozen: dict[str, bytes]):
+    for name, data in frozen.items():
+        dest = tmp / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+
+
 class LeanSession:
     """Compile in isolation, freeze .olean files, independently replay kernels.
     Each stage gets a fresh directory and only previously frozen dependencies.
@@ -274,20 +331,115 @@ class LeanSession:
         self.extra_lean_paths=_extra_lean_paths()
         self.frozen={}
 
+    def compile_model_override(self, submission: Path, artifacts: dict[str, str]):
+        pristine_lean = self.verifier / 'pristine/LeanModel'
+        pristine_root = self.verifier / 'pristine/SecurityChallenge.lean'
+        if not pristine_lean.is_dir() or not pristine_root.is_file():
+            raise RuntimeError('pristine LeanModel missing')
+        sub_lean = submission / 'LeanModel'
+        if sub_lean.is_symlink() or not sub_lean.is_dir():
+            raise FileNotFoundError(str(sub_lean))
+        allowed_files = {f'{m}.lean' for m in LEAN_MODEL_ORDER}
+        for item in sorted(sub_lean.iterdir()):
+            if item.name not in allowed_files:
+                raise ValueError(f'unexpected file in submission/LeanModel: {item.name}')
+        sources = {}
+        changed_count = 0
+        for m in LEAN_MODEL_ORDER:
+            rel = f'LeanModel/{m}.lean'
+            sub_file = sub_lean / f'{m}.lean'
+            pristine_text = (pristine_lean / f'{m}.lean').read_text()
+            if sub_file.exists() or sub_file.is_symlink():
+                text = read_artifact(sub_file)
+                if not text.strip():
+                    raise FileNotFoundError('empty ' + rel)
+                artifacts[rel] = hashlib.sha256(text.encode()).hexdigest()
+                cleaned, _ = clean_source(text, allowed_prefixes=('LeanModel', 'Lean', 'Std', 'Init'))
+                if re.search(r'\b(Nat|toNat|ofNat)\b', cleaned):
+                    raise ValueError(f'{rel} must remain a fixed-width UInt64 model (Nat forbidden)')
+                if text.strip() != pristine_text.strip():
+                    if m in PROTECTED_LEAN_MODULES:
+                        raise ValueError(f'{rel} is a protected protocol orchestration module; patch the defective low-level arithmetic module instead')
+                    changed_count += 1
+                sources[m] = text
+            else:
+                sources[m] = pristine_text
+        if changed_count == 0:
+            raise ValueError('submission/LeanModel must patch the vulnerable Lean module')
+        if changed_count > 1:
+            raise ValueError('submission/LeanModel patch must modify only the single defective arithmetic module')
+        with tempfile.TemporaryDirectory(prefix='lean-model-override-') as raw:
+            tmp = Path(raw)
+            (tmp / 'LeanModel').mkdir(parents=True, exist_ok=True)
+            lean_path_entries = [str(tmp), str(self.api.resolve())] + self.extra_lean_paths
+            env = {
+                'PATH': str(Path(self.lean).parent) + ':/usr/bin:/bin',
+                'HOME': str(tmp),
+                'LEAN_PATH': ':'.join(lean_path_entries),
+                'TMPDIR': str(tmp),
+            }
+            reads = [str(self.prefix), str(self.api.resolve()), '/usr/lib', '/lib', '/lib64', '/dev/null', '/dev/urandom']
+            if Path('/opt/rvb-deps').exists():
+                reads.append('/opt/rvb-deps')
+            new_frozen = {}
+            changed_mods = set()
+            recompiled_mods = []
+            for m in LEAN_MODEL_ORDER:
+                rel_lean = f'LeanModel/{m}.lean'
+                rel_olean = f'LeanModel/{m}.olean'
+                pristine_text = (pristine_lean / f'{m}.lean').read_text()
+                api_olean = self.api / rel_olean
+                deps = set(re.findall(r'import\s+LeanModel\.([A-Za-z0-9_]+)', sources[m]))
+                if sources[m].strip() != pristine_text.strip() or (deps & changed_mods) or not api_olean.is_file():
+                    changed_mods.add(m)
+                    recompiled_mods.append(f'LeanModel.{m}')
+                    (tmp / rel_lean).write_text(sources[m])
+                    compiled = run([self.lean, '-j1', '-M4096', '-o', rel_olean, rel_lean], tmp, 120, env=env, sandbox=True, read_paths=reads)
+                    artifact = tmp / rel_olean
+                    if compiled.returncode or not artifact.is_file():
+                        return {'status': 'fail', 'reason': f'Lean compilation rejected {rel_lean}', 'diagnostic': (compiled.stdout + compiled.stderr)[-4000:]}
+                    if artifact.is_symlink() or artifact.stat().st_size > 32 * 1024**2:
+                        raise ValueError('invalid Lean artifact')
+                    new_frozen[rel_olean] = artifact.read_bytes()
+                else:
+                    olean_bytes = api_olean.read_bytes()
+                    (tmp / rel_olean).write_bytes(olean_bytes)
+                    new_frozen[rel_olean] = olean_bytes
+            (tmp / 'SecurityChallenge.lean').write_text(pristine_root.read_text())
+            compiled_root = run([self.lean, '-j1', '-M4096', '-o', 'SecurityChallenge.olean', 'SecurityChallenge.lean'], tmp, 120, env=env, sandbox=True, read_paths=reads)
+            root_artifact = tmp / 'SecurityChallenge.olean'
+            if compiled_root.returncode or not root_artifact.is_file():
+                return {'status': 'fail', 'reason': 'Lean compilation rejected repaired SecurityChallenge', 'diagnostic': (compiled_root.stdout + compiled.stderr)[-4000:]}
+            new_frozen['SecurityChallenge.olean'] = root_artifact.read_bytes()
+            for item in tmp.iterdir():
+                if item.is_dir() and not item.is_symlink():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+            _write_frozen(tmp, new_frozen)
+            for mod_name in recompiled_mods + ['SecurityChallenge']:
+                replay = run([self.checker, mod_name], tmp, 120, env=env, sandbox=True, read_paths=reads)
+                if replay.returncode:
+                    return {'status': 'fail', 'reason': f'independent kernel replay rejected {mod_name}', 'diagnostic': (replay.stdout + replay.stderr)[-4000:]}
+            self.frozen.update(new_frozen)
+            return {'status': 'pass', 'modified_modules': changed_count}
+
     def stage(self,module,text,mode):
         cleaned, extra_imports = clean_source(text)
         import_block = ''.join(f'import {m}\n' for m in extra_imports if m != 'SecurityChallenge')
         if module=='CandidateProof':
             if re.search(r'\b(theorem|def|opaque|constant|namespace|section|end|export|attribute|set_option)\b',cleaned) or '#' in cleaned:
                 raise ValueError('Proof.lean must be a proof term')
+            if 'CandidateSpec.olean' not in self.frozen or 'CandidateAudit.olean' not in self.frozen:
+                return {'status':'fail','reason':'CandidateSpec and CandidateAudit must compile before CandidateProof'}
             text='import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'+import_block+'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'+cleaned+'\n)\n'
         else:
             text='import SecurityChallenge\n'+import_block+cleaned+'\n'
         with tempfile.TemporaryDirectory(prefix='lean-native-') as raw:
             tmp=Path(raw)
-            for name,data in self.frozen.items(): (tmp/name).write_bytes(data)
+            _write_frozen(tmp, self.frozen)
             (tmp/(module+'.lean')).write_text(text)
-            lean_path_entries = [str(self.api.resolve()), str(tmp)] + self.extra_lean_paths
+            lean_path_entries = [str(tmp), str(self.api.resolve())] + self.extra_lean_paths
             env={'PATH':str(Path(self.lean).parent)+':/usr/bin:/bin','HOME':str(tmp),
                  'LEAN_PATH':':'.join(lean_path_entries),'TMPDIR':str(tmp)}
             reads=[str(self.prefix),str(self.api.resolve()),'/usr/lib','/lib','/lib64','/dev/null','/dev/urandom']
@@ -307,7 +459,7 @@ class LeanSession:
             for item in tmp.iterdir():
                 if item.is_dir() and not item.is_symlink(): shutil.rmtree(item)
                 else: item.unlink()
-            for name,previous in self.frozen.items(): (tmp/name).write_bytes(previous)
+            _write_frozen(tmp, self.frozen)
             artifact.write_bytes(data)
             replay=run([self.checker,module],tmp,120,env=env,sandbox=True,read_paths=reads)
             if replay.returncode:
@@ -331,9 +483,56 @@ def capture(check):
     except Exception as exc: return {'status':'infrastructure_error','reason':str(exc)}
 
 def unexpected_safe_artifacts(submission):
-    return [rel for rel in ('counterexample.json','src/lib.rs')
-            if (submission/rel).exists() or (submission/rel).is_symlink()
-            or (submission/rel).parent.is_symlink()]
+    found = []
+    for rel in ('counterexample.json', 'src/lib.rs'):
+        if (submission/rel).exists() or (submission/rel).is_symlink() or (submission/rel).parent.is_symlink():
+            found.append(rel)
+    for dname in ('src', 'LeanModel'):
+        dpath = submission / dname
+        if dpath.is_symlink():
+            found.append(dname)
+        elif dpath.is_dir():
+            for child in sorted(dpath.iterdir()):
+                rel = f'{dname}/{child.name}'
+                if rel not in found:
+                    found.append(rel)
+    return found
+
+
+def read_submission_rust(submission: Path, verifier: Path, artifacts: dict[str, str]) -> str:
+    pristine_src = verifier / 'pristine/src'
+    if not pristine_src.is_dir():
+        t = read_artifact(submission / 'src/lib.rs')
+        if not t.strip():
+            raise FileNotFoundError('empty src/lib.rs')
+        artifacts['src/lib.rs'] = hashlib.sha256(t.encode()).hexdigest()
+        return t
+    sub_src = submission / 'src'
+    if sub_src.is_symlink() or not sub_src.is_dir():
+        raise FileNotFoundError(str(sub_src))
+    allowed_rs = {p.name for p in pristine_src.glob('*.rs')}
+    rs_files = sorted(sub_src.iterdir())
+    if not rs_files:
+        raise FileNotFoundError(str(sub_src / 'lib.rs'))
+    changed_rs = 0
+    for item in rs_files:
+        if item.name not in allowed_rs:
+            raise ValueError(f'unexpected file in submission/src: {item.name}')
+        t = read_artifact(item)
+        if not t.strip():
+            raise FileNotFoundError(f'empty src/{item.name}')
+        artifacts[f'src/{item.name}'] = hashlib.sha256(t.encode()).hexdigest()
+        pristine_text = (pristine_src / item.name).read_text()
+        if t.strip() != pristine_text.strip():
+            if item.name in PROTECTED_RUST_MODULES:
+                raise ValueError(f'src/{item.name} is a protected protocol orchestration module; patch the defective low-level arithmetic module instead')
+            changed_rs += 1
+    if changed_rs == 0:
+        raise ValueError('submission/src must patch the vulnerable Rust arithmetic module')
+    if changed_rs > 1:
+        raise ValueError('submission/src patch must modify only the single defective arithmetic module')
+    return rust_symbolic.bundle_crate_source(sub_src, fallback_dir=pristine_src)
+
 
 def grade(workspace,verifier,profile=None):
     submission=workspace/'submission'
@@ -343,6 +542,7 @@ def grade(workspace,verifier,profile=None):
     if variant not in ('safe','vulnerable'): raise RuntimeError('invalid trusted variant')
     problem=read_problem(verifier)
     session=None
+    model_override=None
     checks={}
     artifacts={}
     def artifact(rel):
@@ -350,9 +550,17 @@ def grade(workspace,verifier,profile=None):
         if not t.strip(): raise FileNotFoundError('empty '+rel)
         artifacts[rel]=hashlib.sha256(t.encode()).hexdigest()
         return t
+    def ensure_session():
+        nonlocal session, model_override
+        if session is None:
+            session = LeanSession(verifier)
+            if problem == 'zk-clearing' and variant == 'vulnerable':
+                model_override = capture(lambda: session.compile_model_override(submission, artifacts))
     def lean_stage(module,rel,mode):
-        nonlocal session
-        if session is None: session=LeanSession(verifier)
+        ensure_session()
+        if module == 'CandidateProof' and problem == 'zk-clearing' and variant == 'vulnerable':
+            if model_override is not None and model_override['status'] != 'pass':
+                return {**model_override, 'reason': 'repaired LeanModel required for universal vulnerable proof: ' + model_override.get('reason', '')}
         return session.stage(module,artifact(rel),mode)
     start=time.monotonic()
     checks['spec']=capture(lambda:lean_stage('CandidateSpec','Spec.lean','spec'))
@@ -364,22 +572,41 @@ def grade(workspace,verifier,profile=None):
     checks['proof']=capture(lambda:lean_stage('CandidateProof','Proof.lean','proof'))
     # Correctness of the spec and diagnostic theorem are intentionally separate.
     # A proof about an inadequate spec is reported as such, not silently upgraded.
-    checks['proof']['scope']='AuditClaim of the submitted spec and submitted verdict over the visible original model'
+    checks['proof']['scope']='AuditClaim of the submitted spec and submitted verdict over the visible original or repaired model'
     checks['proof']['spec_semantically_complete']=checks['spec']['status']=='pass'
+    if model_override is not None:
+        checks['proof']['lean_model_override']=model_override
     if variant=='vulnerable':
         witness=capture(lambda:check_counterexample(artifact('counterexample.json'),verifier))
-        patch=capture(lambda:check_patch(artifact('src/lib.rs'), problem=problem))
+        patch=capture(lambda:check_patch(read_submission_rust(submission, verifier, artifacts), problem=problem))
         score=.15*(witness['status']=='pass')+.20*(patch['status']=='pass')
-        checks['response']={'status':'pass' if score==.35 else 'partial' if score else 'fail',
-                            'credit_fraction':score/.35,'checks':{'counterexample':witness,'patch':patch}}
+        if problem == 'zk-clearing':
+            justified = (
+                verdict == 'vulnerable'
+                and checks['spec']['status'] == 'pass'
+                and checks['proof']['status'] == 'pass'
+                and witness['status'] == 'pass'
+                and patch['status'] == 'pass'
+            )
+            checks['response'] = {
+                'status': 'pass' if justified else 'fail',
+                'credit_fraction': 1.0 if justified else 0.0,
+                'checks': {'counterexample': witness, 'patch': patch},
+                'reason': 'vulnerable response requires counterexample, universal Rust patch, repaired LeanModel, and universal Lean soundness proof',
+            }
+            if not justified:
+                checks['verdict']['status'] = 'fail' if checks['verdict']['status'] == 'pass' else checks['verdict']['status']
+        else:
+            checks['response']={'status':'pass' if score==.35 else 'partial' if score else 'fail',
+                                'credit_fraction':score/.35,'checks':{'counterexample':witness,'patch':patch}}
         if any(r['status']=='infrastructure_error' for r in (witness,patch)):
             checks['response']['status']='infrastructure_error'
     else:
-        original=capture(lambda:check_patch((verifier/'pristine/lib.rs').read_text(), problem=problem))
+        original=capture(lambda:check_patch(_pristine_rust_source(verifier), problem=problem))
         # Safe responses require absence, so inspect metadata only. Never read
         # optional attacker files (binary/oversized/device/symlink) at all.
         unwanted=unexpected_safe_artifacts(submission)
-        justified=verdict=='safe' and checks['proof']['status']=='pass' and original['status']=='pass'
+        justified=verdict=='safe' and checks['spec']['status']=='pass' and checks['proof']['status']=='pass' and original['status']=='pass'
         # No score for merely omitting files, and no score for a bare "safe".
         checks['response']={'status':'pass' if justified and not unwanted else 'fail',
                             'checks':{'original_universal_conformance':original},
@@ -392,7 +619,7 @@ def grade(workspace,verifier,profile=None):
     reward=round(sum(r['score'] for r in checks.values()),4)
     return {'version':3,'problem':problem,'variant':variant,'status':'infrastructure_error' if any(r['status']=='infrastructure_error' for r in checks.values()) else 'ok',
             'reward':reward,'weights':WEIGHTS,'checkpoints':checks,'artifact_sha256':artifacts,
-            'elapsed_seconds':round(time.monotonic()-start,3),'scoring':'independent semantic facets; safe verdict requires proof + universal original Rust'}
+            'elapsed_seconds':round(time.monotonic()-start,3),'scoring':'independent semantic facets; verdict and response require universal Lean proof + Rust verification'}
 
 def main():
     p=argparse.ArgumentParser()

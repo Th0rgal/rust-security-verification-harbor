@@ -3,11 +3,25 @@
 from pathlib import Path
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parent
 submission = root.parent / 'submission'
+
+LEAN_MODEL_ORDER = (
+    'Constants',
+    'WordMath',
+    'ReciprocalDiv',
+    'BroadwordSwar',
+    'MontgomeryField',
+    'GoldilocksField',
+    'FeeSchedule',
+    'LiquidityPool',
+    'TranscriptCodec',
+    'ClearingPipeline',
+)
 
 
 def _extra_lean_paths():
@@ -56,12 +70,45 @@ def _split_imports(text):
 
 with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
     tmp = Path(raw)
-    lean_paths = [str(root), str(tmp)] + _extra_lean_paths()
+    lean_paths = [str(tmp), str(root)] + _extra_lean_paths()
     env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    sub_lean = submission / 'LeanModel'
+    root_lean = root / 'LeanModel'
+    if sub_lean.is_dir() and root_lean.is_dir():
+        (tmp / 'LeanModel').mkdir(parents=True, exist_ok=True)
+        protected_mods = ('Constants', 'FeeSchedule', 'LiquidityPool', 'TranscriptCodec', 'ClearingPipeline')
+        direct_changes = 0
+        changed_mods = set()
+        for m in LEAN_MODEL_ORDER:
+            rel = f'LeanModel/{m}.lean'
+            rel_olean = f'LeanModel/{m}.olean'
+            orig_file = root_lean / f'{m}.lean'
+            orig_olean = root / rel_olean
+            sub_file = sub_lean / f'{m}.lean'
+            if not orig_file.is_file():
+                continue
+            orig_text = orig_file.read_text()
+            src_text = sub_file.read_text() if sub_file.is_file() else orig_text
+            if src_text.strip() != orig_text.strip():
+                if m in protected_mods:
+                    raise SystemExit(f'{rel} is a protected protocol orchestration module; patch the defective low-level arithmetic module instead')
+                direct_changes += 1
+                if direct_changes > 1:
+                    raise SystemExit('submission/LeanModel patch must modify only the single defective arithmetic module')
+            deps = set(re.findall(r'import\s+LeanModel\.([A-Za-z0-9_]+)', src_text))
+            if src_text.strip() != orig_text.strip() or (deps & changed_mods) or not orig_olean.is_file():
+                changed_mods.add(m)
+                (tmp / rel).write_text(src_text)
+                subprocess.run(['lean', '-j1', '-M4096', '-o', rel_olean, rel], cwd=tmp, env=env, check=True)
+            else:
+                shutil.copy(orig_olean, tmp / rel_olean)
+        if changed_mods and (root / 'SecurityChallenge.lean').is_file():
+            shutil.copy(root / 'SecurityChallenge.lean', tmp / 'SecurityChallenge.lean')
+            subprocess.run(['lean', '-j1', '-M4096', '-o', 'SecurityChallenge.olean', 'SecurityChallenge.lean'], cwd=tmp, env=env, check=True)
     for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
         imp, body = _split_imports((submission / rel).read_text())
         (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
-        subprocess.run(['lean', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+        subprocess.run(['lean', '-j1', '-M4096', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
     imp, body = _split_imports((submission / 'Proof.lean').read_text())
     proof = (
         'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
@@ -71,4 +118,4 @@ with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
         + '\n)\n'
     )
     (tmp / 'CandidateProof.lean').write_text(proof)
-    raise SystemExit(subprocess.call(['lean', 'CandidateProof.lean'], cwd=tmp, env=env))
+    raise SystemExit(subprocess.call(['lean', '-j1', '-M4096', 'CandidateProof.lean'], cwd=tmp, env=env))

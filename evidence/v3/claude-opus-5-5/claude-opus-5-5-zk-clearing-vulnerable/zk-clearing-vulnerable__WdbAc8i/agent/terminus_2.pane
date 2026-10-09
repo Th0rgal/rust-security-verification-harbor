@@ -1,0 +1,3720 @@
+[?2004hroot@b6a024795075:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@b6a024795075:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@b6a024795075:/workspace# cd /workspace && find . -type f -not -path '*/.lake/*' | head -100
+[?2004l./lean/LeanModel/BroadwordSwar.lean
+./lean/LeanModel/MontgomeryField.lean
+./lean/LeanModel/ClearingPipeline.lean
+./lean/LeanModel/WordMath.lean
+./lean/LeanModel/TranscriptCodec.lean
+./lean/LeanModel/Constants.lean
+./lean/LeanModel/FeeSchedule.lean
+./lean/LeanModel/LiquidityPool.lean
+./lean/LeanModel/GoldilocksField.lean
+./lean/LeanModel/ReciprocalDiv.lean
+./lean/LeanModel/GoldilocksField.olean
+./lean/LeanModel/Constants.olean
+./lean/LeanModel/BroadwordSwar.olean
+./lean/LeanModel/MontgomeryField.olean
+./lean/LeanModel/LiquidityPool.olean
+./lean/LeanModel/WordMath.olean
+./lean/LeanModel/FeeSchedule.olean
+./lean/LeanModel/TranscriptCodec.olean
+./lean/LeanModel/ClearingPipeline.olean
+./lean/LeanModel/ReciprocalDiv.olean
+./lean/lean-toolchain
+./lean/Signature.lean
+./lean/SecurityChallenge.lean
+./lean/check.py
+./lean/SecurityChallenge.olean
+./challenge/src/transcript_codec.rs
+./challenge/src/clearing_pipeline.rs
+./challenge/src/lib.rs
+./challenge/src/broadword_swar.rs
+./challenge/src/goldilocks_field.rs
+./challenge/src/reciprocal_div.rs
+./challenge/src/montgomery_field.rs
+./challenge/src/liquidity_pool.rs
+./challenge/src/constants.rs
+./challenge/src/fee_schedule.rs
+./challenge/src/word_math.rs
+./challenge/Cargo.toml
+./challenge/Cargo.lock
+./challenge/target/release/deps/settlement_gate-ebd00f5d27994bc9.d
+./challenge/target/release/deps/libsettlement_gate-0aba5e1fc59a671e.rlib
+./challenge/target/release/deps/libsettlement_gate-0aba5e1fc59a671e.rmeta
+./challenge/target/release/deps/settlement_gate-ebd00f5d27994bc9
+./challenge/target/release/deps/settlement_gate-0aba5e1fc59a671e.d
+./challenge/target/release/.cargo-lock
+./challenge/target/release/.fingerprint/settlement-gate-0aba5e1fc59a671e/lib-settlement_gate.json
+./challenge/target/release/.fingerprint/settlement-gate-0aba5e1fc59a671e/invoked.timestamp
+./challenge/target/release/.fingerprint/settlement-gate-0aba5e1fc59a671e/lib-settlement_gate
+./challenge/target/release/.fingerprint/settlement-gate-0aba5e1fc59a671e/dep-lib-settlement_gate
+./challenge/target/release/.fingerprint/settlement-gate-ebd00f5d27994bc9/test-lib-settlement_gate
+./challenge/target/release/.fingerprint/settlement-gate-ebd00f5d27994bc9/dep-test-lib-settlement_gate
+./challenge/target/release/.fingerprint/settlement-gate-ebd00f5d27994bc9/invoked.timestamp
+./challenge/target/release/.fingerprint/settlement-gate-ebd00f5d27994bc9/test-lib-settlement_gate.json
+./challenge/target/.rustc_info.json
+./challenge/target/CACHEDIR.TAG
+./harness/checkpoint.py
+./submission/Proof.lean
+./submission/Spec.lean
+./submission/Audit.lean
+[?2004hroot@b6a024795075:/workspace# cat challenge/Cargo.toml; for f in challenge/src/*.rs challenge/src/**/*.rs; do echo "=== $f"; cat $f; done
+[?2004l[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+=== challenge/src/broadword_swar.rs
+//! Vigna (`tov/succinct-rs`) 8-lane SWAR (SIMD Within A Register) broadword byte
+//! inspection and accumulation kernels for L1 calldata compression pricing.
+//!
+//! Zero-knowledge rollup batches compress zero bytes in transaction fee parameters
+//! much more cheaply than non-zero bytes. For a 64-bit word `fee` viewed as 8 bytes
+//! `b_0, b_1, ..., b_7` (`b_i = (fee >> (8 * i)) & 0xFF`):
+//! - Each non-zero byte (`b_i > 0`) incurs a fixed `256`-unit activation surcharge.
+//! - Each byte additionally contributes its numeric value `b_i` (`0..=255`).
+//! Thus the total calldata byte-lane surcharge is:
+//! `256 * |{i in 0..8 : b_i > 0}| + sum_{i=0..7} b_i`.
+
+use crate::constants::*;
+
+/// Breakdown of the 8-byte SWAR calldata inspection on a 64-bit parameter word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalldataLaneQuote {
+    pub active_lanes: u64,
+    pub byte_weight_sum: u64,
+    pub surcharge: u64,
+}
+
+/// Vigna's broadword non-zero byte detector (`u_nz8`):
+/// Sets bit 7 (`0x80`) of byte lane `i` if and only if byte `i` of `x` is non-zero (`b_i > 0`),
+/// and clears all other bits in every lane.
+///
+/// Identity: `((((x | H8_MASK) - L8_MASK) | x) & H8_MASK)`:
+/// - Setting `| H8_MASK` ensures bit 7 of each byte is `1`, blocking borrow propagation
+///   between adjacent bytes when subtracting `L8_MASK` (`0x01` in each byte).
+/// - If low 7 bits of byte `i` are non-zero, subtracting `1` leaves bit 7 equal to `1`.
+/// - If byte `i` is `0x80` (`128`), subtracting `1` clears bit 7 to `0`, and `| x`
+///   restores bit 7 to `1`.
+/// - If byte `i` is `0x00`, subtracting `1` clears bit 7 to `0`, and `| x` leaves it `0`.
+#[inline]
+pub fn u_nz8(x: u64) -> u64 {
+    (((x | H8_MASK) - L8_MASK) | x) & H8_MASK
+}
+
+/// Counts the number of non-zero bytes (`0..=8`) in a 64-bit word `x` in `O(1)`
+/// register operations by shifting the `0x80` lane flags of `u_nz8(x)` down to `0x01`
+/// and multiplying by `L8_MASK` to sum all 8 lanes in the top byte (`>> 56`).
+#[inline]
+pub fn count_nz_bytes(x: u64) -> u64 {
+    ((u_nz8(x) >> 7u64) * L8_MASK) >> 56u64
+}
+
+/// Counts the number of zero bytes (`0..=8`) in a 64-bit word `x`.
+#[inline]
+pub fn count_zero_bytes_swar(x: u64) -> u64 {
+    8u64 - count_nz_bytes(x)
+}
+
+/// Checks whether any byte lane of `x` has its most significant bit (`0x80`) set.
+#[inline]
+pub fn has_high_bit_byte(x: u64) -> bool {
+    (x & H8_MASK) != 0u64
+}
+
+/// Computes the exact sum of all 8 bytes `b_0 + b_1 + ... + b_7` (`0..=2040`) of `x`
+/// using two-lane 16-bit SWAR accumulation (`M16_MASK`) followed by `L16_MASK`
+/// multiplication into the top 16-bit lane (`>> 48`).
+#[inline]
+pub fn sum_bytes(x: u64) -> u64 {
+    let pair_sum: u64 = (x & M16_MASK) + ((x >> 8u64) & M16_MASK);
+    ((pair_sum * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Computes the sum of even-indexed bytes `b_0 + b_2 + b_4 + b_6` of `x`.
+#[inline]
+pub fn sum_even_bytes_swar(x: u64) -> u64 {
+    let even_lanes: u64 = x & M16_MASK;
+    ((even_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Computes the sum of odd-indexed bytes `b_1 + b_3 + b_5 + b_7` of `x`.
+#[inline]
+pub fn sum_odd_bytes_swar(x: u64) -> u64 {
+    let odd_lanes: u64 = (x >> 8u64) & M16_MASK;
+    ((odd_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Quotes the L1 calldata byte-lane surcharge for `fee`:
+/// `surcharge = (count_nz_bytes(fee) << 8) + sum_bytes(fee)`.
+#[inline]
+pub fn quote_calldata_lane_surcharge(fee: u64) -> CalldataLaneQuote {
+    let active_lanes: u64 = count_nz_bytes(fee);
+    let byte_weight_sum: u64 = sum_bytes(fee);
+    let surcharge: u64 = (active_lanes << CALLDATA_NZ_BYTE_SHIFT) + byte_weight_sum;
+    CalldataLaneQuote {
+        active_lanes,
+        byte_weight_sum,
+        surcharge,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swar_zero_and_single_byte_lanes() {
+        let q0 = quote_calldata_lane_surcharge(0u64);
+        assert_eq!(q0.active_lanes, 0u64);
+        assert_eq!(q0.byte_weight_sum, 0u64);
+        assert_eq!(q0.surcharge, 0u64);
+        assert_eq!(count_zero_bytes_swar(0u64), 8u64);
+
+        let q1 = quote_calldata_lane_surcharge(1u64);
+        assert_eq!(q1.active_lanes, 1u64);
+        assert_eq!(q1.byte_weight_sum, 1u64);
+        assert_eq!(q1.surcharge, 257u64);
+    }
+
+    #[test]
+    fn swar_high_bit_0x80_bytes_detected_as_nonzero() {
+        let single_0x80: u64 = 0x80u64;
+        let q_single = quote_calldata_lane_surcharge(single_0x80);
+        assert_eq!(q_single.active_lanes, 1u64);
+        assert_eq!(q_single.byte_weight_sum, 128u64);
+        assert_eq!(q_single.surcharge, 384u64);
+        assert!(has_high_bit_byte(single_0x80));
+
+        let all_0x80: u64 = H8_MASK;
+        let q_all = quote_calldata_lane_surcharge(all_0x80);
+        assert_eq!(q_all.active_lanes, 8u64);
+        assert_eq!(q_all.byte_weight_sum, 1024u64);
+        assert_eq!(q_all.surcharge, 3072u64);
+    }
+
+    #[test]
+    fn swar_all_0xff_max_word() {
+        let q_max = quote_calldata_lane_surcharge(u64::MAX);
+        assert_eq!(q_max.active_lanes, 8u64);
+        assert_eq!(q_max.byte_weight_sum, 2040u64);
+        assert_eq!(q_max.surcharge, 4088u64);
+        assert_eq!(count_zero_bytes_swar(u64::MAX), 0u64);
+    }
+
+    #[test]
+    fn swar_mixed_byte_pattern_and_even_odd_partition() {
+        let word: u64 = 0x0010_807F_00FF_0100u64;
+        let q = quote_calldata_lane_surcharge(word);
+        assert_eq!(q.active_lanes, 5u64);
+        assert_eq!(q.byte_weight_sum, 527u64);
+        assert_eq!(q.surcharge, 5u64 * 256u64 + 527u64);
+        assert_eq!(sum_even_bytes_swar(word) + sum_odd_bytes_swar(word), q.byte_weight_sum);
+    }
+}
+=== challenge/src/clearing_pipeline.rs
+//! Multi-stage rollup batch clearing pipeline and settlement ticket gate.
+//!
+//! Coordinates the four protocol surcharge subsystems to price and authorize
+//! a batch clearing transaction `(balance, amount, fee)`:
+//! 1. `net_bps_fee`: Protocol basis-point settlement fee with 10% floor tier rebate
+//!    (`fee_schedule::evaluate_settlement_fee(word_math::add_u64_with_carry(amount, fee)).net_fee`).
+//! 2. `blob_slot_quotient`: L1 data-availability blob slot quotient via Möller-Granlund
+//!    2-by-1 normalized reciprocal division (`reciprocal_div::quote_blob_gas_slots(amount, fee).slot_quotient`).
+//! 3. `calldata_surcharge`: L1 calldata byte-lane compression surcharge via Vigna SWAR
+//!    broadword operations (`broadword_swar::quote_calldata_lane_surcharge(fee).surcharge`).
+//! 4. `prover_levy`: STARK BabyBear Montgomery transcript verification levy
+//!    (`montgomery_field::quote_prover_transcript_levy(amount, fee).prover_levy`).
+//!
+//! The combined surcharge `total_surcharge = net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy`
+//! is added to the transfer principal `amount` via checked `u64` addition, and the
+//! resulting `ClearingTicket` is committed iff `total_debit <= balance`.
+
+use crate::Authorization;
+use crate::broadword_swar::{CalldataLaneQuote, quote_calldata_lane_surcharge};
+use crate::fee_schedule::{FeeQuote, evaluate_settlement_fee};
+use crate::montgomery_field::{ProverLevyQuote, quote_prover_transcript_levy};
+use crate::reciprocal_div::{BlobSlotQuote, quote_blob_gas_slots};
+use crate::word_math::{WordSum, add_u64_with_carry};
+
+/// Itemized four-stage surcharge breakdown for a rollup clearing operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearingBreakdown {
+    pub net_bps_fee: u64,
+    pub blob_slot_quotient: u64,
+    pub calldata_surcharge: u64,
+    pub prover_levy: u64,
+    pub total_surcharge: u64,
+}
+
+/// Validated clearing settlement ticket ready for balance conservation check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearingTicket {
+    pub principal: u64,
+    pub net_bps_fee: u64,
+    pub blob_slot_quotient: u64,
+    pub calldata_surcharge: u64,
+    pub prover_levy: u64,
+    pub total_surcharge: u64,
+    pub total_debit: u64,
+}
+
+/// Evaluates all four surcharge stages for `(amount, fee)` and sums them into
+/// a `ClearingBreakdown`.
+#[inline]
+pub fn compute_clearing_breakdown(amount: u64, fee: u64) -> ClearingBreakdown {
+    let notional_sum: WordSum = add_u64_with_carry(amount, fee);
+    let fee_quote: FeeQuote = evaluate_settlement_fee(notional_sum);
+    let blob_quote: BlobSlotQuote = quote_blob_gas_slots(amount, fee);
+    let lane_quote: CalldataLaneQuote = quote_calldata_lane_surcharge(fee);
+    let levy_quote: ProverLevyQuote = quote_prover_transcript_levy(amount, fee);
+
+    let net_bps_fee: u64 = fee_quote.net_fee;
+    let blob_slot_quotient: u64 = blob_quote.slot_quotient;
+    let calldata_surcharge: u64 = lane_quote.surcharge;
+    let prover_levy: u64 = levy_quote.prover_levy;
+
+    let total_surcharge: u64 =
+        net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy;
+
+    ClearingBreakdown {
+        net_bps_fee,
+        blob_slot_quotient,
+        calldata_surcharge,
+        prover_levy,
+        total_surcharge,
+    }
+}
+
+/// Assembles a `ClearingTicket` from `amount` and `breakdown`, returning `None`
+/// if `amount + breakdown.total_surcharge` exceeds `u64::MAX`.
+#[inline]
+pub fn assemble_clearing_ticket(
+    amount: u64,
+    breakdown: ClearingBreakdown,
+) -> Option<ClearingTicket> {
+    let total_debit: u64 = amount.checked_add(breakdown.total_surcharge)?;
+    Some(ClearingTicket {
+        principal: amount,
+        net_bps_fee: breakdown.net_bps_fee,
+        blob_slot_quotient: breakdown.blob_slot_quotient,
+        calldata_surcharge: breakdown.calldata_surcharge,
+        prover_levy: breakdown.prover_levy,
+        total_surcharge: breakdown.total_surcharge,
+        total_debit,
+    })
+}
+
+/// Quotes a complete `ClearingTicket` for `(amount, fee)`.
+#[inline]
+pub fn quote_clearing_ticket(amount: u64, fee: u64) -> Option<ClearingTicket> {
+    let breakdown: ClearingBreakdown = compute_clearing_breakdown(amount, fee);
+    assemble_clearing_ticket(amount, breakdown)
+}
+
+/// Commits a `ClearingTicket` against `balance`, authorizing iff `ticket.total_debit <= balance`.
+#[inline]
+pub fn commit_clearing_ticket(balance: u64, ticket: ClearingTicket) -> Option<Authorization> {
+    if ticket.total_debit <= balance {
+        Some(Authorization {
+            total_debit: ticket.total_debit,
+        })
+    } else {
+        None
+    }
+}
+
+/// Computes the post-settlement remaining account balance for telemetry, saturating at zero.
+#[inline]
+pub fn preview_remaining_balance(balance: u64, ticket: ClearingTicket) -> u64 {
+    balance.saturating_sub(ticket.total_debit)
+}
+
+/// Verifies internal surcharge conservation (`net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy == total_surcharge`)
+/// on an assembled `ClearingTicket`.
+#[inline]
+pub fn verify_ticket_conservation(ticket: ClearingTicket) -> bool {
+    let recomputed_surcharge: u64 = ticket.net_bps_fee
+        + ticket.blob_slot_quotient
+        + ticket.calldata_surcharge
+        + ticket.prover_levy;
+    (recomputed_surcharge == ticket.total_surcharge)
+        && (ticket.principal.wrapping_add(ticket.total_surcharge) == ticket.total_debit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_transfer_breakdown_is_zero() {
+        let b = compute_clearing_breakdown(0u64, 0u64);
+        assert_eq!(b.net_bps_fee, 0u64);
+        assert_eq!(b.blob_slot_quotient, 0u64);
+        assert_eq!(b.calldata_surcharge, 0u64);
+        assert_eq!(b.prover_levy, 0u64);
+        assert_eq!(b.total_surcharge, 0u64);
+    }
+
+    #[test]
+    fn ticket_overflow_rejected_near_u64_max() {
+        assert_eq!(quote_clearing_ticket(u64::MAX, 1u64), None);
+        assert_eq!(quote_clearing_ticket(u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn remaining_balance_preview_and_ticket_conservation() {
+        let t = quote_clearing_ticket(0u64, 1u64).unwrap();
+        assert_eq!(t.total_debit, 260u64);
+        assert!(verify_ticket_conservation(t));
+        assert_eq!(preview_remaining_balance(300u64, t), 40u64);
+        assert_eq!(preview_remaining_balance(200u64, t), 0u64);
+    }
+}
+=== challenge/src/constants.rs
+//! Protocol-wide arithmetic constants, prime field moduli, reciprocal multipliers,
+//! broadword SWAR bitmasks, and 64-bit word carry-folding parameters for the
+//! rollup batch settlement and clearing engine.
+//!
+//! All arithmetic throughout the clearing crate executes natively on 64-bit machine
+//! words (`u64`) without `u128` promotion so that settlement verification matches
+//! single-word VM register semantics.
+
+/// Standard protocol fee basis-point denominator (`100% = 10_000 bps`).
+pub const BPS_DENOM: u64 = 10_000u64;
+
+/// Maximum non-zero remainder modulo `BPS_DENOM` (`BPS_DENOM - 1`).
+pub const BPS_MAX_REM: u64 = 9_999u64;
+
+/// Exact floor quotient of `2^64` divided by `BPS_DENOM`:
+/// `floor(18_446_744_073_709_551_616 / 10_000) = 1_844_674_407_370_955`.
+pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955u64;
+
+/// Exact positive remainder of `2^64` modulo `BPS_DENOM`:
+/// `18_446_744_073_709_551_616 % 10_000 = 1_616`.
+pub const U64_MOD_BPS_REM: u64 = 1_616u64;
+
+/// Protocol tier rebate divisor (`10` corresponds to a 10% floor rebate on gross fee).
+pub const REBATE_DIVISOR: u64 = 10u64;
+
+/// Passive maker rebate cap divisor (`5` corresponds to a 20% cap on passive limit orders).
+pub const MAKER_REBATE_CAP_DIVISOR: u64 = 5u64;
+
+/// Protocol reserve treasury cut divisor (`4` corresponds to 25% of net fee retained by treasury).
+pub const TREASURY_CUT_DIVISOR: u64 = 4u64;
+
+/// Flash-settlement liquidity surcharge denominator (`5_000` = 2 bps per notional unit).
+pub const FLASH_DENOM: u64 = 5_000u64;
+
+/// Maximum non-zero remainder modulo `FLASH_DENOM` (`FLASH_DENOM - 1`).
+pub const FLASH_MAX_REM: u64 = 4_999u64;
+
+/// Exact floor quotient of `2^64` divided by `FLASH_DENOM`:
+/// `floor(18_446_744_073_709_551_616 / 5_000) = 3_689_348_814_741_910`.
+pub const U64_MOD_FLASH_QUOT: u64 = 3_689_348_814_741_910u64;
+
+/// Exact positive remainder of `2^64` modulo `FLASH_DENOM`:
+/// `18_446_744_073_709_551_616 % 5_000 = 1_616`.
+pub const U64_MOD_FLASH_REM: u64 = 1_616u64;
+
+/// Minimum combined notional classified as institutional settlement volume.
+pub const INSTITUTIONAL_BAND_MIN: u64 = 10_000_000_000_000u64;
+
+/// Normalized 16-bit Möller-Granlund divisor `D = 0x8003 = 32_771` (`2^15 + 3`)
+/// used to partition L1 data-availability blob gas slots.
+pub const MG10_DIVISOR: u64 = 0x8003u64;
+
+/// Precomputed 16-bit Möller-Granlund reciprocal `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65_524`.
+pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+
+/// 16-bit limb extraction mask (`2^16 - 1 = 0xFFFF = 65_535`).
+pub const LIMB_MASK: u64 = 0xFFFFu64;
+
+/// Unsigned borrow-prevention bias `0xC000_0000 = 3_221_225_472` (`49_152 * 2^16`),
+/// which is an exact multiple of `2^16` exceeding `65_535 * MG10_DIVISOR`.
+pub const SUB_BIAS: u64 = 0xC000_0000u64;
+
+/// Nominal gas units allocated per L1 data-availability blob slot (`128 KiB = 131_072`).
+pub const BLOB_GAS_PER_SLOT: u64 = 131_072u64;
+
+/// SWAR 8-lane byte broadcast mask of `0x01` (`0x0101_0101_0101_0101`).
+pub const L8_MASK: u64 = 0x0101_0101_0101_0101u64;
+
+/// SWAR 8-lane byte high-bit mask of `0x80` (`0x8080_8080_8080_8080`).
+pub const H8_MASK: u64 = 0x8080_8080_8080_8080u64;
+
+/// SWAR alternating 16-bit lane mask (`0x00FF_00FF_00FF_00FF`).
+pub const M16_MASK: u64 = 0x00FF_00FF_00FF_00FFu64;
+
+/// SWAR 16-bit lane broadcast multiplier (`0x0001_0001_0001_0001`).
+pub const L16_MASK: u64 = 0x0001_0001_0001_0001u64;
+
+/// Calldata surcharge shift per active non-zero byte lane (`2^8 = 256` units per non-zero byte).
+pub const CALLDATA_NZ_BYTE_SHIFT: u64 = 8u64;
+
+/// BabyBear STARK prime modulus `P = 2^31 - 2^27 + 1 = 2_013_265_921` (`0x7800_0001`).
+pub const BABYBEAR_P: u64 = 2_013_265_921u64;
+
+/// Negative modular inverse of `BABYBEAR_P` modulo `2^32`:
+/// `MU = -P^{-1} mod 2^32 = 2_281_701_377` (`0x87FF_FFFF`).
+pub const BABYBEAR_MU: u64 = 2_281_701_377u64;
+
+/// 32-bit Montgomery radix `R = 2^32 = 4_294_967_296`.
+pub const LIMB_BASE: u64 = 4_294_967_296u64;
+
+/// 32-bit low-limb mask (`2^32 - 1 = 0xFFFF_FFFF`).
+pub const LOW32_MASK: u64 = 0xFFFF_FFFFu64;
+
+/// Goldilocks 64-bit prime modulus `P_G = 2^64 - 2^32 + 1 = 0xFFFF_FFFF_0000_0001`.
+pub const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001u64;
+
+/// Goldilocks reduction epsilon `EPS = 2^32 - 1 = 0xFFFF_FFFF` (`2^64 ≡ EPS (mod P_G)`).
+pub const GOLDILOCKS_EPS: u64 = 0xFFFF_FFFFu64;
+
+/// Transcript header domain tag mask (`0xFF`).
+pub const CODEC_TAG_MASK: u64 = 0xFFu64;
+
+/// Canonical protocol version identifier (`v3 = 3`).
+pub const CODEC_VERSION_V3: u64 = 3u64;
+
+/// Default L2 batch sequencer domain tag (`0x5A = 90`).
+pub const SEQUENCER_DOMAIN_TAG: u64 = 0x5Au64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn babybear_and_goldilocks_radix_identities() {
+        assert_eq!(LIMB_BASE, 1u64 << 32u64);
+        assert_eq!(LOW32_MASK, LIMB_BASE - 1u64);
+        assert_eq!(GOLDILOCKS_P.wrapping_add(GOLDILOCKS_EPS), 0u64);
+        assert_eq!(MG10_DIVISOR, (1u64 << 15u64) + 3u64);
+    }
+
+    #[test]
+    fn swar_mask_lane_alignment() {
+        assert_eq!(L8_MASK * 255u64, u64::MAX);
+        assert_eq!(L8_MASK << 7u64, H8_MASK);
+        assert_eq!(M16_MASK | (M16_MASK << 8u64), u64::MAX);
+        assert_eq!(L16_MASK * 65_535u64, u64::MAX);
+    }
+}
+=== challenge/src/fee_schedule.rs
+//! Protocol basis-point settlement fee and tier rebate schedule calculator.
+//!
+//! Given a 65-bit combined notional `sum = add_u64_with_carry(amount, fee)`:
+//! 1. The gross settlement fee is the ceiling basis-point quotient
+//!    `gross_fee = ceil((amount + fee) / BPS_DENOM)` (`BPS_DENOM = 10_000`).
+//! 2. The tier rebate is the floor 10% discount
+//!    `rebate = floor(gross_fee / REBATE_DIVISOR)` (`REBATE_DIVISOR = 10`).
+//! 3. The net protocol settlement fee is `net_fee = gross_fee - rebate`.
+
+use crate::constants::*;
+use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64, is_institutional_notional};
+
+/// Active protocol fee schedule parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSchedule {
+    pub bps_denom: u64,
+    pub rebate_divisor: u64,
+    pub maker_cap_divisor: u64,
+}
+
+/// Complete two-stage fee quote (`gross_fee`, `rebate`, `net_fee`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeQuote {
+    pub gross_fee: u64,
+    pub rebate: u64,
+    pub net_fee: u64,
+}
+
+/// Returns the canonical protocol fee schedule configuration.
+#[inline]
+pub fn default_schedule() -> FeeSchedule {
+    FeeSchedule {
+        bps_denom: BPS_DENOM,
+        rebate_divisor: REBATE_DIVISOR,
+        maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+    }
+}
+
+/// Computes the 10% floor tier rebate `floor(gross_fee / REBATE_DIVISOR)`.
+#[inline]
+pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+    gross_fee / REBATE_DIVISOR
+}
+
+/// Computes a capped passive maker rebate `min(floor(gross_fee / 10), floor(cap_basis / 5))`
+/// used by order-book analytics.
+#[inline]
+pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+    let base_rebate: u64 = gross_fee / REBATE_DIVISOR;
+    let max_rebate: u64 = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+    if base_rebate <= max_rebate {
+        base_rebate
+    } else {
+        max_rebate
+    }
+}
+
+/// Evaluates the active clearing protocol fee quote (`gross_fee`, `rebate`, `net_fee`)
+/// from a 65-bit notional sum `sum = amount + fee` using ceiling basis-point division
+/// and floor tier rebate.
+#[inline]
+pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = ceil_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Evaluates a passive liquidity floor fee quote (`floor((amount + fee) / 10_000)`)
+/// for pool reserve telemetry.
+#[inline]
+pub fn evaluate_passive_floor_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = floor_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Computes the rounding spread (`ceil_quote.net_fee - floor_quote.net_fee`)
+/// between active ceiling settlement and passive floor settlement.
+#[inline]
+pub fn compute_fee_rounding_spread(sum: WordSum) -> u64 {
+    let ceil_q: FeeQuote = evaluate_settlement_fee(sum);
+    let floor_q: FeeQuote = evaluate_passive_floor_fee(sum);
+    ceil_q.net_fee - floor_q.net_fee
+}
+
+/// Classifies the fee tier code (`0 = zero`, `1 = retail`, `2 = institutional`)
+/// for batch telemetry reporting.
+#[inline]
+pub fn classify_settlement_tier(sum: WordSum) -> u64 {
+    if !sum.high_carry && sum.low_word == 0u64 {
+        0u64
+    } else if is_institutional_notional(sum) {
+        2u64
+    } else {
+        1u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::word_math::add_u64_with_carry;
+
+    #[test]
+    fn settlement_fee_and_rebate_rounding() {
+        let s = add_u64_with_carry(100_000u64, 25_000u64);
+        let q = evaluate_settlement_fee(s);
+        assert_eq!(q.gross_fee, 13u64);
+        assert_eq!(q.rebate, 1u64);
+        assert_eq!(q.net_fee, 12u64);
+
+        let pf = evaluate_passive_floor_fee(s);
+        assert_eq!(pf.gross_fee, 12u64);
+        assert_eq!(pf.rebate, 1u64);
+        assert_eq!(pf.net_fee, 11u64);
+        assert_eq!(compute_fee_rounding_spread(s), 1u64);
+    }
+
+    #[test]
+    fn capped_maker_rebate_and_default_schedule() {
+        let sched = default_schedule();
+        assert_eq!(sched.bps_denom, 10_000u64);
+        assert_eq!(compute_capped_maker_rebate(100u64, 30u64), 6u64);
+        assert_eq!(compute_capped_maker_rebate(100u64, 100u64), 10u64);
+    }
+
+    #[test]
+    fn settlement_tier_classification() {
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(0u64, 0u64)), 0u64);
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(50_000u64, 100u64)), 1u64);
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(INSTITUTIONAL_BAND_MIN, 0u64)), 2u64);
+    }
+}
+=== challenge/src/goldilocks_field.rs
+//! `recmo/goldilocks` 128-bit prime field reduction (`P_G = 2^64 - 2^32 + 1`)
+//! for cross-chain L1 bridge verification fee quotes.
+//!
+//! Because `2^64 ≡ 2^32 - 1 = EPS (mod P_G)`, a 128-bit integer `x_lo + x_hi * 2^64`
+//! is reduced modulo `P_G` in pure `u64` arithmetic by splitting `x_hi` into its
+//! high 32-bit limb `x_hi_hi = x_hi >> 32` and low 32-bit limb `x_hi_lo = x_hi & EPS`:
+//! 1. Subtract `x_hi_hi` from `x_lo` (compensating by `-EPS` on borrow).
+//! 2. Add `x_hi_lo * EPS` (compensating by `+EPS` on 64-bit carry).
+//! 3. Canonicalize into `[0, P_G - 1]` by subtracting `P_G` if `r >= P_G`.
+
+use crate::constants::*;
+
+/// Bridge verifier fee quote produced by Goldilocks 128-bit reduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoldilocksQuote {
+    pub folded_low: u64,
+    pub canonical_residue: u64,
+    pub bridge_fee: u64,
+}
+
+/// Performs the first Goldilocks folding step `x_lo - (x_hi >> 32) mod 2^64`,
+/// returning `(r0, borrow)`.
+#[inline]
+pub fn reduce_goldilocks_step1(x_lo: u64, x_hi: u64) -> (u64, bool) {
+    let x_hi_hi: u64 = x_hi >> 32u64;
+    x_lo.overflowing_sub(x_hi_hi)
+}
+
+/// Reduces a 128-bit value `(x_lo, x_hi)` modulo the Goldilocks prime
+/// `GOLDILOCKS_P = 0xFFFF_FFFF_0000_0001` in pure `u64` arithmetic.
+#[inline]
+pub fn reduce_goldilocks_128(x_lo: u64, x_hi: u64) -> u64 {
+    let x_hi_lo: u64 = x_hi & GOLDILOCKS_EPS;
+    let (t0, borrow): (u64, bool) = reduce_goldilocks_step1(x_lo, x_hi);
+    let t1: u64 = if borrow {
+        t0.wrapping_sub(GOLDILOCKS_EPS)
+    } else {
+        t0
+    };
+    let prod: u64 = x_hi_lo * GOLDILOCKS_EPS;
+    let (t2, carry): (u64, bool) = t1.overflowing_add(prod);
+    let t3: u64 = if carry {
+        t2.wrapping_add(GOLDILOCKS_EPS)
+    } else {
+        t2
+    };
+    if t3 >= GOLDILOCKS_P {
+        t3 - GOLDILOCKS_P
+    } else {
+        t3
+    }
+}
+
+/// Canonicalizes a single 64-bit word `x` modulo `GOLDILOCKS_P`.
+#[inline]
+pub fn canonicalize_goldilocks_u64(x: u64) -> u64 {
+    if x >= GOLDILOCKS_P {
+        x - GOLDILOCKS_P
+    } else {
+        x
+    }
+}
+
+/// Canonical modular addition `(a + b) mod GOLDILOCKS_P` for `a, b < GOLDILOCKS_P`.
+#[inline]
+pub fn add_goldilocks_mod(a: u64, b: u64) -> u64 {
+    reduce_goldilocks_128(a.wrapping_add(b), if a.wrapping_add(b) < a { 1u64 } else { 0u64 })
+}
+
+/// Canonical modular subtraction `(a - b) mod GOLDILOCKS_P` for `a, b < GOLDILOCKS_P`.
+#[inline]
+pub fn sub_goldilocks_mod(a: u64, b: u64) -> u64 {
+    let ca: u64 = canonicalize_goldilocks_u64(a);
+    let cb: u64 = canonicalize_goldilocks_u64(b);
+    if ca >= cb {
+        ca - cb
+    } else {
+        (GOLDILOCKS_P - cb) + ca
+    }
+}
+
+/// Folds a 64-bit commitment word with a 32-bit challenge scalar in the Goldilocks field.
+#[inline]
+pub fn fold_goldilocks_challenge(commitment: u64, challenge_u32: u64) -> u64 {
+    let scalar: u64 = challenge_u32 & LOW32_MASK;
+    let lo_limb: u64 = commitment & LOW32_MASK;
+    let hi_limb: u64 = commitment >> 32u64;
+    let prod_lo: u64 = lo_limb * scalar;
+    let prod_hi: u64 = hi_limb * scalar;
+    let x_lo: u64 = prod_lo.wrapping_add(prod_hi << 32u64);
+    let carry: u64 = if x_lo < prod_lo { 1u64 } else { 0u64 };
+    let x_hi: u64 = (prod_hi >> 32u64) + carry;
+    reduce_goldilocks_128(x_lo, x_hi)
+}
+
+/// Quotes a cross-chain bridge verifier fee from `(amount, fee)` in the Goldilocks field.
+#[inline]
+pub fn quote_bridge_verifier_fee(amount: u64, fee: u64) -> GoldilocksQuote {
+    let (folded_low, _borrow): (u64, bool) = reduce_goldilocks_step1(amount, fee);
+    let canonical_residue: u64 = reduce_goldilocks_128(amount, fee);
+    let bridge_fee: u64 = (amount >> 32u64) + (canonical_residue & LOW32_MASK);
+    GoldilocksQuote {
+        folded_low,
+        canonical_residue,
+        bridge_fee,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goldilocks_canonicalization_at_modulus_boundary() {
+        assert_eq!(reduce_goldilocks_128(0u64, 0u64), 0u64);
+        assert_eq!(reduce_goldilocks_128(GOLDILOCKS_P, 0u64), 0u64);
+        assert_eq!(reduce_goldilocks_128(0u64, 1u64), GOLDILOCKS_EPS);
+        assert_eq!(reduce_goldilocks_128(0u64, 4_294_967_296u64), GOLDILOCKS_P - 1u64);
+        assert_eq!(reduce_goldilocks_128(1u64, 4_294_967_296u64), 0u64);
+        assert_eq!(canonicalize_goldilocks_u64(GOLDILOCKS_P + 5u64), 5u64);
+    }
+
+    #[test]
+    fn goldilocks_bridge_quote_and_modular_add_sub() {
+        let q = quote_bridge_verifier_fee(100u64, 0u64);
+        assert_eq!(q.canonical_residue, 100u64);
+        assert_eq!(add_goldilocks_mod(GOLDILOCKS_P - 1u64, 1u64), 0u64);
+        assert_eq!(add_goldilocks_mod(GOLDILOCKS_P - 10u64, 25u64), 15u64);
+        assert_eq!(sub_goldilocks_mod(10u64, 25u64), GOLDILOCKS_P - 15u64);
+    }
+
+    #[test]
+    fn goldilocks_challenge_folding_matches_128_reduction() {
+        let c = fold_goldilocks_challenge(0x1_0000_0002u64, 3u64);
+        assert_eq!(c, 0x3_0000_0006u64);
+    }
+}
+=== challenge/src/lib.rs
+//! Zero-Knowledge Rollup Batch Settlement & Clearing Engine (`zk_clearing_engine`).
+//!
+//! This crate implements the pre-settlement clearing gate for rollup batch transfers.
+//! All production paths execute strictly in 64-bit word arithmetic (`u64` and `bool`,
+//! without `u128` casts) so that clearing verification aligns with 64-bit VM word
+//! execution and formal bit-level models.
+//!
+//! ### Clearing Protocol Contract
+//! Given an account `balance`, transfer `amount` (principal), and `fee` parameter word
+//! (each a `u64`), the clearing pipeline (`clearing_pipeline::quote_clearing_ticket`)
+//! computes the exact mathematical settlement debit as the sum of `amount` and four
+//! protocol surcharge components evaluated in unbounded integer arithmetic:
+//!
+//! 1. **Protocol Settlement Fee (`word_math`, `fee_schedule`):**
+//!    The combined notional `amount + fee` is divided by the basis-point denominator
+//!    (`constants::BPS_DENOM`), rounded up to the ceiling integer, and reduced by the
+//!    floor tier rebate (`constants::REBATE_DIVISOR`).
+//! 2. **L1 Blob Gas Slot Quotient (`reciprocal_div`):**
+//!    The two-limb normalized dividend formed by high limb `fee mod MG10_DIVISOR` and
+//!    low 16-bit limb `amount mod 2^16` is divided by `constants::MG10_DIVISOR`,
+//!    rounded down.
+//! 3. **Calldata Byte-Lane Surcharge (`broadword_swar`):**
+//!    Across the 8 byte lanes of `fee`, each non-zero byte lane incurs the fixed
+//!    activation surcharge (`1 << constants::CALLDATA_NZ_BYTE_SHIFT`) plus the numeric
+//!    value of each byte lane.
+//! 4. **Prover Transcript Montgomery Levy (`montgomery_field`):**
+//!    The 64-bit transcript state packed from `amount mod LIMB_BASE` and
+//!    `(fee mod BABYBEAR_P) * LIMB_BASE` is reduced modulo `constants::BABYBEAR_P` via
+//!    canonical 32-bit Montgomery reduction (`montgomery_field::monty_reduce`).
+//!
+//! A clearing request must be authorized (`Some(Authorization { total_debit })`) if and
+//! only if the exact mathematical `total_debit` is at most `balance`, and rejected
+//! (`None`) whenever `total_debit > balance`.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod constants;
+pub mod word_math;
+pub mod reciprocal_div;
+pub mod broadword_swar;
+pub mod montgomery_field;
+pub mod goldilocks_field;
+pub mod fee_schedule;
+pub mod liquidity_pool;
+pub mod transcript_codec;
+pub mod clearing_pipeline;
+
+/// Authorizes a rollup batch clearing request `(balance, amount, fee)` if and only if
+/// the exact multi-stage clearing debit does not exceed `balance`.
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let ticket: clearing_pipeline::ClearingTicket =
+        clearing_pipeline::quote_clearing_ticket(amount, fee)?;
+    clearing_pipeline::commit_clearing_ticket(balance, ticket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_zero_transfer() {
+        assert_eq!(authorize(0u64, 0u64, 0u64), Some(Authorization { total_debit: 0u64 }));
+    }
+
+    #[test]
+    fn authorize_single_fee_unit_exact_boundary() {
+        assert_eq!(authorize(260u64, 0u64, 1u64), Some(Authorization { total_debit: 260u64 }));
+        assert_eq!(authorize(259u64, 0u64, 1u64), None);
+    }
+
+    #[test]
+    fn authorize_ordinary_commercial_transfers() {
+        let cases: [(u64, u64, u64); 6] = [
+            (100_000u64, 25_000u64, 2_013_394_831u64),
+            (32_771u64, 10u64, 817_906_990u64),
+            (1_000_000_000u64, 0x8080_8080_8080_8080u64, 833_361_442_500_589u64),
+            (4_294_967_297u64, 1_069_547_520u64, 6_308_717_576u64),
+            (65_535u64, 16_384u64, 1_069_631_816u64),
+            (65_534u64, 21_845u64, 125_930_159u64),
+        ];
+        for (amount, fee, expected) in cases {
+            assert_eq!(
+                authorize(expected, amount, fee),
+                Some(Authorization { total_debit: expected })
+            );
+            assert_eq!(authorize(expected - 1u64, amount, fee), None);
+        }
+    }
+
+    #[test]
+    fn authorize_wide_carry_folding_at_u64_max() {
+        let cases: [(u64, u64, u64); 3] = [
+            (0u64, u64::MAX, 1_660_208_138_808_700u64),
+            (10_000u64, u64::MAX, 1_660_207_132_181_054u64),
+            (1_000_000u64, u64::MAX - 500u64, 1_660_208_139_338_296u64),
+        ];
+        for (amount, fee, expected) in cases {
+            assert_eq!(
+                authorize(expected, amount, fee),
+                Some(Authorization { total_debit: expected })
+            );
+            assert_eq!(authorize(expected - 1u64, amount, fee), None);
+        }
+    }
+
+    #[test]
+    fn authorize_rejects_total_debit_overflow() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 0u64), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX - 100u64, 1_000_000u64), None);
+    }
+}
+=== challenge/src/liquidity_pool.rs
+//! Concentrated-liquidity reserve accounting, protocol treasury split, and
+//! flash-settlement repayment calculators.
+
+use crate::constants::*;
+use crate::fee_schedule::FeeQuote;
+use crate::word_math::{add_u64_with_carry, ceil_div_flash_u64, floor_div_flash_u64};
+
+/// Breakdown of protocol net fee between treasury reserve and liquidity providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolReserveQuote {
+    pub treasury_cut: u64,
+    pub lp_retention: u64,
+}
+
+/// Repayment receipt for an atomic flash-liquidity draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashLoanReceipt {
+    pub principal: u64,
+    pub flash_levy: u64,
+    pub total_repayment: u64,
+}
+
+/// Splits `quote.net_fee` between the protocol treasury (`floor(net_fee / 4)`)
+/// and liquidity providers (`net_fee - treasury_cut`).
+#[inline]
+pub fn split_pool_reserve(quote: FeeQuote) -> PoolReserveQuote {
+    let treasury_cut: u64 = quote.net_fee / TREASURY_CUT_DIVISOR;
+    let lp_retention: u64 = quote.net_fee - treasury_cut;
+    PoolReserveQuote {
+        treasury_cut,
+        lp_retention,
+    }
+}
+
+/// Returns the liquidity-provider retention share from a `FeeQuote`.
+#[inline]
+pub fn quote_lp_retention(quote: FeeQuote) -> u64 {
+    let split: PoolReserveQuote = split_pool_reserve(quote);
+    split.lp_retention
+}
+
+/// Computes the ceiling flash-settlement levy `ceil((principal + surcharge) / 5_000)`
+/// in pure `u64` arithmetic.
+#[inline]
+pub fn assess_flash_fee_ceil(principal: u64, surcharge: u64) -> u64 {
+    let sum = add_u64_with_carry(principal, surcharge);
+    ceil_div_flash_u64(sum)
+}
+
+/// Computes the floor flash-settlement levy `floor((principal + surcharge) / 5_000)`
+/// in pure `u64` arithmetic.
+#[inline]
+pub fn assess_flash_fee_floor(principal: u64, surcharge: u64) -> u64 {
+    let sum = add_u64_with_carry(principal, surcharge);
+    floor_div_flash_u64(sum)
+}
+
+/// Quotes a complete flash-loan repayment receipt if `principal + flash_levy` fits in `u64`.
+#[inline]
+pub fn quote_flash_repayment(principal: u64, surcharge: u64) -> Option<FlashLoanReceipt> {
+    let flash_levy: u64 = assess_flash_fee_ceil(principal, surcharge);
+    let total_repayment: u64 = principal.checked_add(flash_levy)?;
+    Some(FlashLoanReceipt {
+        principal,
+        flash_levy,
+        total_repayment,
+    })
+}
+
+/// Verifies whether a pool reserve after crediting `lp_retention` satisfies a target
+/// solvency floor `min_reserve`.
+#[inline]
+pub fn check_pool_reserve_solvency(current_reserve: u64, quote: FeeQuote, min_reserve: u64) -> bool {
+    let lp_share: u64 = quote_lp_retention(quote);
+    match current_reserve.checked_add(lp_share) {
+        Some(updated) => updated >= min_reserve,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fee_schedule::evaluate_settlement_fee;
+
+    #[test]
+    fn reserve_split_conserves_net_fee() {
+        let sum = add_u64_with_carry(500_000u64, 50_000u64);
+        let q = evaluate_settlement_fee(sum);
+        let split = split_pool_reserve(q);
+        assert_eq!(split.treasury_cut + split.lp_retention, q.net_fee);
+        assert_eq!(quote_lp_retention(q), split.lp_retention);
+        assert!(check_pool_reserve_solvency(1_000u64, q, 1_030u64));
+    }
+
+    #[test]
+    fn flash_repayment_receipt_and_overflow_guard() {
+        let r = quote_flash_repayment(100_000u64, 1u64).unwrap();
+        assert_eq!(r.flash_levy, 21u64);
+        assert_eq!(r.total_repayment, 100_021u64);
+        assert_eq!(assess_flash_fee_floor(100_000u64, 1u64), 20u64);
+        assert_eq!(quote_flash_repayment(u64::MAX, 1u64), None);
+    }
+}
+=== challenge/src/montgomery_field.rs
+//! `Plonky3` BabyBear (`P = 2_013_265_921 = 2^31 - 2^27 + 1`) 64-bit Montgomery
+//! reduction and STARK prover transcript commitment levy calculator.
+//!
+//! For radix `R = 2^32 = 4_294_967_296` and prime `P = 2_013_265_921`:
+//! - `R^{-1} mod P = 943_718_400`
+//! - `MU = -P^{-1} mod R = 2_281_701_377`
+//! Given a 64-bit packed transcript state `x < P * R`:
+//! 1. `t = ((x mod R) * MU) mod R`
+//! 2. `u = t * P` (so `x - u` is an exact multiple of `R = 2^32` in `(-P * R, P * R)`)
+//! 3. If `x < u`, `(x - u) / R + P` is computed in `u64` via
+//!    `P + (x.wrapping_sub(u) / R) - R`; otherwise `(x - u) / R`.
+//! The result equals `(x * R^{-1}) mod P` in `[0, P - 1]`.
+
+use crate::constants::*;
+
+/// Captures the packed 64-bit transcript state, Montgomery quotient limb `t`,
+/// and canonical BabyBear field element `prover_levy in [0, BABYBEAR_P - 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProverLevyQuote {
+    pub packed_transcript: u64,
+    pub monty_t: u64,
+    pub prover_levy: u64,
+}
+
+/// Packs the low 32-bit limb of `amount` (`amount mod 2^32`) and the canonical
+/// BabyBear residue of `fee` (`fee mod P`) into a 64-bit transcript integer
+/// `x = (amount % 2^32) + (fee % P) * 2^32 < P * 2^32`.
+#[inline]
+pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+    (amount % LIMB_BASE) + (fee % BABYBEAR_P) * LIMB_BASE
+}
+
+/// Computes the 32-bit Montgomery reduction multiplier `t = ((x mod 2^32) * MU) mod 2^32`.
+#[inline]
+pub fn monty_quotient(x: u64) -> u64 {
+    ((x % LIMB_BASE) * BABYBEAR_MU) % LIMB_BASE
+}
+
+/// Performs 64-bit BabyBear Montgomery reduction on `x < BABYBEAR_P * 2^32`,
+/// returning `(x * 943_718_400) mod 2_013_265_921` in pure `u64` arithmetic.
+#[inline]
+pub fn monty_reduce(x: u64) -> u64 {
+    let t: u64 = monty_quotient(x);
+    let u: u64 = BABYBEAR_P * t;
+    let diff: u64 = x.wrapping_sub(u);
+    let hi: u64 = diff / LIMB_BASE;
+    if x < u {
+        BABYBEAR_P + hi - LIMB_BASE
+    } else {
+        hi
+    }
+}
+
+/// Performs Montgomery multiplication `(a * b * R^{-1}) mod BABYBEAR_P`
+/// for two BabyBear field elements `a, b < BABYBEAR_P`.
+#[inline]
+pub fn monty_mul_babybear(a: u64, b: u64) -> u64 {
+    let prod: u64 = (a % BABYBEAR_P) * (b % BABYBEAR_P);
+    monty_reduce(prod)
+}
+
+/// Canonical modular addition `(a + b) mod BABYBEAR_P` for `a, b < BABYBEAR_P`.
+#[inline]
+pub fn canonical_add_babybear(a: u64, b: u64) -> u64 {
+    let sum: u64 = a + b;
+    if sum >= BABYBEAR_P {
+        sum - BABYBEAR_P
+    } else {
+        sum
+    }
+}
+
+/// Canonical modular subtraction `(a - b) mod BABYBEAR_P` for `a, b < BABYBEAR_P`.
+#[inline]
+pub fn canonical_sub_babybear(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        (a + BABYBEAR_P) - b
+    }
+}
+
+/// Quotes the STARK prover transcript commitment levy for `(amount, fee)`:
+/// `prover_levy = monty_reduce(pack_transcript(amount, fee))`.
+#[inline]
+pub fn quote_prover_transcript_levy(amount: u64, fee: u64) -> ProverLevyQuote {
+    let packed_transcript: u64 = pack_transcript(amount, fee);
+    let monty_t: u64 = monty_quotient(packed_transcript);
+    let prover_levy: u64 = monty_reduce(packed_transcript);
+    ProverLevyQuote {
+        packed_transcript,
+        monty_t,
+        prover_levy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monty_reduce_zero_and_multiples_of_p() {
+        assert_eq!(monty_reduce(0u64), 0u64);
+        assert_eq!(monty_reduce(BABYBEAR_P), 0u64);
+        assert_eq!(monty_reduce(BABYBEAR_P * 42u64), 0u64);
+    }
+
+    #[test]
+    fn monty_reduce_radix_r_gives_one() {
+        assert_eq!(monty_reduce(LIMB_BASE), 1u64);
+        let q = quote_prover_transcript_levy(0u64, 1u64);
+        assert_eq!(q.prover_levy, 1u64);
+    }
+
+    #[test]
+    fn monty_reduce_underflow_branch_and_non_underflow_branch() {
+        let q_under = quote_prover_transcript_levy(1u64, 0u64);
+        assert_eq!(q_under.prover_levy, 943_718_400u64);
+
+        assert_eq!(monty_reduce(BABYBEAR_P), 0u64);
+
+        let q_high = quote_prover_transcript_levy(u64::MAX, BABYBEAR_P - 1u64);
+        assert_eq!(q_high.prover_levy, 1_069_547_521u64);
+    }
+
+    #[test]
+    fn canonical_babybear_ring_operations() {
+        assert_eq!(canonical_add_babybear(BABYBEAR_P - 1u64, 2u64), 1u64);
+        assert_eq!(canonical_sub_babybear(1u64, 2u64), BABYBEAR_P - 1u64);
+        let r_mod_p: u64 = LIMB_BASE % BABYBEAR_P;
+        assert_eq!(monty_mul_babybear(17u64, r_mod_p), 17u64);
+    }
+}
+=== challenge/src/reciprocal_div.rs
+//! Multiprecision 2-by-1 normalized reciprocal division (`alloy-rs/ruint` algorithm)
+//! for L1 data-availability blob gas slot partitioning.
+//!
+//! Given a normalized 16-bit divisor `D = MG10_DIVISOR = 0x8003 = 32_771` (`2^15 + 3`)
+//! with precomputed reciprocal `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65_524`,
+//! `div_2x1_mg10(u1, u0)` computes the exact floor quotient
+//! `floor((u1 * 2^16 + u0) / D)` for all `u1 < D` and `u0 < 2^16` using only
+//! shifts, bitwise masks, and `u64` multiplications (without hardware `/` or `%`
+//! in the core reciprocal step).
+
+use crate::constants::*;
+use crate::word_math::extract_low_u16;
+
+/// Captures the two-limb blob gas dividend `(high_limb, low_limb)` and its
+/// exact Euclidean division decomposition `high_limb * 2^16 + low_limb = D * slot_quotient + slot_remainder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobSlotQuote {
+    pub high_limb: u64,
+    pub low_limb: u64,
+    pub slot_quotient: u64,
+    pub slot_remainder: u64,
+}
+
+/// Möller-Granlund 2-by-1 normalized reciprocal division (`div_2x1_mg10`)
+/// for divisor `MG10_DIVISOR = 0x8003 = 32_771` and reciprocal `MG10_RECIPROCAL = 0xFFF4 = 65_524`.
+///
+/// Preconditions guaranteed by caller: `u1 < MG10_DIVISOR` and `u0 < 2^16`.
+/// Returns the exact integer quotient `floor((u1 * 65_536 + u0) / 32_771)`.
+#[inline]
+pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+    let q_full: u64 = (u1 * MG10_RECIPROCAL) + (u1 << 16u64) + u0 + (1u64 << 16u64);
+
+    let q1: u64 = q_full >> 16u64;
+    let q0: u64 = q_full & LIMB_MASK;
+    let r: u64 = (SUB_BIAS + u0 - q1 * MG10_DIVISOR) & LIMB_MASK;
+
+    let (q_corr, r_corr): (u64, u64) = if q0 < r {
+        (q1 - 1u64, (r + MG10_DIVISOR) & LIMB_MASK)
+    } else {
+        (q1, r)
+    };
+
+    if r_corr >= MG10_DIVISOR {
+        q_corr + 1u64
+    } else {
+        q_corr
+    }
+}
+
+/// Reconstructs the exact remainder `(u1 * 2^16 + u0) - quot * MG10_DIVISOR`
+/// from a computed quotient `quot = floor((u1 * 2^16 + u0) / MG10_DIVISOR)`.
+#[inline]
+pub fn rem_2x1_mg10(u1: u64, u0: u64, quot: u64) -> u64 {
+    let dividend: u64 = (u1 << 16u64) + u0;
+    dividend - (quot * MG10_DIVISOR)
+}
+
+/// Computes the L1 blob gas slot quotient and remainder for a settlement pair `(amount, fee)`:
+/// - `high_limb = fee % MG10_DIVISOR` (`u1 in [0, 32_770]`)
+/// - `low_limb = amount & 0xFFFF` (`u0 in [0, 65_535]`)
+/// - `slot_quotient = floor((high_limb * 65_536 + low_limb) / 32_771)`
+/// - `slot_remainder = (high_limb * 65_536 + low_limb) % 32_771`
+#[inline]
+pub fn quote_blob_gas_slots(amount: u64, fee: u64) -> BlobSlotQuote {
+    let high_limb: u64 = fee % MG10_DIVISOR;
+    let low_limb: u64 = extract_low_u16(amount);
+    let slot_quotient: u64 = div_2x1_mg10(high_limb, low_limb);
+    let slot_remainder: u64 = rem_2x1_mg10(high_limb, low_limb, slot_quotient);
+    BlobSlotQuote {
+        high_limb,
+        low_limb,
+        slot_quotient,
+        slot_remainder,
+    }
+}
+
+/// Verifies the Euclidean division invariant `0 <= slot_remainder < MG10_DIVISOR`
+/// and `slot_quotient * MG10_DIVISOR + slot_remainder == high_limb * 2^16 + low_limb`
+/// for diagnostic auditing.
+#[inline]
+pub fn verify_blob_slot_euclidean(quote: BlobSlotQuote) -> bool {
+    let dividend: u64 = (quote.high_limb << 16u64) + quote.low_limb;
+    let reconstructed: u64 = (quote.slot_quotient * MG10_DIVISOR) + quote.slot_remainder;
+    (quote.slot_remainder < MG10_DIVISOR) && (reconstructed == dividend)
+}
+
+/// Estimates raw L1 blob gas units `slot_quotient * BLOB_GAS_PER_SLOT` for telemetry.
+#[inline]
+pub fn estimate_blob_gas_units(quote: BlobSlotQuote) -> u64 {
+    quote.slot_quotient * BLOB_GAS_PER_SLOT
+}
+
+/// Computes the ceiling blob slot count `slot_quotient + (if slot_remainder > 0 { 1 } else { 0 })`
+/// for batch reservation telemetry.
+#[inline]
+pub fn ceil_blob_slots(quote: BlobSlotQuote) -> u64 {
+    if quote.slot_remainder > 0u64 {
+        quote.slot_quotient + 1u64
+    } else {
+        quote.slot_quotient
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mg10_zero_and_exact_multiples() {
+        assert_eq!(div_2x1_mg10(0u64, 0u64), 0u64);
+        assert_eq!(div_2x1_mg10(0u64, 32_770u64), 0u64);
+        assert_eq!(div_2x1_mg10(0u64, 32_771u64), 1u64);
+        assert_eq!(div_2x1_mg10(1u64, 0u64), 1u64);
+        assert_eq!(div_2x1_mg10(10u64, 32_771u64), 20u64);
+    }
+
+    #[test]
+    fn mg10_exhaustive_boundary_sweeps() {
+        for u1 in [0u64, 1u64, 2u64, 16_384u64, 21_845u64, 32_769u64, 32_770u64] {
+            for u0 in [0u64, 1u64, 2u64, 32_770u64, 32_771u64, 32_772u64, 65_534u64, 65_535u64] {
+                let expected: u64 = ((u1 << 16u64) + u0) / MG10_DIVISOR;
+                let actual: u64 = div_2x1_mg10(u1, u0);
+                assert_eq!(actual, expected, "mismatch at u1={}, u0={}", u1, u0);
+            }
+        }
+    }
+
+    #[test]
+    fn mg10_second_correction_branch_is_exact() {
+        let q_a = quote_blob_gas_slots(65_535u64, 16_384u64);
+        assert!(verify_blob_slot_euclidean(q_a));
+        assert_eq!(q_a.slot_quotient, 32_767u64);
+        assert_eq!(ceil_blob_slots(q_a), 32_768u64);
+
+        let q_b = quote_blob_gas_slots(65_534u64, 21_845u64);
+        assert!(verify_blob_slot_euclidean(q_b));
+        assert_eq!(q_b.slot_quotient, 43_688u64);
+    }
+
+    #[test]
+    fn blob_gas_unit_telemetry() {
+        let q = quote_blob_gas_slots(32_771u64, 0u64);
+        assert_eq!(q.slot_quotient, 1u64);
+        assert_eq!(q.slot_remainder, 0u64);
+        assert_eq!(ceil_blob_slots(q), 1u64);
+        assert_eq!(estimate_blob_gas_units(q), BLOB_GAS_PER_SLOT);
+    }
+
+    #[test]
+    fn mg10_maximum_two_limb_dividend() {
+        let q_max = quote_blob_gas_slots(65_535u64, 32_770u64);
+        assert!(verify_blob_slot_euclidean(q_max));
+        assert_eq!(q_max.slot_quotient, 65_535u64);
+        assert_eq!(q_max.slot_remainder, 32_770u64);
+    }
+}
+=== challenge/src/transcript_codec.rs
+//! Rollup batch transcript framing and header digest helpers for sequencer telemetry.
+
+use crate::constants::*;
+use crate::word_math::{extract_high_u32, extract_low_u32};
+
+/// Framed batch transcript header metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptHeader {
+    pub version: u64,
+    pub domain_tag: u64,
+    pub payload_low32: u64,
+    pub checksum_word: u64,
+}
+
+/// Extracts the 8-bit domain tag from a parameter word, defaulting to
+/// `SEQUENCER_DOMAIN_TAG` when the low byte is zero.
+#[inline]
+pub fn decode_domain_tag(word: u64) -> u64 {
+    let raw_tag: u64 = word & CODEC_TAG_MASK;
+    if raw_tag == 0u64 {
+        SEQUENCER_DOMAIN_TAG
+    } else {
+        raw_tag
+    }
+}
+
+/// Builds a framed `TranscriptHeader` from `(amount, fee)` for batch indexing.
+#[inline]
+pub fn build_transcript_header(amount: u64, fee: u64) -> TranscriptHeader {
+    let version: u64 = CODEC_VERSION_V3;
+    let domain_tag: u64 = decode_domain_tag(fee);
+    let payload_low32: u64 = extract_low_u32(amount);
+    let hi_fee: u64 = extract_high_u32(fee);
+    let checksum_word: u64 = (payload_low32 ^ hi_fee) + (domain_tag << 8u64) + version;
+    TranscriptHeader {
+        version,
+        domain_tag,
+        payload_low32,
+        checksum_word,
+    }
+}
+
+/// Checks whether a `TranscriptHeader` carries the canonical v3 version tag.
+#[inline]
+pub fn verify_header_version(header: TranscriptHeader) -> bool {
+    header.version == CODEC_VERSION_V3
+}
+
+/// Folds a `TranscriptHeader` into a 64-bit diagnostic digest word.
+#[inline]
+pub fn fold_header_digest(header: TranscriptHeader) -> u64 {
+    (header.checksum_word & LOW32_MASK) + (header.domain_tag << 32u64)
+}
+
+/// Mixes two `TranscriptHeader` digests for two-leaf Merkle batch telemetry.
+#[inline]
+pub fn mix_batch_header_digests(left: TranscriptHeader, right: TranscriptHeader) -> u64 {
+    let d_left: u64 = fold_header_digest(left);
+    let d_right: u64 = fold_header_digest(right);
+    (d_left ^ (d_right >> 16u64)).wrapping_add(left.domain_tag + right.domain_tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_header_framing_and_digest() {
+        let h = build_transcript_header(0x1111_2222_3333_4444u64, 0u64);
+        assert!(verify_header_version(h));
+        assert_eq!(h.domain_tag, SEQUENCER_DOMAIN_TAG);
+        assert_eq!(h.payload_low32, 0x3333_4444u64);
+        assert!(fold_header_digest(h) > 0u64);
+
+        let h_custom = build_transcript_header(42u64, 0x7Bu64);
+        assert_eq!(h_custom.domain_tag, 0x7Bu64);
+        assert!(mix_batch_header_digests(h, h_custom) > 0u64);
+    }
+}
+=== challenge/src/word_math.rs
+//! 64-bit word carry/borrow tracking and 128-bit carry-folded quotient kernels.
+//!
+//! Because two `u64` inputs `lhs` and `rhs` can sum to `[0, 2 * 2^64 - 2]`,
+//! computing exact floor and ceiling quotients `floor((lhs + rhs) / D)` and
+//! `ceil((lhs + rhs) / D)` without `u128` requires tracking the 1-bit carry flag
+//! across the `2^64` word boundary and folding `2^64 = Q_64 * D + R_64`.
+
+use crate::constants::*;
+
+/// Represents the exact 65-bit sum `low_word + (high_carry as u64) * 2^64`
+/// of two 64-bit unsigned words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordSum {
+    pub low_word: u64,
+    pub high_carry: bool,
+}
+
+/// Represents the 64-bit wrapped difference `lhs.wrapping_sub(rhs)` together
+/// with an explicit underflow borrow indicator (`lhs < rhs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordDiff {
+    pub diff_word: u64,
+    pub underflow_borrow: bool,
+}
+
+/// Adds two `u64` words in 64-bit register arithmetic and captures the 64-bit
+/// overflow carry flag (`low_word < lhs`).
+#[inline]
+pub fn add_u64_with_carry(lhs: u64, rhs: u64) -> WordSum {
+    let low_word: u64 = lhs.wrapping_add(rhs);
+    let high_carry: bool = low_word < lhs;
+    WordSum {
+        low_word,
+        high_carry,
+    }
+}
+
+/// Subtracts `rhs` from `lhs` in 64-bit register arithmetic and captures the
+/// underflow borrow flag (`lhs < rhs`).
+#[inline]
+pub fn sub_u64_with_borrow(lhs: u64, rhs: u64) -> WordDiff {
+    let diff_word: u64 = lhs.wrapping_sub(rhs);
+    let underflow_borrow: bool = lhs < rhs;
+    WordDiff {
+        diff_word,
+        underflow_borrow,
+    }
+}
+
+/// Extracts the low 16-bit limb `word & 0xFFFF` (`word mod 2^16`).
+#[inline]
+pub fn extract_low_u16(word: u64) -> u64 {
+    word & LIMB_MASK
+}
+
+/// Extracts the low 32-bit limb `word & 0xFFFF_FFFF` (`word mod 2^32`).
+#[inline]
+pub fn extract_low_u32(word: u64) -> u64 {
+    word & LOW32_MASK
+}
+
+/// Extracts the high 32-bit limb `word >> 32` (`floor(word / 2^32)`).
+#[inline]
+pub fn extract_high_u32(word: u64) -> u64 {
+    word >> 32u64
+}
+
+/// Recombines a 32-bit low limb and 32-bit high limb into a 64-bit word.
+#[inline]
+pub fn pack_u32_limbs(low_u32: u64, high_u32: u64) -> u64 {
+    (low_u32 & LOW32_MASK) | ((high_u32 & LOW32_MASK) << 32u64)
+}
+
+/// Classifies whether a 65-bit combined notional `sum` meets or exceeds
+/// `INSTITUTIONAL_BAND_MIN`.
+#[inline]
+pub fn is_institutional_notional(sum: WordSum) -> bool {
+    if sum.high_carry {
+        true
+    } else {
+        sum.low_word >= INSTITUTIONAL_BAND_MIN
+    }
+}
+
+/// Computes the exact remainder `(lhs + rhs) mod BPS_DENOM` (`BPS_DENOM = 10_000`)
+/// over the full 65-bit `WordSum` range in pure `u64` arithmetic.
+#[inline]
+pub fn rem_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        ((sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM) % BPS_DENOM
+    } else {
+        sum.low_word % BPS_DENOM
+    }
+}
+
+/// Computes the exact floor quotient `floor((lhs + rhs) / BPS_DENOM)` (`BPS_DENOM = 10_000`)
+/// over the full 65-bit `WordSum` range using pure `u64` carry folding.
+#[inline]
+pub fn floor_div_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + (folded_rem / BPS_DENOM)
+    } else {
+        sum.low_word / BPS_DENOM
+    }
+}
+
+/// Computes the ceiling quotient `ceil((lhs + rhs) / BPS_DENOM)` (`BPS_DENOM = 10_000`),
+/// equivalent in exact integer arithmetic to `floor((lhs + rhs + 9_999) / 10_000)`,
+/// over the full 65-bit `WordSum` range using pure `u64` arithmetic.
+#[inline]
+pub fn ceil_div_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    } else {
+        let biased: u64 = sum.low_word.wrapping_add(BPS_MAX_REM);
+        if biased < sum.low_word {
+            (sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+        } else {
+            biased / BPS_DENOM
+        }
+    }
+}
+
+/// Computes the exact floor quotient `floor((lhs + rhs) / FLASH_DENOM)` (`FLASH_DENOM = 5_000`)
+/// over the full 65-bit `WordSum` range in pure `u64` arithmetic.
+#[inline]
+pub fn floor_div_flash_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % FLASH_DENOM) + U64_MOD_FLASH_REM;
+        U64_MOD_FLASH_QUOT + (sum.low_word / FLASH_DENOM) + (folded_rem / FLASH_DENOM)
+    } else {
+        sum.low_word / FLASH_DENOM
+    }
+}
+
+/// Computes the exact ceiling quotient `ceil((lhs + rhs) / FLASH_DENOM)` (`FLASH_DENOM = 5_000`),
+/// equivalent to `floor((lhs + rhs + 4_999) / 5_000)`, in pure `u64` arithmetic.
+#[inline]
+pub fn ceil_div_flash_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % FLASH_DENOM) + U64_MOD_FLASH_REM;
+        U64_MOD_FLASH_QUOT + (sum.low_word / FLASH_DENOM) + ((folded_rem + FLASH_MAX_REM) / FLASH_DENOM)
+    } else {
+        let biased: u64 = sum.low_word.wrapping_add(FLASH_MAX_REM);
+        if biased < sum.low_word {
+            (sum.low_word / FLASH_DENOM) + (((sum.low_word % FLASH_DENOM) + FLASH_MAX_REM) / FLASH_DENOM)
+        } else {
+            biased / FLASH_DENOM
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_and_sub_carry_borrow_flags() {
+        let s0 = add_u64_with_carry(100u64, 250u64);
+        assert_eq!(s0.low_word, 350u64);
+        assert!(!s0.high_carry);
+
+        let s1 = add_u64_with_carry(u64::MAX, 1u64);
+        assert_eq!(s1.low_word, 0u64);
+        assert!(s1.high_carry);
+
+        let d0 = sub_u64_with_borrow(500u64, 120u64);
+        assert_eq!(d0.diff_word, 380u64);
+        assert!(!d0.underflow_borrow);
+
+        let d1 = sub_u64_with_borrow(10u64, 20u64);
+        assert!(d1.underflow_borrow);
+    }
+
+    #[test]
+    fn limb_extraction_and_packing_roundtrip() {
+        let w: u64 = 0x1234_5678_9ABC_DEF0u64;
+        assert_eq!(extract_low_u16(w), 0xDEF0u64);
+        assert_eq!(extract_low_u32(w), 0x9ABC_DEF0u64);
+        assert_eq!(extract_high_u32(w), 0x1234_5678u64);
+        assert_eq!(pack_u32_limbs(extract_low_u32(w), extract_high_u32(w)), w);
+    }
+
+    #[test]
+    fn bps_floor_and_ceil_at_zero_and_u64_max() {
+        let z = add_u64_with_carry(0u64, 0u64);
+        assert_eq!(floor_div_bps_u64(z), 0u64);
+        assert_eq!(ceil_div_bps_u64(z), 0u64);
+        assert_eq!(rem_bps_u64(z), 0u64);
+
+        let one = add_u64_with_carry(1u64, 0u64);
+        assert_eq!(floor_div_bps_u64(one), 0u64);
+        assert_eq!(ceil_div_bps_u64(one), 1u64);
+        assert_eq!(rem_bps_u64(one), 1u64);
+
+        let at_max = add_u64_with_carry(0u64, u64::MAX);
+        assert_eq!(floor_div_bps_u64(at_max), 1_844_674_407_370_955u64);
+        assert_eq!(ceil_div_bps_u64(at_max), 1_844_674_407_370_956u64);
+        assert_eq!(rem_bps_u64(at_max), 1_615u64);
+    }
+
+    #[test]
+    fn bps_carry_folding_above_u64_max() {
+        let wrapped = add_u64_with_carry(10_000u64, u64::MAX);
+        assert!(wrapped.high_carry);
+        assert_eq!(floor_div_bps_u64(wrapped), 1_844_674_407_370_956u64);
+        assert_eq!(ceil_div_bps_u64(wrapped), 1_844_674_407_370_957u64);
+        assert_eq!(rem_bps_u64(wrapped), 1_615u64);
+
+        let double_max = add_u64_with_carry(u64::MAX, u64::MAX);
+        assert_eq!(floor_div_bps_u64(double_max), 3_689_348_814_741_910u64);
+        assert_eq!(ceil_div_bps_u64(double_max), 3_689_348_814_741_911u64);
+    }
+
+    #[test]
+    fn flash_floor_and_ceil_across_boundaries() {
+        let s = add_u64_with_carry(0u64, u64::MAX - 2_500u64);
+        assert_eq!(ceil_div_flash_u64(s), 3_689_348_814_741_910u64);
+        assert_eq!(floor_div_flash_u64(s), 3_689_348_814_741_909u64);
+
+        let s_hi = add_u64_with_carry(u64::MAX, 5_000u64);
+        assert!(is_institutional_notional(s_hi));
+        assert_eq!(floor_div_flash_u64(s_hi), 3_689_348_814_741_911u64);
+        assert_eq!(ceil_div_flash_u64(s_hi), 3_689_348_814_741_912u64);
+    }
+}
+=== challenge/src/**/*.rs
+cat: 'challenge/src/**/*.rs': No such file or directory
+[?2004hroot@b6a024795075:/workspace# wc -l challenge/src/*.rs lean/LeanModel/*.lean lean/*.lean; cat challenge/src/lib.rs
+[?2004l  147 challenge/src/broadword_swar.rs
+  158 challenge/src/clearing_pipeline.rs
+  128 challenge/src/constants.rs
+  143 challenge/src/fee_schedule.rs
+  137 challenge/src/goldilocks_field.rs
+  115 challenge/src/lib.rs
+  104 challenge/src/liquidity_pool.rs
+  133 challenge/src/montgomery_field.rs
+  156 challenge/src/reciprocal_div.rs
+   79 challenge/src/transcript_codec.rs
+  228 challenge/src/word_math.rs
+   47 lean/LeanModel/BroadwordSwar.lean
+  105 lean/LeanModel/ClearingPipeline.lean
+   44 lean/LeanModel/Constants.lean
+   68 lean/LeanModel/FeeSchedule.lean
+   63 lean/LeanModel/GoldilocksField.lean
+   58 lean/LeanModel/LiquidityPool.lean
+   56 lean/LeanModel/MontgomeryField.lean
+   61 lean/LeanModel/ReciprocalDiv.lean
+   47 lean/LeanModel/TranscriptCodec.lean
+   84 lean/LeanModel/WordMath.lean
+   80 lean/SecurityChallenge.lean
+    5 lean/Signature.lean
+ 2246 total
+//! Zero-Knowledge Rollup Batch Settlement & Clearing Engine (`zk_clearing_engine`).
+//!
+//! This crate implements the pre-settlement clearing gate for rollup batch transfers.
+//! All production paths execute strictly in 64-bit word arithmetic (`u64` and `bool`,
+//! without `u128` casts) so that clearing verification aligns with 64-bit VM word
+//! execution and formal bit-level models.
+//!
+//! ### Clearing Protocol Contract
+//! Given an account `balance`, transfer `amount` (principal), and `fee` parameter word
+//! (each a `u64`), the clearing pipeline (`clearing_pipeline::quote_clearing_ticket`)
+//! computes the exact mathematical settlement debit as the sum of `amount` and four
+//! protocol surcharge components evaluated in unbounded integer arithmetic:
+//!
+//! 1. **Protocol Settlement Fee (`word_math`, `fee_schedule`):**
+//!    The combined notional `amount + fee` is divided by the basis-point denominator
+//!    (`constants::BPS_DENOM`), rounded up to the ceiling integer, and reduced by the
+//!    floor tier rebate (`constants::REBATE_DIVISOR`).
+//! 2. **L1 Blob Gas Slot Quotient (`reciprocal_div`):**
+//!    The two-limb normalized dividend formed by high limb `fee mod MG10_DIVISOR` and
+//!    low 16-bit limb `amount mod 2^16` is divided by `constants::MG10_DIVISOR`,
+//!    rounded down.
+//! 3. **Calldata Byte-Lane Surcharge (`broadword_swar`):**
+//!    Across the 8 byte lanes of `fee`, each non-zero byte lane incurs the fixed
+//!    activation surcharge (`1 << constants::CALLDATA_NZ_BYTE_SHIFT`) plus the numeric
+//!    value of each byte lane.
+//! 4. **Prover Transcript Montgomery Levy (`montgomery_field`):**
+//!    The 64-bit transcript state packed from `amount mod LIMB_BASE` and
+//!    `(fee mod BABYBEAR_P) * LIMB_BASE` is reduced modulo `constants::BABYBEAR_P` via
+//!    canonical 32-bit Montgomery reduction (`montgomery_field::monty_reduce`).
+//!
+//! A clearing request must be authorized (`Some(Authorization { total_debit })`) if and
+//! only if the exact mathematical `total_debit` is at most `balance`, and rejected
+//! (`None`) whenever `total_debit > balance`.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod constants;
+pub mod word_math;
+pub mod reciprocal_div;
+pub mod broadword_swar;
+pub mod montgomery_field;
+pub mod goldilocks_field;
+pub mod fee_schedule;
+pub mod liquidity_pool;
+pub mod transcript_codec;
+pub mod clearing_pipeline;
+
+/// Authorizes a rollup batch clearing request `(balance, amount, fee)` if and only if
+/// the exact multi-stage clearing debit does not exceed `balance`.
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let ticket: clearing_pipeline::ClearingTicket =
+        clearing_pipeline::quote_clearing_ticket(amount, fee)?;
+    clearing_pipeline::commit_clearing_ticket(balance, ticket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_zero_transfer() {
+        assert_eq!(authorize(0u64, 0u64, 0u64), Some(Authorization { total_debit: 0u64 }));
+    }
+
+    #[test]
+    fn authorize_single_fee_unit_exact_boundary() {
+        assert_eq!(authorize(260u64, 0u64, 1u64), Some(Authorization { total_debit: 260u64 }));
+        assert_eq!(authorize(259u64, 0u64, 1u64), None);
+    }
+
+    #[test]
+    fn authorize_ordinary_commercial_transfers() {
+        let cases: [(u64, u64, u64); 6] = [
+            (100_000u64, 25_000u64, 2_013_394_831u64),
+            (32_771u64, 10u64, 817_906_990u64),
+            (1_000_000_000u64, 0x8080_8080_8080_8080u64, 833_361_442_500_589u64),
+            (4_294_967_297u64, 1_069_547_520u64, 6_308_717_576u64),
+            (65_535u64, 16_384u64, 1_069_631_816u64),
+            (65_534u64, 21_845u64, 125_930_159u64),
+        ];
+        for (amount, fee, expected) in cases {
+            assert_eq!(
+                authorize(expected, amount, fee),
+                Some(Authorization { total_debit: expected })
+            );
+            assert_eq!(authorize(expected - 1u64, amount, fee), None);
+        }
+    }
+
+    #[test]
+    fn authorize_wide_carry_folding_at_u64_max() {
+        let cases: [(u64, u64, u64); 3] = [
+            (0u64, u64::MAX, 1_660_208_138_808_700u64),
+            (10_000u64, u64::MAX, 1_660_207_132_181_054u64),
+            (1_000_000u64, u64::MAX - 500u64, 1_660_208_139_338_296u64),
+        ];
+        for (amount, fee, expected) in cases {
+            assert_eq!(
+                authorize(expected, amount, fee),
+                Some(Authorization { total_debit: expected })
+            );
+            assert_eq!(authorize(expected - 1u64, amount, fee), None);
+        }
+    }
+
+    #[test]
+    fn authorize_rejects_total_debit_overflow() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 0u64), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX - 100u64, 1_000_000u64), None);
+    }
+}
+[?2004hroot@b6a024795075:/workspace# cat challenge/src/constants.rs
+[?2004l//! Protocol-wide arithmetic constants, prime field moduli, reciprocal multipliers,
+//! broadword SWAR bitmasks, and 64-bit word carry-folding parameters for the
+//! rollup batch settlement and clearing engine.
+//!
+//! All arithmetic throughout the clearing crate executes natively on 64-bit machine
+//! words (`u64`) without `u128` promotion so that settlement verification matches
+//! single-word VM register semantics.
+
+/// Standard protocol fee basis-point denominator (`100% = 10_000 bps`).
+pub const BPS_DENOM: u64 = 10_000u64;
+
+/// Maximum non-zero remainder modulo `BPS_DENOM` (`BPS_DENOM - 1`).
+pub const BPS_MAX_REM: u64 = 9_999u64;
+
+/// Exact floor quotient of `2^64` divided by `BPS_DENOM`:
+/// `floor(18_446_744_073_709_551_616 / 10_000) = 1_844_674_407_370_955`.
+pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955u64;
+
+/// Exact positive remainder of `2^64` modulo `BPS_DENOM`:
+/// `18_446_744_073_709_551_616 % 10_000 = 1_616`.
+pub const U64_MOD_BPS_REM: u64 = 1_616u64;
+
+/// Protocol tier rebate divisor (`10` corresponds to a 10% floor rebate on gross fee).
+pub const REBATE_DIVISOR: u64 = 10u64;
+
+/// Passive maker rebate cap divisor (`5` corresponds to a 20% cap on passive limit orders).
+pub const MAKER_REBATE_CAP_DIVISOR: u64 = 5u64;
+
+/// Protocol reserve treasury cut divisor (`4` corresponds to 25% of net fee retained by treasury).
+pub const TREASURY_CUT_DIVISOR: u64 = 4u64;
+
+/// Flash-settlement liquidity surcharge denominator (`5_000` = 2 bps per notional unit).
+pub const FLASH_DENOM: u64 = 5_000u64;
+
+/// Maximum non-zero remainder modulo `FLASH_DENOM` (`FLASH_DENOM - 1`).
+pub const FLASH_MAX_REM: u64 = 4_999u64;
+
+/// Exact floor quotient of `2^64` divided by `FLASH_DENOM`:
+/// `floor(18_446_744_073_709_551_616 / 5_000) = 3_689_348_814_741_910`.
+pub const U64_MOD_FLASH_QUOT: u64 = 3_689_348_814_741_910u64;
+
+/// Exact positive remainder of `2^64` modulo `FLASH_DENOM`:
+/// `18_446_744_073_709_551_616 % 5_000 = 1_616`.
+pub const U64_MOD_FLASH_REM: u64 = 1_616u64;
+
+/// Minimum combined notional classified as institutional settlement volume.
+pub const INSTITUTIONAL_BAND_MIN: u64 = 10_000_000_000_000u64;
+
+/// Normalized 16-bit Möller-Granlund divisor `D = 0x8003 = 32_771` (`2^15 + 3`)
+/// used to partition L1 data-availability blob gas slots.
+pub const MG10_DIVISOR: u64 = 0x8003u64;
+
+/// Precomputed 16-bit Möller-Granlund reciprocal `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65_524`.
+pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+
+/// 16-bit limb extraction mask (`2^16 - 1 = 0xFFFF = 65_535`).
+pub const LIMB_MASK: u64 = 0xFFFFu64;
+
+/// Unsigned borrow-prevention bias `0xC000_0000 = 3_221_225_472` (`49_152 * 2^16`),
+/// which is an exact multiple of `2^16` exceeding `65_535 * MG10_DIVISOR`.
+pub const SUB_BIAS: u64 = 0xC000_0000u64;
+
+/// Nominal gas units allocated per L1 data-availability blob slot (`128 KiB = 131_072`).
+pub const BLOB_GAS_PER_SLOT: u64 = 131_072u64;
+
+/// SWAR 8-lane byte broadcast mask of `0x01` (`0x0101_0101_0101_0101`).
+pub const L8_MASK: u64 = 0x0101_0101_0101_0101u64;
+
+/// SWAR 8-lane byte high-bit mask of `0x80` (`0x8080_8080_8080_8080`).
+pub const H8_MASK: u64 = 0x8080_8080_8080_8080u64;
+
+/// SWAR alternating 16-bit lane mask (`0x00FF_00FF_00FF_00FF`).
+pub const M16_MASK: u64 = 0x00FF_00FF_00FF_00FFu64;
+
+/// SWAR 16-bit lane broadcast multiplier (`0x0001_0001_0001_0001`).
+pub const L16_MASK: u64 = 0x0001_0001_0001_0001u64;
+
+/// Calldata surcharge shift per active non-zero byte lane (`2^8 = 256` units per non-zero byte).
+pub const CALLDATA_NZ_BYTE_SHIFT: u64 = 8u64;
+
+/// BabyBear STARK prime modulus `P = 2^31 - 2^27 + 1 = 2_013_265_921` (`0x7800_0001`).
+pub const BABYBEAR_P: u64 = 2_013_265_921u64;
+
+/// Negative modular inverse of `BABYBEAR_P` modulo `2^32`:
+/// `MU = -P^{-1} mod 2^32 = 2_281_701_377` (`0x87FF_FFFF`).
+pub const BABYBEAR_MU: u64 = 2_281_701_377u64;
+
+/// 32-bit Montgomery radix `R = 2^32 = 4_294_967_296`.
+pub const LIMB_BASE: u64 = 4_294_967_296u64;
+
+/// 32-bit low-limb mask (`2^32 - 1 = 0xFFFF_FFFF`).
+pub const LOW32_MASK: u64 = 0xFFFF_FFFFu64;
+
+/// Goldilocks 64-bit prime modulus `P_G = 2^64 - 2^32 + 1 = 0xFFFF_FFFF_0000_0001`.
+pub const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001u64;
+
+/// Goldilocks reduction epsilon `EPS = 2^32 - 1 = 0xFFFF_FFFF` (`2^64 ≡ EPS (mod P_G)`).
+pub const GOLDILOCKS_EPS: u64 = 0xFFFF_FFFFu64;
+
+/// Transcript header domain tag mask (`0xFF`).
+pub const CODEC_TAG_MASK: u64 = 0xFFu64;
+
+/// Canonical protocol version identifier (`v3 = 3`).
+pub const CODEC_VERSION_V3: u64 = 3u64;
+
+/// Default L2 batch sequencer domain tag (`0x5A = 90`).
+pub const SEQUENCER_DOMAIN_TAG: u64 = 0x5Au64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn babybear_and_goldilocks_radix_identities() {
+        assert_eq!(LIMB_BASE, 1u64 << 32u64);
+        assert_eq!(LOW32_MASK, LIMB_BASE - 1u64);
+        assert_eq!(GOLDILOCKS_P.wrapping_add(GOLDILOCKS_EPS), 0u64);
+        assert_eq!(MG10_DIVISOR, (1u64 << 15u64) + 3u64);
+    }
+
+    #[test]
+    fn swar_mask_lane_alignment() {
+        assert_eq!(L8_MASK * 255u64, u64::MAX);
+        assert_eq!(L8_MASK << 7u64, H8_MASK);
+        assert_eq!(M16_MASK | (M16_MASK << 8u64), u64::MAX);
+        assert_eq!(L16_MASK * 65_535u64, u64::MAX);
+    }
+}
+[?2004hroot@b6a024795075:/workspace# cat challenge/src/clearing_pipeline.rs
+[?2004l//! Multi-stage rollup batch clearing pipeline and settlement ticket gate.
+//!
+//! Coordinates the four protocol surcharge subsystems to price and authorize
+//! a batch clearing transaction `(balance, amount, fee)`:
+//! 1. `net_bps_fee`: Protocol basis-point settlement fee with 10% floor tier rebate
+//!    (`fee_schedule::evaluate_settlement_fee(word_math::add_u64_with_carry(amount, fee)).net_fee`).
+//! 2. `blob_slot_quotient`: L1 data-availability blob slot quotient via Möller-Granlund
+//!    2-by-1 normalized reciprocal division (`reciprocal_div::quote_blob_gas_slots(amount, fee).slot_quotient`).
+//! 3. `calldata_surcharge`: L1 calldata byte-lane compression surcharge via Vigna SWAR
+//!    broadword operations (`broadword_swar::quote_calldata_lane_surcharge(fee).surcharge`).
+//! 4. `prover_levy`: STARK BabyBear Montgomery transcript verification levy
+//!    (`montgomery_field::quote_prover_transcript_levy(amount, fee).prover_levy`).
+//!
+//! The combined surcharge `total_surcharge = net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy`
+//! is added to the transfer principal `amount` via checked `u64` addition, and the
+//! resulting `ClearingTicket` is committed iff `total_debit <= balance`.
+
+use crate::Authorization;
+use crate::broadword_swar::{CalldataLaneQuote, quote_calldata_lane_surcharge};
+use crate::fee_schedule::{FeeQuote, evaluate_settlement_fee};
+use crate::montgomery_field::{ProverLevyQuote, quote_prover_transcript_levy};
+use crate::reciprocal_div::{BlobSlotQuote, quote_blob_gas_slots};
+use crate::word_math::{WordSum, add_u64_with_carry};
+
+/// Itemized four-stage surcharge breakdown for a rollup clearing operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearingBreakdown {
+    pub net_bps_fee: u64,
+    pub blob_slot_quotient: u64,
+    pub calldata_surcharge: u64,
+    pub prover_levy: u64,
+    pub total_surcharge: u64,
+}
+
+/// Validated clearing settlement ticket ready for balance conservation check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearingTicket {
+    pub principal: u64,
+    pub net_bps_fee: u64,
+    pub blob_slot_quotient: u64,
+    pub calldata_surcharge: u64,
+    pub prover_levy: u64,
+    pub total_surcharge: u64,
+    pub total_debit: u64,
+}
+
+/// Evaluates all four surcharge stages for `(amount, fee)` and sums them into
+/// a `ClearingBreakdown`.
+#[inline]
+pub fn compute_clearing_breakdown(amount: u64, fee: u64) -> ClearingBreakdown {
+    let notional_sum: WordSum = add_u64_with_carry(amount, fee);
+    let fee_quote: FeeQuote = evaluate_settlement_fee(notional_sum);
+    let blob_quote: BlobSlotQuote = quote_blob_gas_slots(amount, fee);
+    let lane_quote: CalldataLaneQuote = quote_calldata_lane_surcharge(fee);
+    let levy_quote: ProverLevyQuote = quote_prover_transcript_levy(amount, fee);
+
+    let net_bps_fee: u64 = fee_quote.net_fee;
+    let blob_slot_quotient: u64 = blob_quote.slot_quotient;
+    let calldata_surcharge: u64 = lane_quote.surcharge;
+    let prover_levy: u64 = levy_quote.prover_levy;
+
+    let total_surcharge: u64 =
+        net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy;
+
+    ClearingBreakdown {
+        net_bps_fee,
+        blob_slot_quotient,
+        calldata_surcharge,
+        prover_levy,
+        total_surcharge,
+    }
+}
+
+/// Assembles a `ClearingTicket` from `amount` and `breakdown`, returning `None`
+/// if `amount + breakdown.total_surcharge` exceeds `u64::MAX`.
+#[inline]
+pub fn assemble_clearing_ticket(
+    amount: u64,
+    breakdown: ClearingBreakdown,
+) -> Option<ClearingTicket> {
+    let total_debit: u64 = amount.checked_add(breakdown.total_surcharge)?;
+    Some(ClearingTicket {
+        principal: amount,
+        net_bps_fee: breakdown.net_bps_fee,
+        blob_slot_quotient: breakdown.blob_slot_quotient,
+        calldata_surcharge: breakdown.calldata_surcharge,
+        prover_levy: breakdown.prover_levy,
+        total_surcharge: breakdown.total_surcharge,
+        total_debit,
+    })
+}
+
+/// Quotes a complete `ClearingTicket` for `(amount, fee)`.
+#[inline]
+pub fn quote_clearing_ticket(amount: u64, fee: u64) -> Option<ClearingTicket> {
+    let breakdown: ClearingBreakdown = compute_clearing_breakdown(amount, fee);
+    assemble_clearing_ticket(amount, breakdown)
+}
+
+/// Commits a `ClearingTicket` against `balance`, authorizing iff `ticket.total_debit <= balance`.
+#[inline]
+pub fn commit_clearing_ticket(balance: u64, ticket: ClearingTicket) -> Option<Authorization> {
+    if ticket.total_debit <= balance {
+        Some(Authorization {
+            total_debit: ticket.total_debit,
+        })
+    } else {
+        None
+    }
+}
+
+/// Computes the post-settlement remaining account balance for telemetry, saturating at zero.
+#[inline]
+pub fn preview_remaining_balance(balance: u64, ticket: ClearingTicket) -> u64 {
+    balance.saturating_sub(ticket.total_debit)
+}
+
+/// Verifies internal surcharge conservation (`net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy == total_surcharge`)
+/// on an assembled `ClearingTicket`.
+#[inline]
+pub fn verify_ticket_conservation(ticket: ClearingTicket) -> bool {
+    let recomputed_surcharge: u64 = ticket.net_bps_fee
+        + ticket.blob_slot_quotient
+        + ticket.calldata_surcharge
+        + ticket.prover_levy;
+    (recomputed_surcharge == ticket.total_surcharge)
+        && (ticket.principal.wrapping_add(ticket.total_surcharge) == ticket.total_debit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_transfer_breakdown_is_zero() {
+        let b = compute_clearing_breakdown(0u64, 0u64);
+        assert_eq!(b.net_bps_fee, 0u64);
+        assert_eq!(b.blob_slot_quotient, 0u64);
+        assert_eq!(b.calldata_surcharge, 0u64);
+        assert_eq!(b.prover_levy, 0u64);
+        assert_eq!(b.total_surcharge, 0u64);
+    }
+
+    #[test]
+    fn ticket_overflow_rejected_near_u64_max() {
+        assert_eq!(quote_clearing_ticket(u64::MAX, 1u64), None);
+        assert_eq!(quote_clearing_ticket(u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn remaining_balance_preview_and_ticket_conservation() {
+        let t = quote_clearing_ticket(0u64, 1u64).unwrap();
+        assert_eq!(t.total_debit, 260u64);
+        assert!(verify_ticket_conservation(t));
+        assert_eq!(preview_remaining_balance(300u64, t), 40u64);
+        assert_eq!(preview_remaining_balance(200u64, t), 0u64);
+    }
+}
+[?2004hroot@b6a024795075:/workspace# head -120 challenge/src/word_math.rs
+[?2004l//! 64-bit word carry/borrow tracking and 128-bit carry-folded quotient kernels.
+//!
+//! Because two `u64` inputs `lhs` and `rhs` can sum to `[0, 2 * 2^64 - 2]`,
+//! computing exact floor and ceiling quotients `floor((lhs + rhs) / D)` and
+//! `ceil((lhs + rhs) / D)` without `u128` requires tracking the 1-bit carry flag
+//! across the `2^64` word boundary and folding `2^64 = Q_64 * D + R_64`.
+
+use crate::constants::*;
+
+/// Represents the exact 65-bit sum `low_word + (high_carry as u64) * 2^64`
+/// of two 64-bit unsigned words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordSum {
+    pub low_word: u64,
+    pub high_carry: bool,
+}
+
+/// Represents the 64-bit wrapped difference `lhs.wrapping_sub(rhs)` together
+/// with an explicit underflow borrow indicator (`lhs < rhs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordDiff {
+    pub diff_word: u64,
+    pub underflow_borrow: bool,
+}
+
+/// Adds two `u64` words in 64-bit register arithmetic and captures the 64-bit
+/// overflow carry flag (`low_word < lhs`).
+#[inline]
+pub fn add_u64_with_carry(lhs: u64, rhs: u64) -> WordSum {
+    let low_word: u64 = lhs.wrapping_add(rhs);
+    let high_carry: bool = low_word < lhs;
+    WordSum {
+        low_word,
+        high_carry,
+    }
+}
+
+/// Subtracts `rhs` from `lhs` in 64-bit register arithmetic and captures the
+/// underflow borrow flag (`lhs < rhs`).
+#[inline]
+pub fn sub_u64_with_borrow(lhs: u64, rhs: u64) -> WordDiff {
+    let diff_word: u64 = lhs.wrapping_sub(rhs);
+    let underflow_borrow: bool = lhs < rhs;
+    WordDiff {
+        diff_word,
+        underflow_borrow,
+    }
+}
+
+/// Extracts the low 16-bit limb `word & 0xFFFF` (`word mod 2^16`).
+#[inline]
+pub fn extract_low_u16(word: u64) -> u64 {
+    word & LIMB_MASK
+}
+
+/// Extracts the low 32-bit limb `word & 0xFFFF_FFFF` (`word mod 2^32`).
+#[inline]
+pub fn extract_low_u32(word: u64) -> u64 {
+    word & LOW32_MASK
+}
+
+/// Extracts the high 32-bit limb `word >> 32` (`floor(word / 2^32)`).
+#[inline]
+pub fn extract_high_u32(word: u64) -> u64 {
+    word >> 32u64
+}
+
+/// Recombines a 32-bit low limb and 32-bit high limb into a 64-bit word.
+#[inline]
+pub fn pack_u32_limbs(low_u32: u64, high_u32: u64) -> u64 {
+    (low_u32 & LOW32_MASK) | ((high_u32 & LOW32_MASK) << 32u64)
+}
+
+/// Classifies whether a 65-bit combined notional `sum` meets or exceeds
+/// `INSTITUTIONAL_BAND_MIN`.
+#[inline]
+pub fn is_institutional_notional(sum: WordSum) -> bool {
+    if sum.high_carry {
+        true
+    } else {
+        sum.low_word >= INSTITUTIONAL_BAND_MIN
+    }
+}
+
+/// Computes the exact remainder `(lhs + rhs) mod BPS_DENOM` (`BPS_DENOM = 10_000`)
+/// over the full 65-bit `WordSum` range in pure `u64` arithmetic.
+#[inline]
+pub fn rem_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        ((sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM) % BPS_DENOM
+    } else {
+        sum.low_word % BPS_DENOM
+    }
+}
+
+/// Computes the exact floor quotient `floor((lhs + rhs) / BPS_DENOM)` (`BPS_DENOM = 10_000`)
+/// over the full 65-bit `WordSum` range using pure `u64` carry folding.
+#[inline]
+pub fn floor_div_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + (folded_rem / BPS_DENOM)
+    } else {
+        sum.low_word / BPS_DENOM
+    }
+}
+
+/// Computes the ceiling quotient `ceil((lhs + rhs) / BPS_DENOM)` (`BPS_DENOM = 10_000`),
+/// equivalent in exact integer arithmetic to `floor((lhs + rhs + 9_999) / 10_000)`,
+/// over the full 65-bit `WordSum` range using pure `u64` arithmetic.
+#[inline]
+pub fn ceil_div_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    } else {
+        let biased: u64 = sum.low_word.wrapping_add(BPS_MAX_REM);
+        if biased < sum.low_word {
+            (sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+        } else {
+[?2004hroot@b6a024795075:/workspace# head -75 challenge/src/word_math.rs
+[?2004l//! 64-bit word carry/borrow tracking and 128-bit carry-folded quotient kernels.
+//!
+//! Because two `u64` inputs `lhs` and `rhs` can sum to `[0, 2 * 2^64 - 2]`,
+//! computing exact floor and ceiling quotients `floor((lhs + rhs) / D)` and
+//! `ceil((lhs + rhs) / D)` without `u128` requires tracking the 1-bit carry flag
+//! across the `2^64` word boundary and folding `2^64 = Q_64 * D + R_64`.
+
+use crate::constants::*;
+
+/// Represents the exact 65-bit sum `low_word + (high_carry as u64) * 2^64`
+/// of two 64-bit unsigned words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordSum {
+    pub low_word: u64,
+    pub high_carry: bool,
+}
+
+/// Represents the 64-bit wrapped difference `lhs.wrapping_sub(rhs)` together
+/// with an explicit underflow borrow indicator (`lhs < rhs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordDiff {
+    pub diff_word: u64,
+    pub underflow_borrow: bool,
+}
+
+/// Adds two `u64` words in 64-bit register arithmetic and captures the 64-bit
+/// overflow carry flag (`low_word < lhs`).
+#[inline]
+pub fn add_u64_with_carry(lhs: u64, rhs: u64) -> WordSum {
+    let low_word: u64 = lhs.wrapping_add(rhs);
+    let high_carry: bool = low_word < lhs;
+    WordSum {
+        low_word,
+        high_carry,
+    }
+}
+
+/// Subtracts `rhs` from `lhs` in 64-bit register arithmetic and captures the
+/// underflow borrow flag (`lhs < rhs`).
+#[inline]
+pub fn sub_u64_with_borrow(lhs: u64, rhs: u64) -> WordDiff {
+    let diff_word: u64 = lhs.wrapping_sub(rhs);
+    let underflow_borrow: bool = lhs < rhs;
+    WordDiff {
+        diff_word,
+        underflow_borrow,
+    }
+}
+
+/// Extracts the low 16-bit limb `word & 0xFFFF` (`word mod 2^16`).
+#[inline]
+pub fn extract_low_u16(word: u64) -> u64 {
+    word & LIMB_MASK
+}
+
+/// Extracts the low 32-bit limb `word & 0xFFFF_FFFF` (`word mod 2^32`).
+#[inline]
+pub fn extract_low_u32(word: u64) -> u64 {
+    word & LOW32_MASK
+}
+
+/// Extracts the high 32-bit limb `word >> 32` (`floor(word / 2^32)`).
+#[inline]
+pub fn extract_high_u32(word: u64) -> u64 {
+    word >> 32u64
+}
+
+/// Recombines a 32-bit low limb and 32-bit high limb into a 64-bit word.
+#[inline]
+pub fn pack_u32_limbs(low_u32: u64, high_u32: u64) -> u64 {
+    (low_u32 & LOW32_MASK) | ((high_u32 & LOW32_MASK) << 32u64)
+}
+
+/// Classifies whether a 65-bit combined notional `sum` meets or exceeds
+/// `INSTITUTIONAL_BAND_MIN`.
+[?2004hroot@b6a024795075:/workspace# cat challenge/src/fee_schedule.rs
+[?2004l//! Protocol basis-point settlement fee and tier rebate schedule calculator.
+//!
+//! Given a 65-bit combined notional `sum = add_u64_with_carry(amount, fee)`:
+//! 1. The gross settlement fee is the ceiling basis-point quotient
+//!    `gross_fee = ceil((amount + fee) / BPS_DENOM)` (`BPS_DENOM = 10_000`).
+//! 2. The tier rebate is the floor 10% discount
+//!    `rebate = floor(gross_fee / REBATE_DIVISOR)` (`REBATE_DIVISOR = 10`).
+//! 3. The net protocol settlement fee is `net_fee = gross_fee - rebate`.
+
+use crate::constants::*;
+use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64, is_institutional_notional};
+
+/// Active protocol fee schedule parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSchedule {
+    pub bps_denom: u64,
+    pub rebate_divisor: u64,
+    pub maker_cap_divisor: u64,
+}
+
+/// Complete two-stage fee quote (`gross_fee`, `rebate`, `net_fee`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeQuote {
+    pub gross_fee: u64,
+    pub rebate: u64,
+    pub net_fee: u64,
+}
+
+/// Returns the canonical protocol fee schedule configuration.
+#[inline]
+pub fn default_schedule() -> FeeSchedule {
+    FeeSchedule {
+        bps_denom: BPS_DENOM,
+        rebate_divisor: REBATE_DIVISOR,
+        maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+    }
+}
+
+/// Computes the 10% floor tier rebate `floor(gross_fee / REBATE_DIVISOR)`.
+#[inline]
+pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+    gross_fee / REBATE_DIVISOR
+}
+
+/// Computes a capped passive maker rebate `min(floor(gross_fee / 10), floor(cap_basis / 5))`
+/// used by order-book analytics.
+#[inline]
+pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+    let base_rebate: u64 = gross_fee / REBATE_DIVISOR;
+    let max_rebate: u64 = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+    if base_rebate <= max_rebate {
+        base_rebate
+    } else {
+        max_rebate
+    }
+}
+
+/// Evaluates the active clearing protocol fee quote (`gross_fee`, `rebate`, `net_fee`)
+/// from a 65-bit notional sum `sum = amount + fee` using ceiling basis-point division
+/// and floor tier rebate.
+#[inline]
+pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = ceil_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Evaluates a passive liquidity floor fee quote (`floor((amount + fee) / 10_000)`)
+/// for pool reserve telemetry.
+#[inline]
+pub fn evaluate_passive_floor_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = floor_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Computes the rounding spread (`ceil_quote.net_fee - floor_quote.net_fee`)
+/// between active ceiling settlement and passive floor settlement.
+#[inline]
+pub fn compute_fee_rounding_spread(sum: WordSum) -> u64 {
+    let ceil_q: FeeQuote = evaluate_settlement_fee(sum);
+    let floor_q: FeeQuote = evaluate_passive_floor_fee(sum);
+    ceil_q.net_fee - floor_q.net_fee
+}
+
+/// Classifies the fee tier code (`0 = zero`, `1 = retail`, `2 = institutional`)
+/// for batch telemetry reporting.
+#[inline]
+pub fn classify_settlement_tier(sum: WordSum) -> u64 {
+    if !sum.high_carry && sum.low_word == 0u64 {
+        0u64
+    } else if is_institutional_notional(sum) {
+        2u64
+    } else {
+        1u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::word_math::add_u64_with_carry;
+
+    #[test]
+    fn settlement_fee_and_rebate_rounding() {
+        let s = add_u64_with_carry(100_000u64, 25_000u64);
+        let q = evaluate_settlement_fee(s);
+        assert_eq!(q.gross_fee, 13u64);
+        assert_eq!(q.rebate, 1u64);
+        assert_eq!(q.net_fee, 12u64);
+
+        let pf = evaluate_passive_floor_fee(s);
+        assert_eq!(pf.gross_fee, 12u64);
+        assert_eq!(pf.rebate, 1u64);
+        assert_eq!(pf.net_fee, 11u64);
+        assert_eq!(compute_fee_rounding_spread(s), 1u64);
+    }
+
+    #[test]
+    fn capped_maker_rebate_and_default_schedule() {
+        let sched = default_schedule();
+        assert_eq!(sched.bps_denom, 10_000u64);
+        assert_eq!(compute_capped_maker_rebate(100u64, 30u64), 6u64);
+        assert_eq!(compute_capped_maker_rebate(100u64, 100u64), 10u64);
+    }
+
+    #[test]
+    fn settlement_tier_classification() {
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(0u64, 0u64)), 0u64);
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(50_000u64, 100u64)), 1u64);
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(INSTITUTIONAL_BAND_MIN, 0u64)), 2u64);
+    }
+}
+[?2004hroot@b6a024795075:/workspace# head -80 challenge/src/fee_schedule.rs
+[?2004l//! Protocol basis-point settlement fee and tier rebate schedule calculator.
+//!
+//! Given a 65-bit combined notional `sum = add_u64_with_carry(amount, fee)`:
+//! 1. The gross settlement fee is the ceiling basis-point quotient
+//!    `gross_fee = ceil((amount + fee) / BPS_DENOM)` (`BPS_DENOM = 10_000`).
+//! 2. The tier rebate is the floor 10% discount
+//!    `rebate = floor(gross_fee / REBATE_DIVISOR)` (`REBATE_DIVISOR = 10`).
+//! 3. The net protocol settlement fee is `net_fee = gross_fee - rebate`.
+
+use crate::constants::*;
+use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64, is_institutional_notional};
+
+/// Active protocol fee schedule parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSchedule {
+    pub bps_denom: u64,
+    pub rebate_divisor: u64,
+    pub maker_cap_divisor: u64,
+}
+
+/// Complete two-stage fee quote (`gross_fee`, `rebate`, `net_fee`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeQuote {
+    pub gross_fee: u64,
+    pub rebate: u64,
+    pub net_fee: u64,
+}
+
+/// Returns the canonical protocol fee schedule configuration.
+#[inline]
+pub fn default_schedule() -> FeeSchedule {
+    FeeSchedule {
+        bps_denom: BPS_DENOM,
+        rebate_divisor: REBATE_DIVISOR,
+        maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+    }
+}
+
+/// Computes the 10% floor tier rebate `floor(gross_fee / REBATE_DIVISOR)`.
+#[inline]
+pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+    gross_fee / REBATE_DIVISOR
+}
+
+/// Computes a capped passive maker rebate `min(floor(gross_fee / 10), floor(cap_basis / 5))`
+/// used by order-book analytics.
+#[inline]
+pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+    let base_rebate: u64 = gross_fee / REBATE_DIVISOR;
+    let max_rebate: u64 = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+    if base_rebate <= max_rebate {
+        base_rebate
+    } else {
+        max_rebate
+    }
+}
+
+/// Evaluates the active clearing protocol fee quote (`gross_fee`, `rebate`, `net_fee`)
+/// from a 65-bit notional sum `sum = amount + fee` using ceiling basis-point division
+/// and floor tier rebate.
+#[inline]
+pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = ceil_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Evaluates a passive liquidity floor fee quote (`floor((amount + fee) / 10_000)`)
+/// for pool reserve telemetry.
+#[inline]
+pub fn evaluate_passive_floor_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = floor_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+[?2004hroot@b6a024795075:/workspace# cat lean/SecurityChallenge.lean lean/Signature.lean; cat lean/check.py | head -60
+[?2004limport Lean
+import LeanModel.ClearingPipeline
+
+namespace SecurityChallenge
+
+export LeanModel.Constants (
+  bpsDenom bpsMaxRem u64ModBpsQuot u64ModBpsRem rebateDivisor
+  makerRebateCapDivisor treasuryCutDivisor flashDenom flashMaxRem
+  u64ModFlashQuot u64ModFlashRem institutionalBandMin
+  mg10Divisor mg10Reciprocal limbMask subBias blobGasPerSlot
+  l8Mask h8Mask m16Mask l16Mask calldataNzByteShift
+  babyBearP babyBearMu limbBase low32Mask
+  goldilocksP goldilocksEps
+  codecTagMask codecVersionV3 sequencerDomainTag
+  u64Max
+)
+export LeanModel.WordMath (
+  WordSum WordDiff addU64WithCarry subU64WithBorrow
+  extractLowU16 extractLowU32 extractHighU32 packU32Limbs
+  isInstitutionalNotional remBpsU64 floorDivBpsU64 ceilDivBpsU64
+  floorDivFlashU64 ceilDivFlashU64
+)
+export LeanModel.ReciprocalDiv (
+  BlobSlotQuote div2x1Mg10 rem2x1Mg10 quoteBlobGasSlots
+  verifyBlobSlotEuclidean estimateBlobGasUnits ceilBlobSlots
+)
+export LeanModel.BroadwordSwar (
+  CalldataLaneQuote uNz8 countNzBytes countZeroBytesSwar
+  hasHighBitByte sumBytes sumEvenBytesSwar sumOddBytesSwar
+  quoteCalldataLaneSurcharge
+)
+export LeanModel.MontgomeryField (
+  ProverLevyQuote packTranscript montyQuotient montyReduce
+  montyMulBabyBear canonicalAddBabyBear canonicalSubBabyBear
+  quoteProverTranscriptLevy
+)
+export LeanModel.GoldilocksField (
+  GoldilocksQuote reduceGoldilocksStep1 reduceGoldilocks128
+  canonicalizeGoldilocksU64 addGoldilocksMod subGoldilocksMod
+  foldGoldilocksChallenge quoteBridgeVerifierFee
+)
+export LeanModel.FeeSchedule (
+  FeeSchedule FeeQuote defaultSchedule computeTierRebate
+  computeCappedMakerRebate evaluateSettlementFee evaluatePassiveFloorFee
+  computeFeeRoundingSpread classifySettlementTier
+)
+export LeanModel.LiquidityPool (
+  PoolReserveQuote FlashLoanReceipt splitPoolReserve quoteLpRetention
+  assessFlashFeeCeil assessFlashFeeFloor quoteFlashRepayment
+  checkPoolReserveSolvency
+)
+export LeanModel.TranscriptCodec (
+  TranscriptHeader decodeDomainTag buildTranscriptHeader
+  verifyHeaderVersion foldHeaderDigest mixBatchHeaderDigests
+)
+export LeanModel.ClearingPipeline (
+  ClearingBreakdown ClearingTicket computeClearingBreakdown
+  assembleClearingTicket quoteClearingTicket commitClearingTicket
+  previewRemainingBalance verifyTicketConservation authorizeBreakdown
+  challengeAuthorize
+)
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (_verdict : AuditVerdict) : Prop :=
+  Conforms spec challengeAuthorize
+
+end SecurityChallenge
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+LEAN_MODEL_ORDER = (
+    'Constants',
+    'WordMath',
+    'ReciprocalDiv',
+    'BroadwordSwar',
+    'MontgomeryField',
+    'GoldilocksField',
+    'FeeSchedule',
+    'LiquidityPool',
+    'TranscriptCodec',
+    'ClearingPipeline',
+)
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+[?2004hroot@b6a024795075:/workspace# cat lean/LeanModel/Constants.lean lean/LeanModel/WordMath.lean | head -130
+[?2004limport Lean
+
+namespace LeanModel.Constants
+
+def bpsDenom : UInt64 := 10000
+def bpsMaxRem : UInt64 := 9999
+def u64ModBpsQuot : UInt64 := 1844674407370955
+def u64ModBpsRem : UInt64 := 1616
+def rebateDivisor : UInt64 := 10
+def makerRebateCapDivisor : UInt64 := 5
+def treasuryCutDivisor : UInt64 := 4
+def flashDenom : UInt64 := 5000
+def flashMaxRem : UInt64 := 4999
+def u64ModFlashQuot : UInt64 := 3689348814741910
+def u64ModFlashRem : UInt64 := 1616
+def institutionalBandMin : UInt64 := 10000000000000
+
+def mg10Divisor : UInt64 := 0x8003
+def mg10Reciprocal : UInt64 := 0xFFF4
+def limbMask : UInt64 := 0xFFFF
+def subBias : UInt64 := 0xC0000000
+def blobGasPerSlot : UInt64 := 131072
+
+def l8Mask : UInt64 := 0x0101010101010101
+def h8Mask : UInt64 := 0x8080808080808080
+def m16Mask : UInt64 := 0x00FF00FF00FF00FF
+def l16Mask : UInt64 := 0x0001000100010001
+def calldataNzByteShift : UInt64 := 8
+
+def babyBearP : UInt64 := 2013265921
+def babyBearMu : UInt64 := 2281701377
+def limbBase : UInt64 := 4294967296
+def low32Mask : UInt64 := 0xFFFFFFFF
+
+def goldilocksP : UInt64 := 0xFFFFFFFF00000001
+def goldilocksEps : UInt64 := 0xFFFFFFFF
+
+def codecTagMask : UInt64 := 0xFF
+def codecVersionV3 : UInt64 := 3
+def sequencerDomainTag : UInt64 := 0x5A
+
+def u64Max : UInt64 := 18446744073709551615
+
+end LeanModel.Constants
+import Lean
+import LeanModel.Constants
+
+namespace LeanModel.WordMath
+
+open LeanModel.Constants
+
+structure WordSum where
+  lowWord : UInt64
+  highCarry : Bool
+
+structure WordDiff where
+  diffWord : UInt64
+  underflowBorrow : Bool
+
+def addU64WithCarry (lhs rhs : UInt64) : WordSum :=
+  let lowWord := lhs + rhs
+  { lowWord := lowWord, highCarry := decide (lowWord < lhs) }
+
+def subU64WithBorrow (lhs rhs : UInt64) : WordDiff :=
+  let diffWord := lhs - rhs
+  { diffWord := diffWord, underflowBorrow := decide (lhs < rhs) }
+
+def extractLowU16 (word : UInt64) : UInt64 :=
+  word &&& limbMask
+
+def extractLowU32 (word : UInt64) : UInt64 :=
+  word &&& low32Mask
+
+def extractHighU32 (word : UInt64) : UInt64 :=
+  word >>> 32
+
+def packU32Limbs (lowU32 highU32 : UInt64) : UInt64 :=
+  (lowU32 &&& low32Mask) ||| ((highU32 &&& low32Mask) <<< 32)
+
+def isInstitutionalNotional (sum : WordSum) : Bool :=
+  if sum.highCarry then
+    true
+  else
+    decide (institutionalBandMin ≤ sum.lowWord)
+
+def remBpsU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    ((sum.lowWord % bpsDenom) + u64ModBpsRem) % bpsDenom
+  else
+    sum.lowWord % bpsDenom
+
+def floorDivBpsU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % bpsDenom) + u64ModBpsRem
+    u64ModBpsQuot + (sum.lowWord / bpsDenom) + (foldedRem / bpsDenom)
+  else
+    sum.lowWord / bpsDenom
+
+def ceilDivBpsU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % bpsDenom) + u64ModBpsRem
+    u64ModBpsQuot + (sum.lowWord / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+  else
+    let biased := sum.lowWord + bpsMaxRem
+    if biased < sum.lowWord then
+      (sum.lowWord / bpsDenom) + ((biased + u64ModBpsRem) / bpsDenom)
+    else
+      biased / bpsDenom
+
+def floorDivFlashU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % flashDenom) + u64ModFlashRem
+    u64ModFlashQuot + (sum.lowWord / flashDenom) + (foldedRem / flashDenom)
+  else
+    sum.lowWord / flashDenom
+
+def ceilDivFlashU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % flashDenom) + u64ModFlashRem
+    u64ModFlashQuot + (sum.lowWord / flashDenom) + ((foldedRem + flashMaxRem) / flashDenom)
+  else
+    let biased := sum.lowWord + flashMaxRem
+    if biased < sum.lowWord then
+      (sum.lowWord / flashDenom) + (((sum.lowWord % flashDenom) + flashMaxRem) / flashDenom)
+    else
+      biased / flashDenom
+
+end LeanModel.WordMath
+[?2004hroot@b6a024795075:/workspace# head -100 challenge/src/reciprocal_div.rs
+[?2004l//! Multiprecision 2-by-1 normalized reciprocal division (`alloy-rs/ruint` algorithm)
+//! for L1 data-availability blob gas slot partitioning.
+//!
+//! Given a normalized 16-bit divisor `D = MG10_DIVISOR = 0x8003 = 32_771` (`2^15 + 3`)
+//! with precomputed reciprocal `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65_524`,
+//! `div_2x1_mg10(u1, u0)` computes the exact floor quotient
+//! `floor((u1 * 2^16 + u0) / D)` for all `u1 < D` and `u0 < 2^16` using only
+//! shifts, bitwise masks, and `u64` multiplications (without hardware `/` or `%`
+//! in the core reciprocal step).
+
+use crate::constants::*;
+use crate::word_math::extract_low_u16;
+
+/// Captures the two-limb blob gas dividend `(high_limb, low_limb)` and its
+/// exact Euclidean division decomposition `high_limb * 2^16 + low_limb = D * slot_quotient + slot_remainder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobSlotQuote {
+    pub high_limb: u64,
+    pub low_limb: u64,
+    pub slot_quotient: u64,
+    pub slot_remainder: u64,
+}
+
+/// Möller-Granlund 2-by-1 normalized reciprocal division (`div_2x1_mg10`)
+/// for divisor `MG10_DIVISOR = 0x8003 = 32_771` and reciprocal `MG10_RECIPROCAL = 0xFFF4 = 65_524`.
+///
+/// Preconditions guaranteed by caller: `u1 < MG10_DIVISOR` and `u0 < 2^16`.
+/// Returns the exact integer quotient `floor((u1 * 65_536 + u0) / 32_771)`.
+#[inline]
+pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+    let q_full: u64 = (u1 * MG10_RECIPROCAL) + (u1 << 16u64) + u0 + (1u64 << 16u64);
+
+    let q1: u64 = q_full >> 16u64;
+    let q0: u64 = q_full & LIMB_MASK;
+    let r: u64 = (SUB_BIAS + u0 - q1 * MG10_DIVISOR) & LIMB_MASK;
+
+    let (q_corr, r_corr): (u64, u64) = if q0 < r {
+        (q1 - 1u64, (r + MG10_DIVISOR) & LIMB_MASK)
+    } else {
+        (q1, r)
+    };
+
+    if r_corr >= MG10_DIVISOR {
+        q_corr + 1u64
+    } else {
+        q_corr
+    }
+}
+
+/// Reconstructs the exact remainder `(u1 * 2^16 + u0) - quot * MG10_DIVISOR`
+/// from a computed quotient `quot = floor((u1 * 2^16 + u0) / MG10_DIVISOR)`.
+#[inline]
+pub fn rem_2x1_mg10(u1: u64, u0: u64, quot: u64) -> u64 {
+    let dividend: u64 = (u1 << 16u64) + u0;
+    dividend - (quot * MG10_DIVISOR)
+}
+
+/// Computes the L1 blob gas slot quotient and remainder for a settlement pair `(amount, fee)`:
+/// - `high_limb = fee % MG10_DIVISOR` (`u1 in [0, 32_770]`)
+/// - `low_limb = amount & 0xFFFF` (`u0 in [0, 65_535]`)
+/// - `slot_quotient = floor((high_limb * 65_536 + low_limb) / 32_771)`
+/// - `slot_remainder = (high_limb * 65_536 + low_limb) % 32_771`
+#[inline]
+pub fn quote_blob_gas_slots(amount: u64, fee: u64) -> BlobSlotQuote {
+    let high_limb: u64 = fee % MG10_DIVISOR;
+    let low_limb: u64 = extract_low_u16(amount);
+    let slot_quotient: u64 = div_2x1_mg10(high_limb, low_limb);
+    let slot_remainder: u64 = rem_2x1_mg10(high_limb, low_limb, slot_quotient);
+    BlobSlotQuote {
+        high_limb,
+        low_limb,
+        slot_quotient,
+        slot_remainder,
+    }
+}
+
+/// Verifies the Euclidean division invariant `0 <= slot_remainder < MG10_DIVISOR`
+/// and `slot_quotient * MG10_DIVISOR + slot_remainder == high_limb * 2^16 + low_limb`
+/// for diagnostic auditing.
+#[inline]
+pub fn verify_blob_slot_euclidean(quote: BlobSlotQuote) -> bool {
+    let dividend: u64 = (quote.high_limb << 16u64) + quote.low_limb;
+    let reconstructed: u64 = (quote.slot_quotient * MG10_DIVISOR) + quote.slot_remainder;
+    (quote.slot_remainder < MG10_DIVISOR) && (reconstructed == dividend)
+}
+
+/// Estimates raw L1 blob gas units `slot_quotient * BLOB_GAS_PER_SLOT` for telemetry.
+#[inline]
+pub fn estimate_blob_gas_units(quote: BlobSlotQuote) -> u64 {
+    quote.slot_quotient * BLOB_GAS_PER_SLOT
+}
+
+/// Computes the ceiling blob slot count `slot_quotient + (if slot_remainder > 0 { 1 } else { 0 })`
+/// for batch reservation telemetry.
+#[inline]
+pub fn ceil_blob_slots(quote: BlobSlotQuote) -> u64 {
+    if quote.slot_remainder > 0u64 {
+        quote.slot_quotient + 1u64
+    } else {
+        quote.slot_quotient
+[?2004hroot@b6a024795075:/workspace# sed -n '40,110p' challenge/src/broadword_swar.rs
+[?2004l/// and multiplying by `L8_MASK` to sum all 8 lanes in the top byte (`>> 56`).
+#[inline]
+pub fn count_nz_bytes(x: u64) -> u64 {
+    ((u_nz8(x) >> 7u64) * L8_MASK) >> 56u64
+}
+
+/// Counts the number of zero bytes (`0..=8`) in a 64-bit word `x`.
+#[inline]
+pub fn count_zero_bytes_swar(x: u64) -> u64 {
+    8u64 - count_nz_bytes(x)
+}
+
+/// Checks whether any byte lane of `x` has its most significant bit (`0x80`) set.
+#[inline]
+pub fn has_high_bit_byte(x: u64) -> bool {
+    (x & H8_MASK) != 0u64
+}
+
+/// Computes the exact sum of all 8 bytes `b_0 + b_1 + ... + b_7` (`0..=2040`) of `x`
+/// using two-lane 16-bit SWAR accumulation (`M16_MASK`) followed by `L16_MASK`
+/// multiplication into the top 16-bit lane (`>> 48`).
+#[inline]
+pub fn sum_bytes(x: u64) -> u64 {
+    let pair_sum: u64 = (x & M16_MASK) + ((x >> 8u64) & M16_MASK);
+    ((pair_sum * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Computes the sum of even-indexed bytes `b_0 + b_2 + b_4 + b_6` of `x`.
+#[inline]
+pub fn sum_even_bytes_swar(x: u64) -> u64 {
+    let even_lanes: u64 = x & M16_MASK;
+    ((even_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Computes the sum of odd-indexed bytes `b_1 + b_3 + b_5 + b_7` of `x`.
+#[inline]
+pub fn sum_odd_bytes_swar(x: u64) -> u64 {
+    let odd_lanes: u64 = (x >> 8u64) & M16_MASK;
+    ((odd_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Quotes the L1 calldata byte-lane surcharge for `fee`:
+/// `surcharge = (count_nz_bytes(fee) << 8) + sum_bytes(fee)`.
+#[inline]
+pub fn quote_calldata_lane_surcharge(fee: u64) -> CalldataLaneQuote {
+    let active_lanes: u64 = count_nz_bytes(fee);
+    let byte_weight_sum: u64 = sum_bytes(fee);
+    let surcharge: u64 = (active_lanes << CALLDATA_NZ_BYTE_SHIFT) + byte_weight_sum;
+    CalldataLaneQuote {
+        active_lanes,
+        byte_weight_sum,
+        surcharge,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swar_zero_and_single_byte_lanes() {
+        let q0 = quote_calldata_lane_surcharge(0u64);
+        assert_eq!(q0.active_lanes, 0u64);
+        assert_eq!(q0.byte_weight_sum, 0u64);
+        assert_eq!(q0.surcharge, 0u64);
+        assert_eq!(count_zero_bytes_swar(0u64), 8u64);
+
+        let q1 = quote_calldata_lane_surcharge(1u64);
+        assert_eq!(q1.active_lanes, 1u64);
+        assert_eq!(q1.byte_weight_sum, 1u64);
+        assert_eq!(q1.surcharge, 257u64);
+[?2004hroot@b6a024795075:/workspace# sed -n '36,48p' challenge/src/broadword_swar.rs; sed -n '1,75p' challenge/src/montgomery_field.rs
+[?2004l}
+
+/// Counts the number of non-zero bytes (`0..=8`) in a 64-bit word `x` in `O(1)`
+/// register operations by shifting the `0x80` lane flags of `u_nz8(x)` down to `0x01`
+/// and multiplying by `L8_MASK` to sum all 8 lanes in the top byte (`>> 56`).
+#[inline]
+pub fn count_nz_bytes(x: u64) -> u64 {
+    ((u_nz8(x) >> 7u64) * L8_MASK) >> 56u64
+}
+
+/// Counts the number of zero bytes (`0..=8`) in a 64-bit word `x`.
+#[inline]
+pub fn count_zero_bytes_swar(x: u64) -> u64 {
+//! `Plonky3` BabyBear (`P = 2_013_265_921 = 2^31 - 2^27 + 1`) 64-bit Montgomery
+//! reduction and STARK prover transcript commitment levy calculator.
+//!
+//! For radix `R = 2^32 = 4_294_967_296` and prime `P = 2_013_265_921`:
+//! - `R^{-1} mod P = 943_718_400`
+//! - `MU = -P^{-1} mod R = 2_281_701_377`
+//! Given a 64-bit packed transcript state `x < P * R`:
+//! 1. `t = ((x mod R) * MU) mod R`
+//! 2. `u = t * P` (so `x - u` is an exact multiple of `R = 2^32` in `(-P * R, P * R)`)
+//! 3. If `x < u`, `(x - u) / R + P` is computed in `u64` via
+//!    `P + (x.wrapping_sub(u) / R) - R`; otherwise `(x - u) / R`.
+//! The result equals `(x * R^{-1}) mod P` in `[0, P - 1]`.
+
+use crate::constants::*;
+
+/// Captures the packed 64-bit transcript state, Montgomery quotient limb `t`,
+/// and canonical BabyBear field element `prover_levy in [0, BABYBEAR_P - 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProverLevyQuote {
+    pub packed_transcript: u64,
+    pub monty_t: u64,
+    pub prover_levy: u64,
+}
+
+/// Packs the low 32-bit limb of `amount` (`amount mod 2^32`) and the canonical
+/// BabyBear residue of `fee` (`fee mod P`) into a 64-bit transcript integer
+/// `x = (amount % 2^32) + (fee % P) * 2^32 < P * 2^32`.
+#[inline]
+pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+    (amount % LIMB_BASE) + (fee % BABYBEAR_P) * LIMB_BASE
+}
+
+/// Computes the 32-bit Montgomery reduction multiplier `t = ((x mod 2^32) * MU) mod 2^32`.
+#[inline]
+pub fn monty_quotient(x: u64) -> u64 {
+    ((x % LIMB_BASE) * BABYBEAR_MU) % LIMB_BASE
+}
+
+/// Performs 64-bit BabyBear Montgomery reduction on `x < BABYBEAR_P * 2^32`,
+/// returning `(x * 943_718_400) mod 2_013_265_921` in pure `u64` arithmetic.
+#[inline]
+pub fn monty_reduce(x: u64) -> u64 {
+    let t: u64 = monty_quotient(x);
+    let u: u64 = BABYBEAR_P * t;
+    let diff: u64 = x.wrapping_sub(u);
+    let hi: u64 = diff / LIMB_BASE;
+    if x < u {
+        BABYBEAR_P + hi - LIMB_BASE
+    } else {
+        hi
+    }
+}
+
+/// Performs Montgomery multiplication `(a * b * R^{-1}) mod BABYBEAR_P`
+/// for two BabyBear field elements `a, b < BABYBEAR_P`.
+#[inline]
+pub fn monty_mul_babybear(a: u64, b: u64) -> u64 {
+    let prod: u64 = (a % BABYBEAR_P) * (b % BABYBEAR_P);
+    monty_reduce(prod)
+}
+
+/// Canonical modular addition `(a + b) mod BABYBEAR_P` for `a, b < BABYBEAR_P`.
+#[inline]
+pub fn canonical_add_babybear(a: u64, b: u64) -> u64 {
+    let sum: u64 = a + b;
+    if sum >= BABYBEAR_P {
+        sum - BABYBEAR_P
+    } else {
+        sum
+    }
+}
+
+/// Canonical modular subtraction `(a - b) mod BABYBEAR_P` for `a, b < BABYBEAR_P`.
+#[inline]
+pub fn canonical_sub_babybear(a: u64, b: u64) -> u64 {
+[?2004hroot@b6a024795075:/workspace# sed -n '12,36p;48,40p' challenge/src/broadword_swar.rs | head -5; grep -n 'fn ' challenge/src/broadword_swar.rs; sed -n '48,62p' challenge/src/broadword_swar.rs; sed -n '75,105p' challenge/src/montgomery_field.rs
+[?2004luse crate::constants::*;
+
+/// Breakdown of the 8-byte SWAR calldata inspection on a 64-bit parameter word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalldataLaneQuote {
+[32m[K34[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Ku_nz8(x: u64) -> u64 {
+[32m[K42[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Kcount_nz_bytes(x: u64) -> u64 {
+[32m[K48[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Kcount_zero_bytes_swar(x: u64) -> u64 {
+[32m[K54[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Khas_high_bit_byte(x: u64) -> bool {
+[32m[K62[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Ksum_bytes(x: u64) -> u64 {
+[32m[K69[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Ksum_even_bytes_swar(x: u64) -> u64 {
+[32m[K76[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Ksum_odd_bytes_swar(x: u64) -> u64 {
+[32m[K84[m[K[36m[K:[m[Kpub [01;31m[Kfn [m[Kquote_calldata_lane_surcharge(fee: u64) -> CalldataLaneQuote {
+[32m[K100[m[K[36m[K:[m[K    [01;31m[Kfn [m[Kswar_zero_and_single_byte_lanes() {
+[32m[K114[m[K[36m[K:[m[K    [01;31m[Kfn [m[Kswar_high_bit_0x80_bytes_detected_as_nonzero() {
+[32m[K130[m[K[36m[K:[m[K    [01;31m[Kfn [m[Kswar_all_0xff_max_word() {
+[32m[K139[m[K[36m[K:[m[K    [01;31m[Kfn [m[Kswar_mixed_byte_pattern_and_even_odd_partition() {
+pub fn count_zero_bytes_swar(x: u64) -> u64 {
+    8u64 - count_nz_bytes(x)
+}
+
+/// Checks whether any byte lane of `x` has its most significant bit (`0x80`) set.
+#[inline]
+pub fn has_high_bit_byte(x: u64) -> bool {
+    (x & H8_MASK) != 0u64
+}
+
+/// Computes the exact sum of all 8 bytes `b_0 + b_1 + ... + b_7` (`0..=2040`) of `x`
+/// using two-lane 16-bit SWAR accumulation (`M16_MASK`) followed by `L16_MASK`
+/// multiplication into the top 16-bit lane (`>> 48`).
+#[inline]
+pub fn sum_bytes(x: u64) -> u64 {
+pub fn canonical_sub_babybear(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        (a + BABYBEAR_P) - b
+    }
+}
+
+/// Quotes the STARK prover transcript commitment levy for `(amount, fee)`:
+/// `prover_levy = monty_reduce(pack_transcript(amount, fee))`.
+#[inline]
+pub fn quote_prover_transcript_levy(amount: u64, fee: u64) -> ProverLevyQuote {
+    let packed_transcript: u64 = pack_transcript(amount, fee);
+    let monty_t: u64 = monty_quotient(packed_transcript);
+    let prover_levy: u64 = monty_reduce(packed_transcript);
+    ProverLevyQuote {
+        packed_transcript,
+        monty_t,
+        prover_levy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monty_reduce_zero_and_multiples_of_p() {
+        assert_eq!(monty_reduce(0u64), 0u64);
+        assert_eq!(monty_reduce(BABYBEAR_P), 0u64);
+        assert_eq!(monty_reduce(BABYBEAR_P * 42u64), 0u64);
+[?2004hroot@b6a024795075:/workspace# grep -n -A8 'pub fn sum_bytes\|pub fn sum_even_bytes_swar' challenge/src/broadword_swar.rs
+[?2004l[32m[K62[m[K[36m[K:[m[K[01;31m[Kpub fn sum_bytes[m[K(x: u64) -> u64 {
+[32m[K63[m[K[36m[K-[m[K    let pair_sum: u64 = (x & M16_MASK) + ((x >> 8u64) & M16_MASK);
+[32m[K64[m[K[36m[K-[m[K    ((pair_sum * L16_MASK) >> 48u64) & LIMB_MASK
+[32m[K65[m[K[36m[K-[m[K}
+[32m[K66[m[K[36m[K-[m[K
+[32m[K67[m[K[36m[K-[m[K/// Computes the sum of even-indexed bytes `b_0 + b_2 + b_4 + b_6` of `x`.
+[32m[K68[m[K[36m[K-[m[K#[inline]
+[32m[K69[m[K[36m[K:[m[K[01;31m[Kpub fn sum_even_bytes_swar[m[K(x: u64) -> u64 {
+[32m[K70[m[K[36m[K-[m[K    let even_lanes: u64 = x & M16_MASK;
+[32m[K71[m[K[36m[K-[m[K    ((even_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+[32m[K72[m[K[36m[K-[m[K}
+[32m[K73[m[K[36m[K-[m[K
+[32m[K74[m[K[36m[K-[m[K/// Computes the sum of odd-indexed bytes `b_1 + b_3 + b_5 + b_7` of `x`.
+[32m[K75[m[K[36m[K-[m[K#[inline]
+[32m[K76[m[K[36m[K-[m[Kpub fn sum_odd_bytes_swar(x: u64) -> u64 {
+[32m[K77[m[K[36m[K-[m[K    let odd_lanes: u64 = (x >> 8u64) & M16_MASK;
+[?2004hroot@b6a024795075:/workspace# cat lean/LeanModel/FeeSchedule.lean | head -40; sed -n '1,105p' lean/LeanModel/ClearingPipeline.lean | grep -v '^$' | head -90
+[?2004limport Lean
+import LeanModel.Constants
+import LeanModel.WordMath
+
+namespace LeanModel.FeeSchedule
+
+open LeanModel.Constants
+open LeanModel.WordMath
+
+structure FeeSchedule where
+  bpsDenom : UInt64
+  rebateDivisor : UInt64
+  makerCapDivisor : UInt64
+
+structure FeeQuote where
+  grossFee : UInt64
+  rebate : UInt64
+  netFee : UInt64
+
+def defaultSchedule : FeeSchedule :=
+  {
+    bpsDenom := bpsDenom
+    rebateDivisor := rebateDivisor
+    makerCapDivisor := makerRebateCapDivisor
+  }
+
+def computeTierRebate (grossFee : UInt64) : UInt64 :=
+  grossFee / rebateDivisor
+
+def computeCappedMakerRebate (grossFee capBasis : UInt64) : UInt64 :=
+  let baseRebate : UInt64 := grossFee / rebateDivisor
+  let maxRebate : UInt64 := capBasis / makerRebateCapDivisor
+  if baseRebate ≤ maxRebate then baseRebate else maxRebate
+
+def evaluateSettlementFee (sum : WordSum) : FeeQuote :=
+  let grossFee : UInt64 := ceilDivBpsU64 sum
+  let rebate : UInt64 := computeTierRebate grossFee
+  let netFee : UInt64 := grossFee - rebate
+  {
+    grossFee := grossFee
+import Lean
+import LeanModel.Constants
+import LeanModel.WordMath
+import LeanModel.ReciprocalDiv
+import LeanModel.BroadwordSwar
+import LeanModel.MontgomeryField
+import LeanModel.GoldilocksField
+import LeanModel.FeeSchedule
+import LeanModel.LiquidityPool
+import LeanModel.TranscriptCodec
+namespace LeanModel.ClearingPipeline
+open LeanModel.Constants
+open LeanModel.WordMath
+open LeanModel.ReciprocalDiv
+open LeanModel.BroadwordSwar
+open LeanModel.MontgomeryField
+open LeanModel.FeeSchedule
+structure ClearingBreakdown where
+  netBpsFee : UInt64
+  blobSlotQuotient : UInt64
+  calldataSurcharge : UInt64
+  proverLevy : UInt64
+  totalSurcharge : UInt64
+structure ClearingTicket where
+  principal : UInt64
+  netBpsFee : UInt64
+  blobSlotQuotient : UInt64
+  calldataSurcharge : UInt64
+  proverLevy : UInt64
+  totalSurcharge : UInt64
+  totalDebit : UInt64
+def computeClearingBreakdown (amount fee : UInt64) : ClearingBreakdown :=
+  let notionalSum : WordSum := addU64WithCarry amount fee
+  let feeQuote : FeeQuote := evaluateSettlementFee notionalSum
+  let blobQuote : BlobSlotQuote := quoteBlobGasSlots amount fee
+  let laneQuote : CalldataLaneQuote := quoteCalldataLaneSurcharge fee
+  let levyQuote : ProverLevyQuote := quoteProverTranscriptLevy amount fee
+  let netBpsFee : UInt64 := feeQuote.netFee
+  let blobSlotQuotient : UInt64 := blobQuote.slotQuotient
+  let calldataSurcharge : UInt64 := laneQuote.surcharge
+  let proverLevy : UInt64 := levyQuote.proverLevy
+  let totalSurcharge : UInt64 :=
+    netBpsFee + blobSlotQuotient + calldataSurcharge + proverLevy
+  {
+    netBpsFee := netBpsFee
+    blobSlotQuotient := blobSlotQuotient
+    calldataSurcharge := calldataSurcharge
+    proverLevy := proverLevy
+    totalSurcharge := totalSurcharge
+  }
+def assembleClearingTicket (amount : UInt64) (breakdown : ClearingBreakdown) : Option ClearingTicket :=
+  if breakdown.totalSurcharge ≤ u64Max - amount then
+    some {
+      principal := amount
+      netBpsFee := breakdown.netBpsFee
+      blobSlotQuotient := breakdown.blobSlotQuotient
+      calldataSurcharge := breakdown.calldataSurcharge
+      proverLevy := breakdown.proverLevy
+      totalSurcharge := breakdown.totalSurcharge
+      totalDebit := amount + breakdown.totalSurcharge
+    }
+  else
+    none
+def quoteClearingTicket (amount fee : UInt64) : Option ClearingTicket :=
+  let breakdown : ClearingBreakdown := computeClearingBreakdown amount fee
+  assembleClearingTicket amount breakdown
+def commitClearingTicket (balance : UInt64) (ticket : ClearingTicket) : Option UInt64 :=
+  if ticket.totalDebit ≤ balance then
+    some ticket.totalDebit
+  else
+    none
+def previewRemainingBalance (balance : UInt64) (ticket : ClearingTicket) : UInt64 :=
+  if ticket.totalDebit ≤ balance then
+    balance - ticket.totalDebit
+  else
+    0
+def verifyTicketConservation (ticket : ClearingTicket) : Bool :=
+  let recomputed : UInt64 :=
+    ticket.netBpsFee + ticket.blobSlotQuotient + ticket.calldataSurcharge + ticket.proverLevy
+  decide (recomputed = ticket.totalSurcharge ∧ ticket.principal + ticket.totalSurcharge = ticket.totalDebit)
+def authorizeBreakdown (balance amount : UInt64) (breakdown : ClearingBreakdown) : Option UInt64 :=
+  if breakdown.totalSurcharge ≤ u64Max - amount then
+    let totalDebit : UInt64 := amount + breakdown.totalSurcharge
+    if totalDebit ≤ balance then
+      some totalDebit
+    else
+      none
+  else
+    none
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+[?2004hroot@b6a024795075:/workspace# cat lean/lean-toolchain; ls /opt/rvb-deps/packages 2>/dev/null; tail -5 lean/LeanModel/ClearingPipeline.lean; cat lean/LeanModel/Constants.lean | grep -n 'def' | head -50
+[?2004lleanprover/lean4:v4.31.0
+[0m[01;34mCli[0m  [01;34mLeanSearchClient[0m  [01;34mQq[0m  [01;34maeneas[0m  [01;34maesop[0m  [01;34mbatteries[0m  [01;34mhax[0m  [01;34mimportGraph[0m  [01;34mmathlib[0m  [01;34mplausible[0m  [01;34mproofwidgets[0m
+
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  authorizeBreakdown balance amount (computeClearingBreakdown amount fee)
+
+end LeanModel.ClearingPipeline
+5:def bpsDenom : UInt64 := 10000
+6:def bpsMaxRem : UInt64 := 9999
+7:def u64ModBpsQuot : UInt64 := 1844674407370955
+8:def u64ModBpsRem : UInt64 := 1616
+9:def rebateDivisor : UInt64 := 10
+10:def makerRebateCapDivisor : UInt64 := 5
+11:def treasuryCutDivisor : UInt64 := 4
+12:def flashDenom : UInt64 := 5000
+13:def flashMaxRem : UInt64 := 4999
+14:def u64ModFlashQuot : UInt64 := 3689348814741910
+15:def u64ModFlashRem : UInt64 := 1616
+16:def institutionalBandMin : UInt64 := 10000000000000
+18:def mg10Divisor : UInt64 := 0x8003
+19:def mg10Reciprocal : UInt64 := 0xFFF4
+20:def limbMask : UInt64 := 0xFFFF
+21:def subBias : UInt64 := 0xC0000000
+22:def blobGasPerSlot : UInt64 := 131072
+24:def l8Mask : UInt64 := 0x0101010101010101
+25:def h8Mask : UInt64 := 0x8080808080808080
+26:def m16Mask : UInt64 := 0x00FF00FF00FF00FF
+27:def l16Mask : UInt64 := 0x0001000100010001
+28:def calldataNzByteShift : UInt64 := 8
+30:def babyBearP : UInt64 := 2013265921
+31:def babyBearMu : UInt64 := 2281701377
+32:def limbBase : UInt64 := 4294967296
+33:def low32Mask : UInt64 := 0xFFFFFFFF
+35:def goldilocksP : UInt64 := 0xFFFFFFFF00000001
+36:def goldilocksEps : UInt64 := 0xFFFFFFFF
+38:def codecTagMask : UInt64 := 0xFF
+39:def codecVersionV3 : UInt64 := 3
+40:def sequencerDomainTag : UInt64 := 0x5A
+42:def u64Max : UInt64 := 18446744073709551615
+[?2004hroot@b6a024795075:/workspace# mkdir -p /tmp/w && cat > /tmp/w/model.py << 'EOF'
+[?2004l[?2004h> M=1<<64
+[?2004l[?2004h> MASK=M-1
+[?2004l[?2004h> D=10000;Q=1844674407370955;R=1616
+[?2004l[?2004h> def ceil_bps(a,f,fixed=False):
+[?2004l[?2004h>     low=(a+f)&MASK; carry=low<a
+[?2004l[?2004h>     if carry:
+[?2004l[?2004h>         fr=(low%D)+R
+[?2004l[?2004h>         return Q+low//D+(fr+9999)//D
+[?2004l[?2004h>     b=(low+9999)&MASK
+[?2004l[?2004h>     if b<low:
+[?2004l[?2004h>         if fixed: return low//D+((low%D)+9999)//D
+[?2004l[?2004h>         return low//D+((b+R)//D)
+[?2004l[?2004h>     return b//D
+[?2004l[?2004h> def div_mg(u1,u0):
+[?2004l[?2004h>     qf=(u1*0xFFF4+(u1<<16)+u0+(1<<16))&MASK
+[?2004l[?2004h>     q1=qf>>16;q0=qf&0xFFFF
+[?2004l[?2004h>     r=((0xC0000000+u0-q1*0x8003)&MASK)&0xFFFF
+[?2004l[?2004h>     if q0<r: qc,rc=q1-1,(r+0x8003)&0xFFFF
+[?2004l[?2004h>     else: qc,rc=q1,r
+[?2004l[?2004h>     return qc+1 if rc>=0x8003 else qc
+[?2004l[?2004h> def unz8(x):
+[?2004l[?2004h>     H=0x8080808080808080;L=0x0101010101010101
+[?2004l[?2004h>     return ((((x|H)-L)&MASK)|x)&H
+[?2004l[?2004h> def cnz(x): return ((((unz8(x)>>7)*0x0101010101010101)&MASK)>>56)
+[?2004l[?2004h> def sumb(x):
+[?2004l[?2004h>     m=0x00FF00FF00FF00FF
+[?2004l[?2004h>     ps=(x&m)+((x>>8)&m)
+[?2004l[?2004h>     return (((ps*0x0001000100010001)&MASK)>>48)&0xFFFF
+[?2004l[?2004h> P=2013265921;MU=2281701377;LB=1<<32
+[?2004l[?2004h> def monty(x):
+[?2004l[?2004h>     t=((x%LB)*MU)%LB
+[?2004l[?2004h>     u=(P*t)&MASK
+[?2004l[?2004h>     diff=(x-u)&MASK
+[?2004l[?2004h>     hi=diff//LB
+[?2004l[?2004h>     return (P+hi-LB)&MASK if x<u else hi
+[?2004l[?2004h> def rust(bal,a,f,fixed=False):
+[?2004l[?2004h>     g=ceil_bps(a,f,fixed); net=g-g//10
+[?2004l[?2004h>     blob=div_mg(f%0x8003,a&0xFFFF)
+[?2004l[?2004h>     cd=(cnz(f)<<8)+sumb(f)
+[?2004l[?2004h>     lev=monty((a%LB)+(f%P)*LB)
+[?2004l[?2004h>     s=net+blob+cd+lev
+[?2004l[?2004h>     assert s<M
+[?2004l[?2004h>     if a+s>MASK: return None
+[?2004l[?2004h>     t=a+s
+[?2004l[?2004h>     return t if t<=bal else None
+[?2004l[?2004h> def spec_total(a,f):
+[?2004l[?2004h>     g=(a+f+9999)//10000; net=g-g//10
+[?2004l[?2004h>     blob=((f%32771)*65536+(a%65536))//32771
+[?2004l[?2004h>     bs=[(f>>(8*i))&255 for i in range(8)]
+[?2004l[?2004h>     cd=sum(256 for b in bs if b>0)+sum(bs)
+[?2004l[?2004h>     lev=((a%LB)*pow(LB,-1,P)+f%P)%P
+[?2004l[?2004h>     return a+net+blob+cd+lev
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b6a024795075:/workspace# cd /tmp/w && python3 -c "
+[?2004l[?2004h> from model import *
+[?2004l[?2004h> import random
+[?2004l[?2004h> print(pow(LB,-1,P))
+[?2004l[?2004h> bad=0
+[?2004l[?2004h> for i in range(200000):
+[?2004l[?2004h>     k=random.choice([64,40,20,63,16])
+[?2004l[?2004h>     a=random.getrandbits(k)%M; f=random.getrandbits(random.choice([64,33,8,60]))
+[?2004l[?2004h>     if random.random()<0.3: a=(M-random.randint(1,20000)-f)%M
+[?2004l[?2004h>     T=spec_total(a,f)
+[?2004l[?2004h>     for fixed in (False,True):
+[?2004l[?2004h>       r=rust(MASK,a,f,fixed)
+[?2004l[?2004h>       exp=T if T<=MASK else None
+[?2004l[?2004h>       if r!=exp:
+[?2004l[?2004h>         if fixed: print('FIXED MISMATCH',a,f,r,exp)
+[?2004l[?2004h>         else: bad+=1
+[?2004l[?2004h> print('orig mismatches',bad)
+[?2004l[?2004h> "
+[?2004l943718400
+orig mismatches 12378
+[?2004hroot@b6a024795075:/tmp/w# python3 -c "
+[?2004l[?2004h> from model import *
+[?2004l[?2004h> for (a,f) in [(0,M-2000),(0,M-5000),(1000,M-3000-1000)]:
+[?2004l[?2004h>     T=spec_total(a,f); r=rust(T-1,a,f); print(a,f,T,r, rust(MASK,a,f))
+[?2004l[?2004h> "
+[?2004l0 18446744073709549616 1660208138868025 1660208138868024 1660208138868024
+0 18446744073709546616 1660208138859085 1660208138859084 1660208138859084
+1000 18446744073709547616 1660207635546116 1660207635546115 1660207635546115
+[?2004hroot@b6a024795075:/tmp/w# sed -n '60,200p' /workspace/lean/check.py
+[?2004l    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(tmp), str(root)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    sub_lean = submission / 'LeanModel'
+    root_lean = root / 'LeanModel'
+    if sub_lean.is_dir() and root_lean.is_dir():
+        (tmp / 'LeanModel').mkdir(parents=True, exist_ok=True)
+        changed_mods = set()
+        for m in LEAN_MODEL_ORDER:
+            rel = f'LeanModel/{m}.lean'
+            rel_olean = f'LeanModel/{m}.olean'
+            orig_file = root_lean / f'{m}.lean'
+            orig_olean = root / rel_olean
+            sub_file = sub_lean / f'{m}.lean'
+            if not orig_file.is_file():
+                continue
+            orig_text = orig_file.read_text()
+            src_text = sub_file.read_text() if sub_file.is_file() else orig_text
+            deps = set(re.findall(r'import\s+LeanModel\.([A-Za-z0-9_]+)', src_text))
+            if src_text.strip() != orig_text.strip() or (deps & changed_mods) or not orig_olean.is_file():
+                changed_mods.add(m)
+                (tmp / rel).write_text(src_text)
+                subprocess.run(['lean', '-j1', '-M4096', '-o', rel_olean, rel], cwd=tmp, env=env, check=True)
+            else:
+                shutil.copy(orig_olean, tmp / rel_olean)
+        if changed_mods and (root / 'SecurityChallenge.lean').is_file():
+            shutil.copy(root / 'SecurityChallenge.lean', tmp / 'SecurityChallenge.lean')
+            subprocess.run(['lean', '-j1', '-M4096', '-o', 'SecurityChallenge.olean', 'SecurityChallenge.lean'], cwd=tmp, env=env, check=True)
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-j1', '-M4096', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', '-j1', '-M4096', 'CandidateProof.lean'], cwd=tmp, env=env))
+[?2004hroot@b6a024795075:/tmp/w# cd /workspace && mkdir -p submission/src submission/LeanModel && cp challenge/src/*.rs submission/src/ && cp lean/LeanModel/WordMath.lean submission/LeanModel/
+[?2004l[?2004hroot@b6a024795075:/workspace# python3 - << 'EOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> p='/workspace/submission/src/word_math.rs'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> old='(sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)'
+[?2004l[?2004h> assert s.count(old)==1
+[?2004l[?2004h> s=s.replace(old,'(sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> p='/workspace/submission/LeanModel/WordMath.lean'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> old='(sum.lowWord / bpsDenom) + ((biased + u64ModBpsRem) / bpsDenom)'
+[?2004l[?2004h> assert s.count(old)==1
+[?2004l[?2004h> s=s.replace(old,'(sum.lowWord / bpsDenom) + (((sum.lowWord % bpsDenom) + bpsMaxRem) / bpsDenom)')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b6a024795075:/workspace# printf '{"balance": 1660208138868024, "amount": 0, "fee": 18446744073709549616}\n' > submission/counterexample.json; cat submission/counterexample.json; diff -r challenge/src submission/src; diff lean/LeanModel/WordMath.lean submission/LeanModel/WordMath.lean
+[?2004l{"balance": 1660208138868024, "amount": 0, "fee": 18446744073709549616}
+diff -r challenge/src/word_math.rs submission/src/word_math.rs
+119c119
+<             (sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+---
+>             (sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+62c62
+<       (sum.lowWord / bpsDenom) + ((biased + u64ModBpsRem) / bpsDenom)
+---
+>       (sum.lowWord / bpsDenom) + (((sum.lowWord % bpsDenom) + bpsMaxRem) / bpsDenom)
+[?2004hroot@b6a024795075:/workspace# rm -rf /tmp/rt && cp -r challenge /tmp/rt && cp submission/src/*.rs /tmp/rt/src/ && cd /tmp/rt && cargo test --release 2>&1 | tail -15; cd /workspace
+[?2004ltest liquidity_pool::tests::reserve_split_conserves_net_fee ... ok
+test word_math::tests::add_and_sub_carry_borrow_flags ... ok
+test word_math::tests::bps_floor_and_ceil_at_zero_and_u64_max ... ok
+test word_math::tests::bps_carry_folding_above_u64_max ... ok
+test word_math::tests::flash_floor_and_ceil_across_boundaries ... ok
+test word_math::tests::limb_extraction_and_packing_roundtrip ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@b6a024795075:/workspace# clear; grep -v '^$' lean/LeanModel/ReciprocalDiv.lean | head -40; grep -v '^$' lean/LeanModel/BroadwordSwar.lean | sed -n '5,40p'
+[?2004l[H[J[3Jimport Lean
+import LeanModel.Constants
+import LeanModel.WordMath
+namespace LeanModel.ReciprocalDiv
+open LeanModel.Constants
+open LeanModel.WordMath
+structure BlobSlotQuote where
+  highLimb : UInt64
+  lowLimb : UInt64
+  slotQuotient : UInt64
+  slotRemainder : UInt64
+def div2x1Mg10 (u1 u0 : UInt64) : UInt64 :=
+  let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+  let q1 : UInt64 := qFull >>> 16
+  let q0 : UInt64 := qFull &&& limbMask
+  let r : UInt64 := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+  let (qCorr, rCorr) :=
+    if q0 < r then
+      (q1 - 1, (r + mg10Divisor) &&& limbMask)
+    else
+      (q1, r)
+  if mg10Divisor ≤ rCorr then
+    qCorr + 1
+  else
+    qCorr
+def rem2x1Mg10 (u1 u0 quot : UInt64) : UInt64 :=
+  let dividend : UInt64 := (u1 <<< 16) + u0
+  dividend - (quot * mg10Divisor)
+def quoteBlobGasSlots (amount fee : UInt64) : BlobSlotQuote :=
+  let highLimb : UInt64 := fee % mg10Divisor
+  let lowLimb : UInt64 := extractLowU16 amount
+  let slotQuotient : UInt64 := div2x1Mg10 highLimb lowLimb
+  let slotRemainder : UInt64 := rem2x1Mg10 highLimb lowLimb slotQuotient
+  {
+    highLimb := highLimb
+    lowLimb := lowLimb
+    slotQuotient := slotQuotient
+    slotRemainder := slotRemainder
+  }
+def verifyBlobSlotEuclidean (quote : BlobSlotQuote) : Bool :=
+structure CalldataLaneQuote where
+  activeLanes : UInt64
+  byteWeightSum : UInt64
+  surcharge : UInt64
+def uNz8 (x : UInt64) : UInt64 :=
+  (((x ||| h8Mask) - l8Mask) ||| x) &&& h8Mask
+def countNzBytes (x : UInt64) : UInt64 :=
+  (((uNz8 x) >>> 7) * l8Mask) >>> 56
+def countZeroBytesSwar (x : UInt64) : UInt64 :=
+  8 - countNzBytes x
+def hasHighBitByte (x : UInt64) : Bool :=
+  decide ((x &&& h8Mask) != 0)
+def sumBytes (x : UInt64) : UInt64 :=
+  let pairSum : UInt64 := (x &&& m16Mask) + ((x >>> 8) &&& m16Mask)
+  ((pairSum * l16Mask) >>> 48) &&& limbMask
+def sumEvenBytesSwar (x : UInt64) : UInt64 :=
+  let evenLanes : UInt64 := x &&& m16Mask
+  ((evenLanes * l16Mask) >>> 48) &&& limbMask
+def sumOddBytesSwar (x : UInt64) : UInt64 :=
+  let oddLanes : UInt64 := (x >>> 8) &&& m16Mask
+  ((oddLanes * l16Mask) >>> 48) &&& limbMask
+def quoteCalldataLaneSurcharge (fee : UInt64) : CalldataLaneQuote :=
+  let activeLanes : UInt64 := countNzBytes fee
+  let byteWeightSum : UInt64 := sumBytes fee
+  let surcharge : UInt64 := (activeLanes <<< calldataNzByteShift) + byteWeightSum
+  {
+    activeLanes := activeLanes
+    byteWeightSum := byteWeightSum
+    surcharge := surcharge
+  }
+end LeanModel.BroadwordSwar
+[?2004hroot@b6a024795075:/workspace# clear; grep -v '^$' lean/LeanModel/ReciprocalDiv.lean | sed -n '1,30p'
+[?2004l[H[J[3Jimport Lean
+import LeanModel.Constants
+import LeanModel.WordMath
+namespace LeanModel.ReciprocalDiv
+open LeanModel.Constants
+open LeanModel.WordMath
+structure BlobSlotQuote where
+  highLimb : UInt64
+  lowLimb : UInt64
+  slotQuotient : UInt64
+  slotRemainder : UInt64
+def div2x1Mg10 (u1 u0 : UInt64) : UInt64 :=
+  let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+  let q1 : UInt64 := qFull >>> 16
+  let q0 : UInt64 := qFull &&& limbMask
+  let r : UInt64 := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+  let (qCorr, rCorr) :=
+    if q0 < r then
+      (q1 - 1, (r + mg10Divisor) &&& limbMask)
+    else
+      (q1, r)
+  if mg10Divisor ≤ rCorr then
+    qCorr + 1
+  else
+    qCorr
+def rem2x1Mg10 (u1 u0 quot : UInt64) : UInt64 :=
+  let dividend : UInt64 := (u1 <<< 16) + u0
+  dividend - (quot * mg10Divisor)
+def quoteBlobGasSlots (amount fee : UInt64) : BlobSlotQuote :=
+  let highLimb : UInt64 := fee % mg10Divisor
+[?2004hroot@b6a024795075:/workspace# grep -v '^$' lean/LeanModel/MontgomeryField.lean | sed -n '1,45p'; head -20 submission/Spec.lean submission/Audit.lean submission/Proof.lean
+[?2004limport Lean
+import LeanModel.Constants
+namespace LeanModel.MontgomeryField
+open LeanModel.Constants
+structure ProverLevyQuote where
+  packedTranscript : UInt64
+  montyT : UInt64
+  proverLevy : UInt64
+def packTranscript (amount fee : UInt64) : UInt64 :=
+  (amount % limbBase) + (fee % babyBearP) * limbBase
+def montyQuotient (x : UInt64) : UInt64 :=
+  ((x % limbBase) * babyBearMu) % limbBase
+def montyReduce (x : UInt64) : UInt64 :=
+  let t : UInt64 := montyQuotient x
+  let u : UInt64 := babyBearP * t
+  let diff : UInt64 := x - u
+  let hi : UInt64 := diff / limbBase
+  if x < u then
+    babyBearP + hi - limbBase
+  else
+    hi
+def montyMulBabyBear (a b : UInt64) : UInt64 :=
+  let prod : UInt64 := (a % babyBearP) * (b % babyBearP)
+  montyReduce prod
+def canonicalAddBabyBear (a b : UInt64) : UInt64 :=
+  let sum : UInt64 := a + b
+  if babyBearP ≤ sum then
+    sum - babyBearP
+  else
+    sum
+def canonicalSubBabyBear (a b : UInt64) : UInt64 :=
+  if b ≤ a then
+    a - b
+  else
+    (a + babyBearP) - b
+def quoteProverTranscriptLevy (amount fee : UInt64) : ProverLevyQuote :=
+  let packedTranscript : UInt64 := packTranscript amount fee
+  let montyT : UInt64 := montyQuotient packedTranscript
+  let proverLevy : UInt64 := montyReduce packedTranscript
+  {
+    packedTranscript := packedTranscript
+    montyT := montyT
+    proverLevy := proverLevy
+  }
+end LeanModel.MontgomeryField
+==> submission/Spec.lean <==
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+
+==> submission/Audit.lean <==
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+
+==> submission/Proof.lean <==
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+[?2004hroot@b6a024795075:/workspace# clear; grep -A14 'def div2x1Mg10' lean/LeanModel/ReciprocalDiv.lean; grep -A4 'def quoteBlobGasSlots' lean/LeanModel/ReciprocalDiv.lean
+[?2004l[H[J[3J[01;31m[Kdef div2x1Mg10[m[K (u1 u0 : UInt64) : UInt64 :=
+  let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+  let q1 : UInt64 := qFull >>> 16
+  let q0 : UInt64 := qFull &&& limbMask
+  let r : UInt64 := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+  let (qCorr, rCorr) :=
+    if q0 < r then
+      (q1 - 1, (r + mg10Divisor) &&& limbMask)
+    else
+      (q1, r)
+  if mg10Divisor ≤ rCorr then
+    qCorr + 1
+  else
+    qCorr
+
+[01;31m[Kdef quoteBlobGasSlots[m[K (amount fee : UInt64) : BlobSlotQuote :=
+  let highLimb : UInt64 := fee % mg10Divisor
+  let lowLimb : UInt64 := extractLowU16 amount
+  let slotQuotient : UInt64 := div2x1Mg10 highLimb lowLimb
+  let slotRemainder : UInt64 := rem2x1Mg10 highLimb lowLimb slotQuotient
+[?2004hroot@b6a024795075:/workspace# grep -B1 -A10 'def packTranscript\|def montyReduce' lean/LeanModel/MontgomeryField.lean | grep -v '^$'
+[?2004ldef packTranscript (amount fee : UInt64) : UInt64 :=
+  (amount % limbBase) + (fee % babyBearP) * limbBase
+def montyQuotient (x : UInt64) : UInt64 :=
+  ((x % limbBase) * babyBearMu) % limbBase
+def montyReduce (x : UInt64) : UInt64 :=
+  let t : UInt64 := montyQuotient x
+  let u : UInt64 := babyBearP * t
+  let diff : UInt64 := x - u
+  let hi : UInt64 := diff / limbBase
+  if x < u then
+    babyBearP + hi - limbBase
+  else
+    hi
+def montyMulBabyBear (a b : UInt64) : UInt64 :=
+[?2004hroot@b6a024795075:/workspace# clear; cat > /tmp/w/mg.c << 'EOF'
+[?2004l[?2004h> #include <stdio.h>
+[?2004l[?2004h> #include <stdint.h>
+[?2004l[?2004h> #include <stdlib.h>
+[?2004l[?2004h> static uint64_t mg(uint64_t u1,uint64_t u0){uint64_t qf=u1*0xFFF4ULL+(u1<<16)+u0+(1ULL<<16);uint64_t q1=qf>>16,q0=qf&0xFFFF;uint64_t r=(0xC0000000ULL+u0-q1*0x8003ULL)&0xFFFF;uint64_t qc,rc;if(q0<r){qc=q1-1;rc=(r+0x8003)&0xFFFF;}else{qc=q1;rc=r;}return rc>=0x8003?qc+1:qc;}
+[?2004l[?2004h> static uint64_t unz8(uint64_t x){uint64_t H=0x8080808080808080ULL,L=0x0101010101010101ULL;return (((x|H)-L)|x)&H;}
+[?2004l[?2004h> static uint64_t cnz(uint64_t x){return ((unz8(x)>>7)*0x0101010101010101ULL)>>56;}
+[?2004l[?2004h> static uint64_t sumb(uint64_t x){uint64_t m=0x00FF00FF00FF00FFULL;uint64_t ps=(x&m)+((x>>8)&m);return ((ps*0x0001000100010001ULL)>>48)&0xFFFF;}
+[?2004l[?2004h> int main(){long bad=0;for(uint64_t u1=0;u1<32771;u1++)for(uint64_t u0=0;u0<65536;u0++){uint64_t n=u1*65536+u0;if(mg(u1,u0)!=n/32771)bad++;}printf("mg bad %ld\n",bad);
+[?2004l[?2004h> bad=0;uint64_t s=88172645463325252ULL;for(long i=0;i<200000000;i++){s^=s<<13;s^=s>>7;s^=s<<17;uint64_t x=s;if(i&1){uint64_t m=s*0x9E3779B97F4A7C15ULL;for(int k=0;k<8;k++)if((m>>(k*8))&1)x&=~(0xFFULL<<(8*k));}uint64_t c=0,t=0;for(int k=0;k<8;k++){uint64_t b=(x>>(8*k))&255;c+=b!=0;t+=b;}if(cnz(x)!=c||sumb(x)!=t)bad++;}printf("swar bad %ld\n",bad);return 0;}
+[?2004l[?2004h> EOF
+[?2004l[H[J[3J[?2004hroot@b6a024795075:/workspace# gcc -O2 -o /tmp/w/mg /tmp/w/mg.c && time /tmp/w/mg
+[?2004lmg bad 0
+swar bad 0
+
+real	0m8.487s
+user	0m8.460s
+sys	0m0.003s
+[?2004hroot@b6a024795075:/workspace# cd /tmp/w && python3 -c "
+[?2004l[?2004h> from model import *
+[?2004l[?2004h> import random
+[?2004l[?2004h> bad=0
+[?2004l[?2004h> for i in range(300000):
+[?2004l[?2004h>     x=random.randrange(P*LB)
+[?2004l[?2004h>     if monty(x)!=x*943718400%P: bad+=1
+[?2004l[?2004h> print('monty bad',bad)
+[?2004l[?2004h> "; cd /workspace
+[?2004lmonty bad 0
+[?2004hroot@b6a024795075:/workspace# clear; mkdir -p /tmp/lb/LeanModel && cp /workspace/lean/LeanModel/*.lean /tmp/lb/LeanModel/ && cp /workspace/submission/LeanModel/*.lean /tmp/lb/LeanModel/ && cp /workspace/lean/SecurityChallenge.lean /tmp/lb/
+[?2004l[H[J[3J[?2004hroot@b6a024795075:/workspace# cat > /tmp/lb/env.sh << 'EOF'
+[?2004l[?2004h> LP=/tmp/lb:/opt/rvb-deps/.lake/build/lib/lean
+[?2004l[?2004h> for d in /opt/rvb-deps/packages/*/.lake/build/lib/lean; do LP=$LP:$d; done
+[?2004l[?2004h> export LEAN_PATH=$LP
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b6a024795075:/workspace# cat > /tmp/lb/build.sh << 'EOF'
+[?2004l[?2004h> . /tmp/lb/env.sh; cd /tmp/lb
+[?2004l[?2004h> for m in Constants WordMath ReciprocalDiv BroadwordSwar MontgomeryField GoldilocksField FeeSchedule LiquidityPool TranscriptCodec ClearingPipeline; do lean -o LeanModel/$m.olean LeanModel/$m.lean || exit 1; done
+[?2004l[?2004h> lean -o SecurityChallenge.olean SecurityChallenge.lean && echo BUILD_OK
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b6a024795075:/workspace# bash /tmp/lb/build.sh
+[?2004lBUILD_OK
+[?2004hroot@b6a024795075:/workspace# clear; cat > /tmp/lb/T0.lean << 'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> #check @UInt64.toNat_add
+[?2004l[?2004h> #check @UInt64.toNat_sub
+[?2004l[?2004h> #check @UInt64.toNat_mul
+[?2004l[?2004h> #check @UInt64.toNat_div
+[?2004l[?2004h> #check @UInt64.toNat_mod
+[?2004l[?2004h> #check @UInt64.toNat_and
+[?2004l[?2004h> #check @UInt64.toNat_or
+[?2004l[?2004h> #check @UInt64.toNat_shiftRight
+[?2004l[?2004h> #check @UInt64.toNat_shiftLeft
+[?2004l[?2004h> #check @UInt64.lt_iff_toNat_lt
+[?2004l[?2004h> #check @UInt64.le_iff_toNat_le
+[?2004l[?2004h> #check @UInt64.toNat_lt
+[?2004l[?2004h> #check @UInt64.toNat_inj
+[?2004l[?2004h> #check @UInt64.toNat_ofNat
+[?2004l[?2004h> #check @Nat.or_mod_two_pow
+[?2004l[?2004h> #check @Nat.and_mod_two_pow
+[?2004l[?2004h> #check @Nat.shiftRight_or_distrib
+[?2004l[?2004h> #check @Nat.shiftRight_and_distrib
+[?2004l[?2004h> #check @Nat.and_two_pow_sub_one_eq_mod
+[?2004l[?2004h> #check @Nat.shiftRight_eq_div_pow
+[?2004l[?2004h> #check @Nat.shiftLeft_eq
+[?2004l[?2004h> EOF
+[?2004l[H[J[3J[?2004hroot@b6a024795075:/workspace# cd /tmp/lb && . ./env.sh && lean T0.lean; cd /workspace
+[?2004lUInt64.toNat_add : ∀ (a b : UInt64), (a + b).toNat = (a.toNat + b.toNat) % 2 ^ 64
+UInt64.toNat_sub : ∀ (a b : UInt64), (a - b).toNat = (2 ^ 64 - b.toNat + a.toNat) % 2 ^ 64
+UInt64.toNat_mul : ∀ (a b : UInt64), (a * b).toNat = a.toNat * b.toNat % 2 ^ 64
+UInt64.toNat_div : ∀ (a b : UInt64), (a / b).toNat = a.toNat / b.toNat
+UInt64.toNat_mod : ∀ (a b : UInt64), (a % b).toNat = a.toNat % b.toNat
+UInt64.toNat_and : ∀ (a b : UInt64), (a &&& b).toNat = a.toNat &&& b.toNat
+UInt64.toNat_or : ∀ (a b : UInt64), (a ||| b).toNat = a.toNat ||| b.toNat
+UInt64.toNat_shiftRight : ∀ (a b : UInt64), (a >>> b).toNat = a.toNat >>> (b.toNat % 64)
+UInt64.toNat_shiftLeft : ∀ (a b : UInt64), (a <<< b).toNat = a.toNat <<< (b.toNat % 64) % 2 ^ 64
+@UInt64.lt_iff_toNat_lt : ∀ {a b : UInt64}, a < b ↔ a.toNat < b.toNat
+@UInt64.le_iff_toNat_le : ∀ {a b : UInt64}, a ≤ b ↔ a.toNat ≤ b.toNat
+UInt64.toNat_lt : ∀ (n : UInt64), n.toNat < 2 ^ 64
+@UInt64.toNat_inj : ∀ {a b : UInt64}, a.toNat = b.toNat ↔ a = b
+@UInt64.toNat_ofNat : ∀ {n : Nat}, (OfNat.ofNat n).toNat = n % 2 ^ 64
+@Nat.or_mod_two_pow : ∀ {a b n : Nat}, (a ||| b) % 2 ^ n = a % 2 ^ n ||| b % 2 ^ n
+@Nat.and_mod_two_pow : ∀ {a b n : Nat}, (a &&& b) % 2 ^ n = a % 2 ^ n &&& b % 2 ^ n
+@Nat.shiftRight_or_distrib : ∀ {i a b : Nat}, (a ||| b) >>> i = a >>> i ||| b >>> i
+@Nat.shiftRight_and_distrib : ∀ {i a b : Nat}, (a &&& b) >>> i = a >>> i &&& b >>> i
+Nat.and_two_pow_sub_one_eq_mod : ∀ (x n : Nat), x &&& 2 ^ n - 1 = x % 2 ^ n
+Nat.shiftRight_eq_div_pow : ∀ (m n : Nat), m >>> n = m / 2 ^ n
+Nat.shiftLeft_eq : ∀ (a b : Nat), a <<< b = a * 2 ^ b
+[?2004hroot@b6a024795075:/workspace# 

@@ -1,58 +1,96 @@
 # Benchmark Details & Per-Task Breakdown (v3)
 
-## 1. The 6 Challenge Pairs (12 Harbor Tasks)
+## 1. Flagship Multi-Module Benchmark (`zk-clearing`)
 
-Each problem wraps a real-world 64-bit Rust arithmetic kernel into a unified `authorize(balance, amount, fee) -> Option<Authorization>` gate that authorizes an operation iff its target mathematical cost is $\le \text{balance}$.
+The default benchmark (`python3 scripts/make-family.py /tmp/security-family`) generates the symmetric pair **`zk-clearing-vulnerable`** and **`zk-clearing-safe`** from [`problems/zk-clearing`](../../problems/zk-clearing).
 
-| Pair (`-vulnerable` / `-safe`) | Origin & Domain | Target Specification (Unbounded `Nat`) | Bug in `.vulnerable` (Fixed in `.safe`) |
-|---|---|---|---|
-| **[`ruint`](../../problems/ruint)** | `alloy-rs/ruint` (Multiprecision Division) | $\lfloor \text{amount}/2 \rfloor + \lfloor (((\text{fee} \bmod 32771) \cdot 2^{16} + (\text{amount} \bmod 2^{16})) / 32771 \rfloor$ | Möller-Granlund 2-by-1 reciprocal division (`div_2x1_mg10`, `D = 0x8003`, `V = 0xFFF4`) omits the second conditional remainder correction `if r_corr >= D`, under-estimating the quotient by `1` when `r_corr` falls in `[D, 2D)`. |
-| **[`succinct`](../../problems/succinct)** | `tov/succinct-rs` (Non-Web3 SWAR Bitmaps) | $\lfloor \text{amount}/2 \rfloor + (\text{sum of bytes of } \text{fee}) + 256 \times (\text{count of non-zero bytes of } \text{fee})$ | Vigna's SWAR broadword non-zero byte detector `(((x \| H8) - L8) \| x) & H8` omits `\| x`, silently treating every byte equal to `0x80` (`128`) as zero. |
-| **[`plonky3`](../../problems/plonky3)** | `Plonky3/Plonky3` (ZK BabyBear Field, $P = 2\,013\,265\,921$) | $\text{amount} + (((\text{amount} \bmod 2^{32}) + (\text{fee} \bmod P) \cdot 2^{32}) \cdot 943\,718\,400 \bmod P)$ | 64-bit Montgomery reduction (`MU = 2_281_701_377`) adds `(1 << 32) - P` instead of `P` in the unsigned underflow branch after shifting by 32 bits. |
-| **[`settlement-engine`](../../problems/settlement-engine)** | Multi-Module Settlement Engine (~330 lines Rust, 6 modules) | $\text{amount} + (\lceil (\text{amount}+\text{fee})/10\,000 \rceil - \lfloor \lceil (\text{amount}+\text{fee})/10\,000 \rceil / 10 \rfloor)$ | Pure-`u64` carry folding across 3 modules is exact at `u64::MAX`, but under-computes the fee by `1` inside an interior pocket ($2^{64}-9\,999 \le \text{amount}+\text{fee} \le 2^{64}-1\,617$), surrounded by 6 sound sibling calculators acting as realistic noise. |
-| **[`whirlpool`](../../problems/whirlpool)** | `orca-so/whirlpools` (DeFi 128-bit Ceiling Division) | $\lfloor \text{amount}/2 \rfloor + \lceil (\text{amount} + \text{fee} \cdot 2^{64}) / 1\,000\,000 \rceil$ | 4-limb base-$2^{32}$ ceiling division drops the `w1 -> w2` carry when rounding up `q0 = 2^32 - 1, q1 = 2^32 - 1` with non-zero remainder, wrapping a $2^{64}$ quotient to `0`. |
-| **[`goldilocks`](../../problems/goldilocks)** | `recmo/goldilocks` (ZK Goldilocks Field, $P = 2^{64}-2^{32}+1$) | $\lfloor \text{amount}/2 \rfloor + ((\text{amount} + \text{fee} \cdot 2^{64}) \bmod P)$ | Two-step 128-bit Goldilocks reduction checks `> P` instead of `>= P` in the final canonicalization step, leaving a single unreduced residue `r = P`. |
+### Crate & Lean Model Structure
+- **Rust Crate (`1,528` LOC across `11` files in `src/`, `37` unit tests):**
+  - [`src/lib.rs`](../../problems/zk-clearing/safe/src/lib.rs): Public `authorize(balance, amount, fee) -> Option<Authorization>` entrypoint and crate-level protocol contract.
+  - [`src/constants.rs`](../../problems/zk-clearing/safe/src/constants.rs): Protocol basis-point, reciprocal division, SWAR bitmask, BabyBear Montgomery, Goldilocks, and transcript framing constants.
+  - [`src/word_math.rs`](../../problems/zk-clearing/safe/src/word_math.rs): 64-bit carry/borrow word arithmetic (`WordSum`, `WordDiff`) and pure-`u64` carry-folded floor/ceiling division by `10_000` (`BPS_DENOM`) and `5_000` (`FLASH_DENOM`).
+  - [`src/fee_schedule.rs`](../../problems/zk-clearing/safe/src/fee_schedule.rs): Basis-point settlement fee calculator with 10% floor tier rebate (`gross_fee - gross_fee / 10`), passive floor fee, and tier classification.
+  - [`src/reciprocal_div.rs`](../../problems/zk-clearing/safe/src/reciprocal_div.rs): Möller-Granlund (`alloy-rs/ruint` algorithm `MG10`) 2-by-1 normalized reciprocal division (`D = 32771`, `V = 0xFFF4`) for L1 blob gas slot pricing.
+  - [`src/broadword_swar.rs`](../../problems/zk-clearing/safe/src/broadword_swar.rs): Vigna (`tov/succinct-rs`) 8-lane SWAR broadword non-zero byte detection (`u_nz8`, `count_nz_bytes`) and parallel byte-weight accumulation (`sum_bytes`).
+  - [`src/montgomery_field.rs`](../../problems/zk-clearing/safe/src/montgomery_field.rs): `Plonky3` BabyBear ($P = 2\,013\,265\,921$, $\mu = 2\,281\,701\,377$) 32-bit Montgomery reduction (`monty_reduce`) for STARK transcript verification levies.
+  - [`src/goldilocks_field.rs`](../../problems/zk-clearing/safe/src/goldilocks_field.rs): `recmo/goldilocks` ($P = 2^{64} - 2^{32} + 1$) two-step 128-bit field reduction and bridge verification helpers.
+  - [`src/liquidity_pool.rs`](../../problems/zk-clearing/safe/src/liquidity_pool.rs): LP reserve retention split, flash-loan fee quotes, and solvency checks.
+  - [`src/transcript_codec.rs`](../../problems/zk-clearing/safe/src/transcript_codec.rs): Rollup batch header framing and digest mixing.
+  - [`src/clearing_pipeline.rs`](../../problems/zk-clearing/safe/src/clearing_pipeline.rs): Multi-stage clearing orchestrator combining the 4 active surcharge stages into `ClearingBreakdown` and `ClearingTicket`.
+- **Lean 4.31 Functional Model (`633` LOC across `10` modules in `LeanModel/` + `SecurityChallenge.lean`):**
+  Mirrors all 10 Rust modules in fixed-width `UInt64` arithmetic (`LeanModel/Constants.lean`, `WordMath.lean`, `ReciprocalDiv.lean`, `BroadwordSwar.lean`, `MontgomeryField.lean`, `GoldilocksField.lean`, `FeeSchedule.lean`, `LiquidityPool.lean`, `TranscriptCodec.lean`, `ClearingPipeline.lean`).
 
-*(Passing `--problem all` to `scripts/make-family.py` also generates 4 auxiliary calibration pairs: `authorization`, `settlement`, `settlement-modular`, and `openpql`.)*
+### Target Unbounded `Nat` Specification
+For inputs `(balance, amount, fee)` with $b = \text{balance.toNat}$, $a = \text{amount.toNat}$, $f = \text{fee.toNat}$:
+$$\text{totalDebit}(a, f) = a + \left(\lceil (a + f)/10\,000 \rceil - \lfloor \lceil (a + f)/10\,000 \rceil / 10 \rfloor\right) + \left\lfloor \frac{(f \bmod 32\,771) \cdot 2^{16} + (a \bmod 2^{16})}{32\,771} \right\rfloor + \sum_{i=0}^{7} \left(256 \cdot \mathbf{1}_{b_i(f) > 0} + b_i(f)\right) + \left(\left((a \bmod 2^{32}) + (f \bmod P) \cdot 2^{32}\right) \cdot 943\,718\,400 \bmod P\right)$$
+where $b_i(f) = \lfloor f / 2^{8i} \rfloor \bmod 256$ and $P = 2\,013\,265\,921$. The gate authorizes iff $\text{totalDebit}(a, f) \le b$.
+
+### Vulnerability in `zk-clearing-vulnerable`
+In `src/word_math.rs` (`LeanModel/WordMath.lean`), `ceil_div_bps_u64` handles the non-carry `biased < sum.low_word` overflow pocket ($2^{64} - 9\,999 \le a + f \le 2^{64} - 1$) using `(sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)` instead of `(sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)`. Whenever $2^{64} - 9\,999 \le a + f \le 2^{64} - 1\,617$, `biased + 1616 < 10_000`, so the ceiling rounding increment is lost and `gross_fee` is under-computed by `1`.
 
 ---
 
-## 2. Per-Task Breakdown (`10` Turns Default vs. `25` Turns Extended)
+## 2. Flagship Benchmark Results (`10` Turns vs. `25` Turns)
 
-Reproducible via `python3 scripts/summarize-results.py` (or `python3 scripts/summarize-results.py --all`):
+Reproducible via `python3 scripts/summarize-results.py`:
 
 | Task | Variant | Opus 5.5 @ **10T** | Opus 5.5 @ **25T** | Opus 5.5 Turns | Opus 5.5 Tokens (`in` + `out`) | GPT 6.1 Sol @ **10T** | GPT 6.1 Sol @ **25T** | GPT 6.1 Sol Turns | GPT 6.1 Sol Tokens (`in` + `out`) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `ruint-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 9 | 107.3k (95.8k + 11.5k) | **1.00** | **1.00** | 10 | 84.2k (80.6k + 3.6k) |
-| `ruint-safe` | `.safe` | **0.00** | **1.00** | 23 | 665.6k (606.7k + 58.9k) | **0.25** | **0.25 ❌** | 25 | 671.7k (661.5k + 10.2k) |
-| `succinct-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 9 | 116.7k (106.5k + 10.2k) | **1.00** | **1.00** | 7 | 58.5k (54.8k + 3.6k) |
-| `succinct-safe` | `.safe` | **0.00** | **1.00** | 15 | 572.9k (519.2k + 53.7k) | **0.25** | **0.25 ❌** | 25 | 745.1k (735.4k + 9.7k) |
-| `plonky3-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (78.4k + 13.0k) | **1.00** | **1.00** | 10 | 83.1k (79.0k + 4.2k) |
-| `plonky3-safe` | `.safe` | **0.00** | **1.00** | 16 | 490.2k (427.5k + 62.7k) | **0.25** | **0.25 ❌** | 25 | 537.2k (528.5k + 8.7k) |
-| `settlement-engine-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 12 *(done T8)* | 218.3k (203.6k + 14.7k) | **1.00** | **1.00** | 12 *(done T9)* | 146.3k (142.0k + 4.4k) |
-| `settlement-engine-safe` | `.safe` | **0.25** | **1.00** | 20 | 354.7k (326.2k + 28.5k) | **0.25** | **1.00** | 25 | 582.2k (574.3k + 8.0k) |
-| `whirlpool-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 90.8k (79.6k + 11.2k) | **1.00** | **1.00** | 10 | 92.6k (88.3k + 4.3k) |
-| `whirlpool-safe` | `.safe` | **1.00** | **1.00** | 11 *(done T9)* | 260.1k (207.8k + 52.3k) | **0.25** | **1.00** | 21 | 573.1k (562.7k + 10.5k) |
-| `goldilocks-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (79.5k + 12.0k) | **1.00** | **1.00** | 9 | 73.7k (69.6k + 4.0k) |
-| `goldilocks-safe` | `.safe` | **1.00** | **1.00** | 10 | 374.9k (318.9k + 56.0k) | **0.25** | **1.00** | 25 | 530.0k (520.2k + 9.8k) |
-| **Mean (12 tasks)** | **All** | **0.688** (`8.25/12`) | **1.000** (`12.00/12`) | - | - | **0.625** (`7.50/12`) | **0.813** (`9.75/12`) | - | - |
+| `zk-clearing-vulnerable` | `.vulnerable` | **0.00** | **0.00** | 25 | 843.9k (754.5k + 89.4k) | **0.00** | **0.25** | 25 | 385.4k (374.8k + 10.6k) |
+| `zk-clearing-safe` | `.safe` | **0.00** | **0.00** | 25 | 1113.0k (1026.1k + 86.9k) | **0.00** | **0.25** | 25 | 362.7k (352.9k + 9.8k) |
+| **Mean (2 tasks)** | **All** | **0.000** (`0.00/2`) | **0.000** (`0.00/2`) | - | - | **0.000** (`0.00/2`) | **0.250** (`0.50/2`) | - | - |
+
+### Why Frontier Models Fail (`< 0.30`) While the Reference Oracle Scores `1.00`
+- **Multi-Module Audit Overhead (`@ 10T = 0.000` for both models):** Auditing 11 Rust modules (`1,528` LOC) and 10 Lean modules (`633` LOC) to identify which modules are on the critical path (`word_math`, `fee_schedule`, `reciprocal_div`, `broadword_swar`, `montgomery_field`, `clearing_pipeline`) vs. auxiliary modules (`goldilocks_field`, `liquidity_pool`, `transcript_codec`) takes 9 to 12 turns before either model writes `Spec.lean`.
+- **Universal Compositional Proof Requirement on Both `.vulnerable` and `.safe`:**
+  - **Claude Opus 5.5 (`high`, `0.000` @ 25T):** On `zk-clearing-vulnerable`, Opus 5.5 pinpointed the bug in `word_math.rs`, synthesized a valid counterexample (`balance = 1660208138868024, amount = 0, fee = 18446744073709549616`), and patched `word_math.rs` and `WordMath.lean`, but spent all remaining turns attempting to prove the 4-stage compositional lemmas (`div2x1Mg10`, `countNzBytes`/`sumBytes`, and `montyReduce`) in scratch files before writing `Spec.lean`, `Audit.lean`, or `Proof.lean`. On `zk-clearing-safe`, it similarly exhausted all 25 turns (`1.11M` tokens) trying to close the `div2x1Mg10` and SWAR bit-blasting lemmas without `bv_decide`.
+  - **GPT 6.1 Sol (`high`, `0.250` @ 25T):** On both tasks, GPT 6.1 Sol wrote a valid `Spec.lean` (`0.25` credit, verified across all 4 facets by `spec.py` in `< 1.5s`), but could not prove the 4-stage `UInt64`-to-`Nat` soundness theorems in `Proof.lean`. On `zk-clearing-vulnerable`, it attempted to bypass the 4 arithmetic modules by rewriting `ClearingPipeline.lean` and `clearing_pipeline.rs` directly with closed-form spec expressions (rejected by `verify.py`'s protected orchestrator check and still failing `omega` in `Proof.lean`). On `zk-clearing-safe`, it left `sorry` in `Proof.lean`.
 
 ### Direct Proof & Failure Inspection Links
-
-- **`ruint-safe`:** [Reference Proof](../../problems/ruint/solution/safe/Proof.lean) · [Opus 5.5 (`1.00`, 23T) Report](claude-opus-5-5/claude-opus-5-5-ruint-safe/ruint-safe__kP8qzNh/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-ruint-safe/ruint-safe__kP8qzNh/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, failed `omega`) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-ruint-safe/ruint-safe__HcwaH48/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-ruint-safe/ruint-safe__HcwaH48/agent/terminus_2.pane)
-- **`succinct-safe`:** [Reference Proof](../../problems/succinct/solution/safe/Proof.lean) · [Opus 5.5 (`1.00`, 15T) Report](claude-opus-5-5/claude-opus-5-5-succinct-safe/succinct-safe__vSngWU9/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-succinct-safe/succinct-safe__vSngWU9/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, disallowed `bv_decide`) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-succinct-safe/succinct-safe__oYsCe2P/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-succinct-safe/succinct-safe__oYsCe2P/agent/terminus_2.pane)
-- **`plonky3-safe`:** [Reference Proof](../../problems/plonky3/solution/safe/Proof.lean) · [Opus 5.5 (`1.00`, 16T) Report](claude-opus-5-5/claude-opus-5-5-plonky3-safe/plonky3-safe__ByhaTT4/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-plonky3-safe/plonky3-safe__ByhaTT4/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, left `sorry`) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-plonky3-safe/plonky3-safe__K6xkgTV/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-plonky3-safe/plonky3-safe__K6xkgTV/agent/terminus_2.pane)
+- **`zk-clearing-vulnerable`:** [Reference Solution (`1.00`)](../../problems/zk-clearing/solution/vulnerable/Proof.lean) · [Reference Receipt](zk-clearing-vulnerable-reference.json) · [Opus 5.5 (`0.00`, 25T) Report](claude-opus-5-5/claude-opus-5-5-zk-clearing-vulnerable/zk-clearing-vulnerable__WdbAc8i/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-zk-clearing-vulnerable/zk-clearing-vulnerable__WdbAc8i/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, 25T) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-zk-clearing-vulnerable/zk-clearing-vulnerable__r4fYzi4/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-zk-clearing-vulnerable/zk-clearing-vulnerable__r4fYzi4/agent/terminus_2.pane)
+- **`zk-clearing-safe`:** [Reference Solution (`1.00`)](../../problems/zk-clearing/solution/safe/Proof.lean) · [Reference Receipt](zk-clearing-safe-reference.json) · [Opus 5.5 (`0.00`, 25T) Report](claude-opus-5-5/claude-opus-5-5-zk-clearing-safe/zk-clearing-safe__2PkQuoK/verifier/details.json) & [Transcript](claude-opus-5-5/claude-opus-5-5-zk-clearing-safe/zk-clearing-safe__2PkQuoK/agent/terminus_2.pane) · [GPT 6.1 Sol (`0.25`, 25T) Report](gpt-6.1-sol-high/gpt-6.1-sol-high-zk-clearing-safe/zk-clearing-safe__EEpiCWn/verifier/details.json) & [Transcript](gpt-6.1-sol-high/gpt-6.1-sol-high-zk-clearing-safe/zk-clearing-safe__EEpiCWn/agent/terminus_2.pane)
 
 ---
 
-## 3. Verifier Validation & Adversarial Regression (`scripts/selftest.py`)
+## 3. Full Suite Including Single-Kernel Calibration Pairs (`--all`, 20 Tasks)
 
-All 20 reference solutions (`1.00`) and skeletons (`0.00`), plus adversarial test cases (vacuous specs, under-constrained outputs, `sorry` / `bv_decide` / `native_decide` axiom injection, invalid counterexamples, non-equivalent Rust patches, symlink escapes), are verified offline via:
+Reproducible via `python3 scripts/summarize-results.py --all`:
+
+| Task | Variant | Opus 5.5 @ **10T** | Opus 5.5 @ **25T** | Opus 5.5 Turns | Opus 5.5 Tokens (`in` + `out`) | GPT 6.1 Sol @ **10T** | GPT 6.1 Sol @ **25T** | GPT 6.1 Sol Turns | GPT 6.1 Sol Tokens (`in` + `out`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `zk-clearing-vulnerable` | `.vulnerable` | **0.00** | **0.00** | 25 | 843.9k (754.5k + 89.4k) | **0.00** | **0.25** | 25 | 385.4k (374.8k + 10.6k) |
+| `zk-clearing-safe` | `.safe` | **0.00** | **0.00** | 25 | 1113.0k (1026.1k + 86.9k) | **0.00** | **0.25** | 25 | 362.7k (352.9k + 9.8k) |
+| `ruint-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 9 | 107.3k (95.8k + 11.5k) | **1.00** | **1.00** | 10 | 84.2k (80.6k + 3.6k) |
+| `ruint-safe` | `.safe` | **0.00** | **1.00** | 23 | 665.6k (606.7k + 58.9k) | **0.25** | **0.25** | 25 | 671.7k (661.5k + 10.2k) |
+| `succinct-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 9 | 116.7k (106.5k + 10.2k) | **1.00** | **1.00** | 7 | 58.5k (54.8k + 3.6k) |
+| `succinct-safe` | `.safe` | **0.00** | **1.00** | 15 | 572.9k (519.2k + 53.7k) | **0.25** | **0.25** | 25 | 745.1k (735.4k + 9.7k) |
+| `plonky3-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (78.4k + 13.0k) | **1.00** | **1.00** | 10 | 83.1k (79.0k + 4.2k) |
+| `plonky3-safe` | `.safe` | **0.00** | **1.00** | 16 | 490.2k (427.5k + 62.7k) | **0.25** | **0.25** | 25 | 537.2k (528.5k + 8.7k) |
+| `settlement-engine-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 12 | 218.3k (203.6k + 14.7k) | **1.00** | **1.00** | 12 | 146.3k (142.0k + 4.4k) |
+| `settlement-engine-safe` | `.safe` | **0.25** | **1.00** | 20 | 354.7k (326.2k + 28.5k) | **0.25** | **1.00** | 25 | 582.2k (574.3k + 8.0k) |
+| `whirlpool-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 90.8k (79.6k + 11.2k) | **1.00** | **1.00** | 10 | 92.6k (88.3k + 4.3k) |
+| `whirlpool-safe` | `.safe` | **1.00** | **1.00** | 11 | 260.1k (207.8k + 52.3k) | **0.25** | **1.00** | 21 | 573.1k (562.7k + 10.5k) |
+| `goldilocks-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 91.4k (79.5k + 12.0k) | **1.00** | **1.00** | 9 | 73.7k (69.6k + 4.0k) |
+| `goldilocks-safe` | `.safe` | **1.00** | **1.00** | 10 | 374.9k (318.9k + 56.0k) | **0.25** | **1.00** | 25 | 530.0k (520.2k + 9.8k) |
+| `settlement-modular-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 95.4k (82.4k + 13.0k) | **0.25** | **1.00** | 11 | 105.5k (100.6k + 4.9k) |
+| `settlement-modular-safe` | `.safe` | **0.25** | **1.00** | 15 | 309.1k (291.5k + 17.6k) | **0.25** | **1.00** | 25 | 519.4k (512.1k + 7.3k) |
+| `settlement-vulnerable` | `.vulnerable` | **0.00** | **1.00** | 11 | 139.5k (125.6k + 13.9k) | **0.25** | **1.00** | 11 | 90.4k (85.5k + 4.8k) |
+| `settlement-safe` | `.safe` | **0.25** | **1.00** | 13 | 231.2k (204.4k + 26.8k) | **0.25** | **1.00** | 19 | 228.4k (222.3k + 6.1k) |
+| `openpql-vulnerable` | `.vulnerable` | **1.00** | **1.00** | 7 | 94.9k (82.9k + 12.0k) | **1.00** | **1.00** | 7 | 58.8k (55.5k + 3.3k) |
+| `openpql-safe` | `.safe` | **1.00** | **1.00** | 8 | 145.6k (125.8k + 19.8k) | **0.25** | **1.00** | 15 | 286.6k (280.0k + 6.6k) |
+| **Mean (20 tasks)** | **All** | **0.588** (`11.75/20`) | **0.900** (`18.00/20`) | - | - | **0.487** (`9.75/20`) | **0.812** (`16.25/20`) | - | - |
+
+---
+
+## 4. Verifier Validation & Adversarial Regression (`scripts/selftest.py` & `scripts/harbor-smoke.py`)
+
+All reference solutions (`1.00`) and skeletons (`0.00`), plus adversarial test cases (vacuous specs, under-constrained outputs, `sorry` / `bv_decide` / `native_decide` axiom injection, protected orchestrator module tampering, invalid counterexamples, non-equivalent Rust patches, symlink escapes), are verified offline via:
 
 ```bash
 docker build -t security-verifier:v3 -f task/tests/Dockerfile task/tests
 docker run --rm --network none -v "$PWD:/repo" -e VERIFIER_ROOT=/opt/security-verifier \
   security-verifier:v3 python3 /repo/scripts/selftest.py
+python3 scripts/harbor-smoke.py
 ```
 
-The final output is `selftest v3: PASS`, with reference receipts recorded in `evidence/v3/*-reference.json`.
+The final output is `selftest v3: PASS` and `reference-zk-clearing-vulnerable: PASS 1.00` / `reference-zk-clearing-safe: PASS 1.00`, with reference receipts recorded in `evidence/v3/*-reference.json` and `evidence/v3/harbor/`.

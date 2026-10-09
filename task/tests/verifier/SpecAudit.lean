@@ -32,7 +32,7 @@ def node (op : String) (args : Array Json := #[]) : Json :=
 
 -- Serialize kernel Exprs, never candidate text. Unknown heads are unfolded
 -- only when definitional reduction makes progress, with a finite fuel budget.
-partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 2048) : MetaM Json := do
+partial def lower (e : Expr) (vars : Array Expr) (fuel : Nat := 8192) : MetaM Json := do
   if fuel == 0 then throwError "unsupported: normalization/expression budget"
   let e := e.consumeMData.headBeta
   let fn := e.getAppFn

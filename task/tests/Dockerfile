@@ -1,7 +1,7 @@
 ARG LEAN_BASE=ghcr.io/lfglabs-dev/rvb-lean-deps@sha256:a31dc0e4b707a3f419cdfa34af1ba5c5f7d147a401caad720e2e5b17cc3293e2
 FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS rust
 FROM ${LEAN_BASE} AS api
-COPY verifier/SecurityChallenge.lean verifier/SpecAudit.lean verifier/lakefile.lean verifier/lake-manifest.json verifier/lean-toolchain /build-api/
+COPY verifier/ /build-api/
 WORKDIR /build-api
 RUN lake build SecurityChallenge SpecAudit
 
@@ -18,9 +18,8 @@ COPY verifier/*.py /opt/security-verifier/
 COPY verifier/pristine/ /opt/security-verifier/pristine/
 COPY verifier/variant.txt /opt/security-verifier/variant.txt
 COPY verifier/problem.txt /opt/security-verifier/problem.txt
-COPY --from=api /build-api/.lake/build/lib/lean/SecurityChallenge.olean /opt/security-verifier/api/SecurityChallenge.olean
-COPY --from=api /build-api/.lake/build/lib/lean/SpecAudit.olean /opt/security-verifier/api/SpecAudit.olean
+COPY --from=api /build-api/.lake/build/lib/lean/ /opt/security-verifier/api/
 COPY verifier/SpecAudit.lean /opt/security-verifier/SpecAudit.lean
 COPY test.sh /tests/test.sh
-RUN chmod 0555 /tests/test.sh && mkdir -p /workspace/submission/src /logs/verifier
+RUN chmod 0555 /tests/test.sh && mkdir -p /workspace/submission/src /workspace/submission/LeanModel /logs/verifier
 WORKDIR /workspace

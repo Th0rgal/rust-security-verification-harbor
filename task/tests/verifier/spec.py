@@ -24,6 +24,7 @@ PROBLEMS = (
     'succinct',
     'openpql',
     'ruint',
+    'zk-clearing',
 )
 
 class Unsupported(ValueError):
@@ -148,7 +149,10 @@ def purify_divmod(expr):
     rem_defs = {}
     quot_defs = {}
     var_splits = {}
-    monty_rels = {}
+    pow2_var_splits = {}
+    monty_rels = []
+    monty_q_ids = set()
+    monty_u0_vids = set()
     var_divs = _scan_var_divisors(expr)
     for name in ('balance', 'amount', 'fee', 'total', 'other_total'):
         v = z3.Int(name)
@@ -162,7 +166,7 @@ def purify_divmod(expr):
                 extra.append(z3.And(bv >= 0, bv < 256))
             decomp = z3.simplify(sum(bvars[i] * (1 << (8 * i)) for i in range(8)))
             keep_alive.append(decomp)
-            var_splits[v.get_id()] = decomp
+            pow2_var_splits[v.get_id()] = decomp
             extra.append(v == decomp)
         elif name in var_divs and 65536 in var_divs[name]:
             lvars = [z3.Int(f'_limb_{name}_{i}') for i in range(4)]
@@ -172,7 +176,7 @@ def purify_divmod(expr):
                 extra.append(z3.And(lv >= 0, lv < 65536))
             decomp = z3.simplify(sum(lvars[i] * (1 << (16 * i)) for i in range(4)))
             keep_alive.append(decomp)
-            var_splits[v.get_id()] = decomp
+            pow2_var_splits[v.get_id()] = decomp
             extra.append(v == decomp)
     memo = {}
     idx = [0]
@@ -289,17 +293,28 @@ def purify_divmod(expr):
                 acc = acc + z3.IntVal(cf) * vexpr
         return z3.simplify(acc) if changed else e
 
-    def expand_var_splits(e):
+    def expand_var_splits(e, c_val):
+        is_pow2 = c_val > 0 and (c_val & (c_val - 1)) == 0
         c0, terms = _extract_linear(e)
         changed = False
         acc = z3.IntVal(c0)
         for vid, (cf, vexpr) in terms.items():
-            if vid in var_splits:
+            if is_pow2 and vid in pow2_var_splits:
+                acc = acc + z3.IntVal(cf) * pow2_var_splits[vid]
+                changed = True
+            elif (vid, c_val) in var_splits:
+                acc = acc + z3.IntVal(cf) * var_splits[(vid, c_val)]
+                changed = True
+            elif not is_pow2 and vid in var_splits and c_val not in (32771, 2013265921):
                 acc = acc + z3.IntVal(cf) * var_splits[vid]
                 changed = True
             else:
                 acc = acc + z3.IntVal(cf) * vexpr
         return z3.simplify(acc) if changed else e
+
+    def _linear_key(e, c_val):
+        c0, terms = _extract_linear(e)
+        return (c_val, c0, tuple((vid, terms[vid][0]) for vid in sorted(terms)))
 
     def get_qr(a, c_val, c_expr):
         lo_raw, hi_raw = get_bounds(a)
@@ -316,6 +331,13 @@ def purify_divmod(expr):
             keep_alive.append(r_exact)
             _cache_bound(r_exact, (lo - q_const * c_val, hi - q_const * c_val))
             return (z3.IntVal(q_const), r_exact)
+        if lo is not None and hi is not None and -c_val < lo < 0 and hi == 0:
+            q_exact = z3.If(a_s == 0, z3.IntVal(0), z3.IntVal(-1))
+            r_exact = z3.If(a_s == 0, z3.IntVal(0), z3.simplify(a_s + c_expr))
+            keep_alive.extend((q_exact, r_exact))
+            _cache_bound(q_exact, (-1, 0))
+            _cache_bound(r_exact, (0, c_val - 1))
+            return (q_exact, r_exact)
         if z3.is_app(a_s) and a_s.decl().kind() == z3.Z3_OP_ITE:
             cond, t_br, f_br = a_s.arg(0), a_s.arg(1), a_s.arg(2)
             qt, rt = get_qr(t_br, c_val, c_expr)
@@ -339,44 +361,80 @@ def purify_divmod(expr):
             if lo is not None and hi is not None:
                 _cache_bound(q_exact, (lo // c_val, hi // c_val))
             return (q_exact, r_exact)
-        if c_val == 2013265921:
-            c0_m, terms_m = _extract_linear(a_s)
-            if any(vid in monty_rels and cf % 943718400 == 0 for vid, (cf, _) in terms_m.items()):
-                q_mult = z3.IntVal(c0_m // c_val)
-                rem_expr = z3.IntVal(c0_m % c_val)
-                for vid, (cf, vexpr) in terms_m.items():
-                    if vid in monty_rels and cf % 943718400 == 0:
-                        q_mu, r_mu = monty_rels[vid]
-                        k_m = cf // 943718400
-                        hi_part = z3.IntVal(-1069547521) * vexpr + z3.IntVal(2013265921) * q_mu
-                        q_mult = q_mult + z3.IntVal(k_m) * (z3.IntVal(943718400) * r_mu + z3.IntVal(2013265919) * hi_part)
-                        rem_expr = rem_expr + z3.IntVal(k_m) * hi_part
-                    else:
+        a_vexp = expand_var_splits(a_exp, c_val)
+        keep_alive.append(a_vexp)
+        c0_v, terms_v = _extract_linear(a_vexp)
+        if c_val == 2013265921 and monty_rels:
+            for u0_terms, u0_expr, q_mu, r_mu in monty_rels:
+                first_vid, first_u0_cf = next(iter(u0_terms.items()))
+                if first_vid not in terms_v:
+                    continue
+                cf_first = terms_v[first_vid][0]
+                if cf_first % (943718400 * first_u0_cf) != 0:
+                    continue
+                k_m = cf_first // (943718400 * first_u0_cf)
+                if k_m != 0 and all(
+                    vid in terms_v and terms_v[vid][0] == k_m * 943718400 * u0_cf
+                    for vid, u0_cf in u0_terms.items()
+                ):
+                    hi_part = z3.simplify(z3.IntVal(-1069547521) * u0_expr + z3.IntVal(2013265921) * q_mu)
+                    q_mult = z3.IntVal(c0_v // c_val) + z3.IntVal(k_m) * (
+                        z3.IntVal(943718400) * r_mu + z3.IntVal(2013265919) * hi_part
+                    )
+                    rem_expr = z3.IntVal(c0_v % c_val) + z3.IntVal(k_m) * hi_part
+                    for vid in sorted(terms_v):
+                        if vid in u0_terms:
+                            continue
+                        cf, vexpr = terms_v[vid]
                         d, m = cf // c_val, cf % c_val
                         if 2 * m > c_val:
                             m -= c_val
                             d += 1
                         q_mult = q_mult + z3.IntVal(d) * vexpr
                         rem_expr = rem_expr + z3.IntVal(m) * vexpr
-                rem_s = z3.simplify(rem_expr)
-                idx[0] += 1
-                q_sub = z3.Int(f'_dm_q_{idx[0]}')
-                r_sub = z3.Int(f'_dm_r_{idx[0]}')
-                keep_alive.extend((rem_s, q_sub, r_sub))
-                extra.append(z3.And(rem_s == c_expr * q_sub + r_sub, r_sub >= 0, r_sub < c_expr, z3.Implies(rem_s >= 0, q_sub >= 0)))
-                _cache_bound(r_sub, (0, c_val - 1))
-                res_pair = (z3.simplify(q_mult + q_sub), r_sub)
-                dm_cache[(a_s.get_id(), c_val)] = res_pair
-                return res_pair
-        a_vexp = expand_var_splits(a_exp)
-        keep_alive.append(a_vexp)
-        c0_v, terms_v = _extract_linear(a_vexp)
-        if any(abs(cf) >= c_val for cf, _ in terms_v.values()) or c0_v >= c_val or c0_v < 0:
+                    rem_s = z3.simplify(rem_expr)
+                    keep_alive.append(rem_s)
+                    m_key = _linear_key(rem_s, c_val)
+                    if m_key not in dm_cache:
+                        idx[0] += 1
+                        q_sub = z3.Int(f'_dm_q_{idx[0]}')
+                        r_sub = z3.Int(f'_dm_r_{idx[0]}')
+                        keep_alive.extend((q_sub, r_sub))
+                        extra.append(z3.And(rem_s == c_expr * q_sub + r_sub, r_sub >= 0, r_sub < c_expr, z3.Implies(rem_s >= 0, q_sub >= 0)))
+                        _cache_bound(r_sub, (0, c_val - 1))
+                        dm_cache[m_key] = (q_sub, r_sub)
+                    q_sub, r_sub = dm_cache[m_key]
+                    res_pair = (z3.simplify(q_mult + q_sub), r_sub)
+                    dm_cache[_linear_key(a_s, c_val)] = res_pair
+                    return res_pair
+        is_monty_mu = (
+            c_val == 4294967296
+            and c0_v == 0
+            and len(terms_v) > 0
+            and all(cf > 0 and cf % 2281701377 == 0 for cf, _ in terms_v.values())
+        )
+        has_monty_hi_terms = (
+            c_val == 2013265921
+            and any(vid in monty_q_ids for vid in terms_v)
+            and any(vid in monty_u0_vids for vid in terms_v)
+        )
+        if not is_monty_mu and (
+            any(
+                (2 * cf > c_val or 2 * cf <= -c_val)
+                and not (has_monty_hi_terms and (vid in monty_q_ids or vid in monty_u0_vids))
+                for vid, (cf, _) in terms_v.items()
+            )
+            or c0_v >= c_val
+            or c0_v < 0
+        ):
             q_mult = z3.IntVal(c0_v // c_val)
             rem_expr = z3.IntVal(c0_v % c_val)
             reduced_any = (c0_v >= c_val or c0_v < 0)
-            for cf, vexpr in terms_v.values():
-                if abs(cf) >= c_val:
+            for vid in sorted(terms_v):
+                cf, vexpr = terms_v[vid]
+                if (2 * cf > c_val or 2 * cf <= -c_val) and not (
+                    has_monty_hi_terms and (vid in monty_q_ids or vid in monty_u0_vids)
+                ):
                     m = cf % c_val
                     if 2 * m > c_val:
                         m -= c_val
@@ -389,40 +447,48 @@ def purify_divmod(expr):
             if reduced_any:
                 rem_s = z3.simplify(rem_expr)
                 keep_alive.append(rem_s)
-                if rem_s.get_id() != a_s.get_id():
+                if _linear_key(rem_s, c_val) != _linear_key(a_s, c_val):
                     q_sub, r_sub = get_qr(rem_s, c_val, c_expr)
                     q_tot = z3.simplify(q_mult + q_sub)
                     keep_alive.append(q_tot)
                     if lo is not None and hi is not None:
                         _cache_bound(q_tot, (lo // c_val, hi // c_val))
                     return (q_tot, r_sub)
-        key = (a_s.get_id(), c_val)
+        target_s = a_vexp if (is_monty_mu or has_monty_hi_terms) else a_s
+        key = _linear_key(target_s, c_val)
         if key not in dm_cache:
             idx[0] += 1
             q = z3.Int(f'_dm_q_{idx[0]}')
             r = z3.Int(f'_dm_r_{idx[0]}')
             keep_alive.extend((q, r))
-            conds = [a_s == c_expr * q + r, r >= 0, r < c_expr, z3.Implies(a_s >= 0, q >= 0)]
+            conds = [target_s == c_expr * q + r, r >= 0, r < c_expr, z3.Implies(target_s >= 0, q >= 0)]
             if lo is not None and hi is not None:
                 q_lo, q_hi = lo // c_val, hi // c_val
                 conds += [q >= z3.IntVal(q_lo), q <= z3.IntVal(q_hi)]
                 _cache_bound(q, (q_lo, q_hi))
             extra.append(z3.And(*conds))
             _cache_bound(r, (0, c_val - 1))
-            q_num = z3.simplify(a_exp - r)
+            def_base = a_vexp if (is_monty_mu or has_monty_hi_terms) else a_exp
+            q_num = z3.simplify(def_base - r)
             keep_alive.append(q_num)
             quot_defs[q.get_id()] = (c_val, q_num)
-            if z3.is_const(a_s) and a_s.decl().kind() == z3.Z3_OP_UNINTERPRETED and a_s.get_id() not in var_splits:
-                var_splits[a_s.get_id()] = c_expr * q + r
+            if z3.is_const(target_s) and target_s.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+                var_splits[(target_s.get_id(), c_val)] = c_expr * q + r
+                if target_s.get_id() not in var_splits:
+                    var_splits[target_s.get_id()] = c_expr * q + r
             else:
-                r_def = z3.simplify(a_exp - c_expr * q)
+                r_def = z3.simplify(def_base - c_expr * q)
                 keep_alive.append(r_def)
                 rem_defs[r.get_id()] = r_def
-                c0_m, terms_m = _extract_linear(a_s)
-                if c_val == 4294967296 and c0_m == 0 and len(terms_m) == 1:
-                    [(vid, (cf, _))] = list(terms_m.items())
-                    if cf == 2281701377:
-                        monty_rels[vid] = (q, r)
+                if is_monty_mu:
+                    u0_terms = {vid: cf // 2281701377 for vid, (cf, _) in terms_v.items()}
+                    u0_expr = z3.simplify(
+                        sum(z3.IntVal(cf // 2281701377) * vexpr for vid, (cf, vexpr) in sorted(terms_v.items()))
+                    )
+                    keep_alive.append(u0_expr)
+                    monty_rels.append((u0_terms, u0_expr, q, r))
+                    monty_q_ids.add(q.get_id())
+                    monty_u0_vids.update(u0_terms.keys())
             dm_cache[key] = (q, r)
         return dm_cache[key]
 
@@ -484,6 +550,33 @@ def purify_divmod(expr):
         get_bounds(res)
         memo[eid] = res
         return res
+    def _mentions_int_const(root, target):
+        seen_c = set()
+        stk = [root]
+        while stk:
+            cur = stk.pop()
+            cid = cur.get_id()
+            if cid in seen_c:
+                continue
+            seen_c.add(cid)
+            if z3.is_quantifier(cur):
+                stk.append(cur.body())
+                continue
+            if not z3.is_app(cur):
+                continue
+            if z3.is_int_value(cur) and cur.as_long() == target:
+                return True
+            for i in range(cur.num_args()):
+                stk.append(cur.arg(i))
+        return False
+
+    for name in ('balance', 'amount', 'fee'):
+        for pre_d in (10000, 1000000):
+            if name in var_divs and pre_d in var_divs[name]:
+                get_qr(z3.Int(name), pre_d, z3.IntVal(pre_d))
+    if _mentions_int_const(expr, 2281701377):
+        _, u0_pre = get_qr(z3.Int('amount'), 4294967296, z3.IntVal(4294967296))
+        get_qr(u0_pre * z3.IntVal(2281701377), 4294967296, z3.IntVal(4294967296))
     purified = walk(expr)
     return z3.And(purified, *extra) if extra else purified
 
@@ -574,7 +667,7 @@ def expression(tree, variables):
     def go(n, depth=0):
         nonlocal count
         count += 1
-        if count > 4096 or depth > 128: raise Unsupported('expression size/depth budget')
+        if count > 16384 or depth > 128: raise Unsupported('expression size/depth budget')
         if not isinstance(n,dict): raise ValueError('invalid trusted AST')
         if set(n)=={'var'}:
             i=n['var']
@@ -688,6 +781,19 @@ def expected_debit_z3(amount, fee, problem='authorization'):
         u0 = amount % b
         u = u1 * b + u0
         return (amount / 2) + (u / RUINT_MG10_D)
+    if problem=='zk-clearing':
+        gross_fee = (amount + fee + 9999) / 10000
+        net_bps_fee = gross_fee - (gross_fee / 10)
+        b16 = 1 << 16
+        blob_quot = ((fee % RUINT_MG10_D) * b16 + (amount % b16)) / RUINT_MG10_D
+        bs = [_byte_at_z3(fee, i) for i in range(8)]
+        active = sum(z3.If(bi > 0, 1, 0) for bi in bs)
+        bsum = sum(bs)
+        calldata_surcharge = active * 256 + bsum
+        b32 = 1 << 32
+        x = (amount % b32) + (fee % PLONKY3_P) * b32
+        prover_levy = (x * PLONKY3_R_INV) % PLONKY3_P
+        return amount + net_bps_fee + blob_quot + calldata_surcharge + prover_levy
     raise ValueError(f'unknown problem: {problem}')
 
 def expected_debit_py(amount, fee, problem='authorization'):
@@ -725,6 +831,19 @@ def expected_debit_py(amount, fee, problem='authorization'):
         u0 = amount % b
         u = u1 * b + u0
         return (amount // 2) + (u // RUINT_MG10_D)
+    if problem=='zk-clearing':
+        gross_fee = (amount + fee + 9999) // 10000
+        net_bps_fee = gross_fee - (gross_fee // 10)
+        b16 = 1 << 16
+        blob_quot = ((fee % RUINT_MG10_D) * b16 + (amount % b16)) // RUINT_MG10_D
+        bs = [(fee >> (8 * i)) & 0xFF for i in range(8)]
+        active = sum(1 if bi > 0 else 0 for bi in bs)
+        bsum = sum(bs)
+        calldata_surcharge = active * 256 + bsum
+        b32 = 1 << 32
+        x = (amount % b32) + (fee % PLONKY3_P) * b32
+        prover_levy = (x * PLONKY3_R_INV) % PLONKY3_P
+        return amount + net_bps_fee + blob_quot + calldata_surcharge + prover_levy
     raise ValueError(f'unknown problem: {problem}')
 
 def check(obj, problem='authorization'):

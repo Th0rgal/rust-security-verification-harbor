@@ -10,8 +10,8 @@ import tempfile
 import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
-CHALLENGE_PROBLEMS=('settlement-engine','goldilocks','whirlpool','plonky3','succinct','ruint')
-ALL_PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3','succinct','openpql','ruint')
+CHALLENGE_PROBLEMS=('zk-clearing',)
+ALL_PROBLEMS=('authorization','settlement','settlement-modular','settlement-engine','goldilocks','whirlpool','plonky3','succinct','openpql','ruint','zk-clearing')
 p=argparse.ArgumentParser()
 p.add_argument('--harbor',default='harbor')
 p.add_argument('--problem',choices=('challenge','all')+ALL_PROBLEMS,default='challenge')

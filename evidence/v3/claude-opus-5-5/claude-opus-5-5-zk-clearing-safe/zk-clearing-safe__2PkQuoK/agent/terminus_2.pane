@@ -1,0 +1,2612 @@
+[?2004hroot@07b8edb2de26:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@07b8edb2de26:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@07b8edb2de26:/workspace# cd /workspace && find . -type f -not -path '*/.lake/*' -not -path '*/target/*' | head -100
+[?2004l./lean/LeanModel/BroadwordSwar.lean
+./lean/LeanModel/MontgomeryField.lean
+./lean/LeanModel/ClearingPipeline.lean
+./lean/LeanModel/WordMath.lean
+./lean/LeanModel/TranscriptCodec.lean
+./lean/LeanModel/Constants.lean
+./lean/LeanModel/FeeSchedule.lean
+./lean/LeanModel/LiquidityPool.lean
+./lean/LeanModel/GoldilocksField.lean
+./lean/LeanModel/ReciprocalDiv.lean
+./lean/LeanModel/GoldilocksField.olean
+./lean/LeanModel/Constants.olean
+./lean/LeanModel/BroadwordSwar.olean
+./lean/LeanModel/MontgomeryField.olean
+./lean/LeanModel/LiquidityPool.olean
+./lean/LeanModel/WordMath.olean
+./lean/LeanModel/FeeSchedule.olean
+./lean/LeanModel/TranscriptCodec.olean
+./lean/LeanModel/ClearingPipeline.olean
+./lean/LeanModel/ReciprocalDiv.olean
+./lean/lean-toolchain
+./lean/Signature.lean
+./lean/SecurityChallenge.lean
+./lean/check.py
+./lean/SecurityChallenge.olean
+./challenge/src/transcript_codec.rs
+./challenge/src/clearing_pipeline.rs
+./challenge/src/lib.rs
+./challenge/src/broadword_swar.rs
+./challenge/src/goldilocks_field.rs
+./challenge/src/reciprocal_div.rs
+./challenge/src/montgomery_field.rs
+./challenge/src/liquidity_pool.rs
+./challenge/src/constants.rs
+./challenge/src/fee_schedule.rs
+./challenge/src/word_math.rs
+./challenge/Cargo.toml
+./challenge/Cargo.lock
+./harness/checkpoint.py
+./submission/Proof.lean
+./submission/Spec.lean
+./submission/Audit.lean
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/Cargo.toml; wc -l challenge/src/*.rs
+[?2004l[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+  147 challenge/src/broadword_swar.rs
+  158 challenge/src/clearing_pipeline.rs
+  128 challenge/src/constants.rs
+  143 challenge/src/fee_schedule.rs
+  137 challenge/src/goldilocks_field.rs
+  115 challenge/src/lib.rs
+  104 challenge/src/liquidity_pool.rs
+  133 challenge/src/montgomery_field.rs
+  156 challenge/src/reciprocal_div.rs
+   79 challenge/src/transcript_codec.rs
+  228 challenge/src/word_math.rs
+ 1528 total
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/lib.rs challenge/src/constants.rs
+[?2004l//! Zero-Knowledge Rollup Batch Settlement & Clearing Engine (`zk_clearing_engine`).
+//!
+//! This crate implements the pre-settlement clearing gate for rollup batch transfers.
+//! All production paths execute strictly in 64-bit word arithmetic (`u64` and `bool`,
+//! without `u128` casts) so that clearing verification aligns with 64-bit VM word
+//! execution and formal bit-level models.
+//!
+//! ### Clearing Protocol Contract
+//! Given an account `balance`, transfer `amount` (principal), and `fee` parameter word
+//! (each a `u64`), the clearing pipeline (`clearing_pipeline::quote_clearing_ticket`)
+//! computes the exact mathematical settlement debit as the sum of `amount` and four
+//! protocol surcharge components evaluated in unbounded integer arithmetic:
+//!
+//! 1. **Protocol Settlement Fee (`word_math`, `fee_schedule`):**
+//!    The combined notional `amount + fee` is divided by the basis-point denominator
+//!    (`constants::BPS_DENOM`), rounded up to the ceiling integer, and reduced by the
+//!    floor tier rebate (`constants::REBATE_DIVISOR`).
+//! 2. **L1 Blob Gas Slot Quotient (`reciprocal_div`):**
+//!    The two-limb normalized dividend formed by high limb `fee mod MG10_DIVISOR` and
+//!    low 16-bit limb `amount mod 2^16` is divided by `constants::MG10_DIVISOR`,
+//!    rounded down.
+//! 3. **Calldata Byte-Lane Surcharge (`broadword_swar`):**
+//!    Across the 8 byte lanes of `fee`, each non-zero byte lane incurs the fixed
+//!    activation surcharge (`1 << constants::CALLDATA_NZ_BYTE_SHIFT`) plus the numeric
+//!    value of each byte lane.
+//! 4. **Prover Transcript Montgomery Levy (`montgomery_field`):**
+//!    The 64-bit transcript state packed from `amount mod LIMB_BASE` and
+//!    `(fee mod BABYBEAR_P) * LIMB_BASE` is reduced modulo `constants::BABYBEAR_P` via
+//!    canonical 32-bit Montgomery reduction (`montgomery_field::monty_reduce`).
+//!
+//! A clearing request must be authorized (`Some(Authorization { total_debit })`) if and
+//! only if the exact mathematical `total_debit` is at most `balance`, and rejected
+//! (`None`) whenever `total_debit > balance`.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod constants;
+pub mod word_math;
+pub mod reciprocal_div;
+pub mod broadword_swar;
+pub mod montgomery_field;
+pub mod goldilocks_field;
+pub mod fee_schedule;
+pub mod liquidity_pool;
+pub mod transcript_codec;
+pub mod clearing_pipeline;
+
+/// Authorizes a rollup batch clearing request `(balance, amount, fee)` if and only if
+/// the exact multi-stage clearing debit does not exceed `balance`.
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let ticket: clearing_pipeline::ClearingTicket =
+        clearing_pipeline::quote_clearing_ticket(amount, fee)?;
+    clearing_pipeline::commit_clearing_ticket(balance, ticket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_zero_transfer() {
+        assert_eq!(authorize(0u64, 0u64, 0u64), Some(Authorization { total_debit: 0u64 }));
+    }
+
+    #[test]
+    fn authorize_single_fee_unit_exact_boundary() {
+        assert_eq!(authorize(260u64, 0u64, 1u64), Some(Authorization { total_debit: 260u64 }));
+        assert_eq!(authorize(259u64, 0u64, 1u64), None);
+    }
+
+    #[test]
+    fn authorize_ordinary_commercial_transfers() {
+        let cases: [(u64, u64, u64); 6] = [
+            (100_000u64, 25_000u64, 2_013_394_831u64),
+            (32_771u64, 10u64, 817_906_990u64),
+            (1_000_000_000u64, 0x8080_8080_8080_8080u64, 833_361_442_500_589u64),
+            (4_294_967_297u64, 1_069_547_520u64, 6_308_717_576u64),
+            (65_535u64, 16_384u64, 1_069_631_816u64),
+            (65_534u64, 21_845u64, 125_930_159u64),
+        ];
+        for (amount, fee, expected) in cases {
+            assert_eq!(
+                authorize(expected, amount, fee),
+                Some(Authorization { total_debit: expected })
+            );
+            assert_eq!(authorize(expected - 1u64, amount, fee), None);
+        }
+    }
+
+    #[test]
+    fn authorize_wide_carry_folding_at_u64_max() {
+        let cases: [(u64, u64, u64); 3] = [
+            (0u64, u64::MAX, 1_660_208_138_808_700u64),
+            (10_000u64, u64::MAX, 1_660_207_132_181_054u64),
+            (1_000_000u64, u64::MAX - 500u64, 1_660_208_139_338_296u64),
+        ];
+        for (amount, fee, expected) in cases {
+            assert_eq!(
+                authorize(expected, amount, fee),
+                Some(Authorization { total_debit: expected })
+            );
+            assert_eq!(authorize(expected - 1u64, amount, fee), None);
+        }
+    }
+
+    #[test]
+    fn authorize_rejects_total_debit_overflow() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 0u64), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX - 100u64, 1_000_000u64), None);
+    }
+}
+//! Protocol-wide arithmetic constants, prime field moduli, reciprocal multipliers,
+//! broadword SWAR bitmasks, and 64-bit word carry-folding parameters for the
+//! rollup batch settlement and clearing engine.
+//!
+//! All arithmetic throughout the clearing crate executes natively on 64-bit machine
+//! words (`u64`) without `u128` promotion so that settlement verification matches
+//! single-word VM register semantics.
+
+/// Standard protocol fee basis-point denominator (`100% = 10_000 bps`).
+pub const BPS_DENOM: u64 = 10_000u64;
+
+/// Maximum non-zero remainder modulo `BPS_DENOM` (`BPS_DENOM - 1`).
+pub const BPS_MAX_REM: u64 = 9_999u64;
+
+/// Exact floor quotient of `2^64` divided by `BPS_DENOM`:
+/// `floor(18_446_744_073_709_551_616 / 10_000) = 1_844_674_407_370_955`.
+pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955u64;
+
+/// Exact positive remainder of `2^64` modulo `BPS_DENOM`:
+/// `18_446_744_073_709_551_616 % 10_000 = 1_616`.
+pub const U64_MOD_BPS_REM: u64 = 1_616u64;
+
+/// Protocol tier rebate divisor (`10` corresponds to a 10% floor rebate on gross fee).
+pub const REBATE_DIVISOR: u64 = 10u64;
+
+/// Passive maker rebate cap divisor (`5` corresponds to a 20% cap on passive limit orders).
+pub const MAKER_REBATE_CAP_DIVISOR: u64 = 5u64;
+
+/// Protocol reserve treasury cut divisor (`4` corresponds to 25% of net fee retained by treasury).
+pub const TREASURY_CUT_DIVISOR: u64 = 4u64;
+
+/// Flash-settlement liquidity surcharge denominator (`5_000` = 2 bps per notional unit).
+pub const FLASH_DENOM: u64 = 5_000u64;
+
+/// Maximum non-zero remainder modulo `FLASH_DENOM` (`FLASH_DENOM - 1`).
+pub const FLASH_MAX_REM: u64 = 4_999u64;
+
+/// Exact floor quotient of `2^64` divided by `FLASH_DENOM`:
+/// `floor(18_446_744_073_709_551_616 / 5_000) = 3_689_348_814_741_910`.
+pub const U64_MOD_FLASH_QUOT: u64 = 3_689_348_814_741_910u64;
+
+/// Exact positive remainder of `2^64` modulo `FLASH_DENOM`:
+/// `18_446_744_073_709_551_616 % 5_000 = 1_616`.
+pub const U64_MOD_FLASH_REM: u64 = 1_616u64;
+
+/// Minimum combined notional classified as institutional settlement volume.
+pub const INSTITUTIONAL_BAND_MIN: u64 = 10_000_000_000_000u64;
+
+/// Normalized 16-bit Möller-Granlund divisor `D = 0x8003 = 32_771` (`2^15 + 3`)
+/// used to partition L1 data-availability blob gas slots.
+pub const MG10_DIVISOR: u64 = 0x8003u64;
+
+/// Precomputed 16-bit Möller-Granlund reciprocal `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65_524`.
+pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+
+/// 16-bit limb extraction mask (`2^16 - 1 = 0xFFFF = 65_535`).
+pub const LIMB_MASK: u64 = 0xFFFFu64;
+
+/// Unsigned borrow-prevention bias `0xC000_0000 = 3_221_225_472` (`49_152 * 2^16`),
+/// which is an exact multiple of `2^16` exceeding `65_535 * MG10_DIVISOR`.
+pub const SUB_BIAS: u64 = 0xC000_0000u64;
+
+/// Nominal gas units allocated per L1 data-availability blob slot (`128 KiB = 131_072`).
+pub const BLOB_GAS_PER_SLOT: u64 = 131_072u64;
+
+/// SWAR 8-lane byte broadcast mask of `0x01` (`0x0101_0101_0101_0101`).
+pub const L8_MASK: u64 = 0x0101_0101_0101_0101u64;
+
+/// SWAR 8-lane byte high-bit mask of `0x80` (`0x8080_8080_8080_8080`).
+pub const H8_MASK: u64 = 0x8080_8080_8080_8080u64;
+
+/// SWAR alternating 16-bit lane mask (`0x00FF_00FF_00FF_00FF`).
+pub const M16_MASK: u64 = 0x00FF_00FF_00FF_00FFu64;
+
+/// SWAR 16-bit lane broadcast multiplier (`0x0001_0001_0001_0001`).
+pub const L16_MASK: u64 = 0x0001_0001_0001_0001u64;
+
+/// Calldata surcharge shift per active non-zero byte lane (`2^8 = 256` units per non-zero byte).
+pub const CALLDATA_NZ_BYTE_SHIFT: u64 = 8u64;
+
+/// BabyBear STARK prime modulus `P = 2^31 - 2^27 + 1 = 2_013_265_921` (`0x7800_0001`).
+pub const BABYBEAR_P: u64 = 2_013_265_921u64;
+
+/// Negative modular inverse of `BABYBEAR_P` modulo `2^32`:
+/// `MU = -P^{-1} mod 2^32 = 2_281_701_377` (`0x87FF_FFFF`).
+pub const BABYBEAR_MU: u64 = 2_281_701_377u64;
+
+/// 32-bit Montgomery radix `R = 2^32 = 4_294_967_296`.
+pub const LIMB_BASE: u64 = 4_294_967_296u64;
+
+/// 32-bit low-limb mask (`2^32 - 1 = 0xFFFF_FFFF`).
+pub const LOW32_MASK: u64 = 0xFFFF_FFFFu64;
+
+/// Goldilocks 64-bit prime modulus `P_G = 2^64 - 2^32 + 1 = 0xFFFF_FFFF_0000_0001`.
+pub const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001u64;
+
+/// Goldilocks reduction epsilon `EPS = 2^32 - 1 = 0xFFFF_FFFF` (`2^64 ≡ EPS (mod P_G)`).
+pub const GOLDILOCKS_EPS: u64 = 0xFFFF_FFFFu64;
+
+/// Transcript header domain tag mask (`0xFF`).
+pub const CODEC_TAG_MASK: u64 = 0xFFu64;
+
+/// Canonical protocol version identifier (`v3 = 3`).
+pub const CODEC_VERSION_V3: u64 = 3u64;
+
+/// Default L2 batch sequencer domain tag (`0x5A = 90`).
+pub const SEQUENCER_DOMAIN_TAG: u64 = 0x5Au64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn babybear_and_goldilocks_radix_identities() {
+        assert_eq!(LIMB_BASE, 1u64 << 32u64);
+        assert_eq!(LOW32_MASK, LIMB_BASE - 1u64);
+        assert_eq!(GOLDILOCKS_P.wrapping_add(GOLDILOCKS_EPS), 0u64);
+        assert_eq!(MG10_DIVISOR, (1u64 << 15u64) + 3u64);
+    }
+
+    #[test]
+    fn swar_mask_lane_alignment() {
+        assert_eq!(L8_MASK * 255u64, u64::MAX);
+        assert_eq!(L8_MASK << 7u64, H8_MASK);
+        assert_eq!(M16_MASK | (M16_MASK << 8u64), u64::MAX);
+        assert_eq!(L16_MASK * 65_535u64, u64::MAX);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/clearing_pipeline.rs
+[?2004l//! Multi-stage rollup batch clearing pipeline and settlement ticket gate.
+//!
+//! Coordinates the four protocol surcharge subsystems to price and authorize
+//! a batch clearing transaction `(balance, amount, fee)`:
+//! 1. `net_bps_fee`: Protocol basis-point settlement fee with 10% floor tier rebate
+//!    (`fee_schedule::evaluate_settlement_fee(word_math::add_u64_with_carry(amount, fee)).net_fee`).
+//! 2. `blob_slot_quotient`: L1 data-availability blob slot quotient via Möller-Granlund
+//!    2-by-1 normalized reciprocal division (`reciprocal_div::quote_blob_gas_slots(amount, fee).slot_quotient`).
+//! 3. `calldata_surcharge`: L1 calldata byte-lane compression surcharge via Vigna SWAR
+//!    broadword operations (`broadword_swar::quote_calldata_lane_surcharge(fee).surcharge`).
+//! 4. `prover_levy`: STARK BabyBear Montgomery transcript verification levy
+//!    (`montgomery_field::quote_prover_transcript_levy(amount, fee).prover_levy`).
+//!
+//! The combined surcharge `total_surcharge = net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy`
+//! is added to the transfer principal `amount` via checked `u64` addition, and the
+//! resulting `ClearingTicket` is committed iff `total_debit <= balance`.
+
+use crate::Authorization;
+use crate::broadword_swar::{CalldataLaneQuote, quote_calldata_lane_surcharge};
+use crate::fee_schedule::{FeeQuote, evaluate_settlement_fee};
+use crate::montgomery_field::{ProverLevyQuote, quote_prover_transcript_levy};
+use crate::reciprocal_div::{BlobSlotQuote, quote_blob_gas_slots};
+use crate::word_math::{WordSum, add_u64_with_carry};
+
+/// Itemized four-stage surcharge breakdown for a rollup clearing operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearingBreakdown {
+    pub net_bps_fee: u64,
+    pub blob_slot_quotient: u64,
+    pub calldata_surcharge: u64,
+    pub prover_levy: u64,
+    pub total_surcharge: u64,
+}
+
+/// Validated clearing settlement ticket ready for balance conservation check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearingTicket {
+    pub principal: u64,
+    pub net_bps_fee: u64,
+    pub blob_slot_quotient: u64,
+    pub calldata_surcharge: u64,
+    pub prover_levy: u64,
+    pub total_surcharge: u64,
+    pub total_debit: u64,
+}
+
+/// Evaluates all four surcharge stages for `(amount, fee)` and sums them into
+/// a `ClearingBreakdown`.
+#[inline]
+pub fn compute_clearing_breakdown(amount: u64, fee: u64) -> ClearingBreakdown {
+    let notional_sum: WordSum = add_u64_with_carry(amount, fee);
+    let fee_quote: FeeQuote = evaluate_settlement_fee(notional_sum);
+    let blob_quote: BlobSlotQuote = quote_blob_gas_slots(amount, fee);
+    let lane_quote: CalldataLaneQuote = quote_calldata_lane_surcharge(fee);
+    let levy_quote: ProverLevyQuote = quote_prover_transcript_levy(amount, fee);
+
+    let net_bps_fee: u64 = fee_quote.net_fee;
+    let blob_slot_quotient: u64 = blob_quote.slot_quotient;
+    let calldata_surcharge: u64 = lane_quote.surcharge;
+    let prover_levy: u64 = levy_quote.prover_levy;
+
+    let total_surcharge: u64 =
+        net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy;
+
+    ClearingBreakdown {
+        net_bps_fee,
+        blob_slot_quotient,
+        calldata_surcharge,
+        prover_levy,
+        total_surcharge,
+    }
+}
+
+/// Assembles a `ClearingTicket` from `amount` and `breakdown`, returning `None`
+/// if `amount + breakdown.total_surcharge` exceeds `u64::MAX`.
+#[inline]
+pub fn assemble_clearing_ticket(
+    amount: u64,
+    breakdown: ClearingBreakdown,
+) -> Option<ClearingTicket> {
+    let total_debit: u64 = amount.checked_add(breakdown.total_surcharge)?;
+    Some(ClearingTicket {
+        principal: amount,
+        net_bps_fee: breakdown.net_bps_fee,
+        blob_slot_quotient: breakdown.blob_slot_quotient,
+        calldata_surcharge: breakdown.calldata_surcharge,
+        prover_levy: breakdown.prover_levy,
+        total_surcharge: breakdown.total_surcharge,
+        total_debit,
+    })
+}
+
+/// Quotes a complete `ClearingTicket` for `(amount, fee)`.
+#[inline]
+pub fn quote_clearing_ticket(amount: u64, fee: u64) -> Option<ClearingTicket> {
+    let breakdown: ClearingBreakdown = compute_clearing_breakdown(amount, fee);
+    assemble_clearing_ticket(amount, breakdown)
+}
+
+/// Commits a `ClearingTicket` against `balance`, authorizing iff `ticket.total_debit <= balance`.
+#[inline]
+pub fn commit_clearing_ticket(balance: u64, ticket: ClearingTicket) -> Option<Authorization> {
+    if ticket.total_debit <= balance {
+        Some(Authorization {
+            total_debit: ticket.total_debit,
+        })
+    } else {
+        None
+    }
+}
+
+/// Computes the post-settlement remaining account balance for telemetry, saturating at zero.
+#[inline]
+pub fn preview_remaining_balance(balance: u64, ticket: ClearingTicket) -> u64 {
+    balance.saturating_sub(ticket.total_debit)
+}
+
+/// Verifies internal surcharge conservation (`net_bps_fee + blob_slot_quotient + calldata_surcharge + prover_levy == total_surcharge`)
+/// on an assembled `ClearingTicket`.
+#[inline]
+pub fn verify_ticket_conservation(ticket: ClearingTicket) -> bool {
+    let recomputed_surcharge: u64 = ticket.net_bps_fee
+        + ticket.blob_slot_quotient
+        + ticket.calldata_surcharge
+        + ticket.prover_levy;
+    (recomputed_surcharge == ticket.total_surcharge)
+        && (ticket.principal.wrapping_add(ticket.total_surcharge) == ticket.total_debit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_transfer_breakdown_is_zero() {
+        let b = compute_clearing_breakdown(0u64, 0u64);
+        assert_eq!(b.net_bps_fee, 0u64);
+        assert_eq!(b.blob_slot_quotient, 0u64);
+        assert_eq!(b.calldata_surcharge, 0u64);
+        assert_eq!(b.prover_levy, 0u64);
+        assert_eq!(b.total_surcharge, 0u64);
+    }
+
+    #[test]
+    fn ticket_overflow_rejected_near_u64_max() {
+        assert_eq!(quote_clearing_ticket(u64::MAX, 1u64), None);
+        assert_eq!(quote_clearing_ticket(u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn remaining_balance_preview_and_ticket_conservation() {
+        let t = quote_clearing_ticket(0u64, 1u64).unwrap();
+        assert_eq!(t.total_debit, 260u64);
+        assert!(verify_ticket_conservation(t));
+        assert_eq!(preview_remaining_balance(300u64, t), 40u64);
+        assert_eq!(preview_remaining_balance(200u64, t), 0u64);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/word_math.rs
+[?2004l//! 64-bit word carry/borrow tracking and 128-bit carry-folded quotient kernels.
+//!
+//! Because two `u64` inputs `lhs` and `rhs` can sum to `[0, 2 * 2^64 - 2]`,
+//! computing exact floor and ceiling quotients `floor((lhs + rhs) / D)` and
+//! `ceil((lhs + rhs) / D)` without `u128` requires tracking the 1-bit carry flag
+//! across the `2^64` word boundary and folding `2^64 = Q_64 * D + R_64`.
+
+use crate::constants::*;
+
+/// Represents the exact 65-bit sum `low_word + (high_carry as u64) * 2^64`
+/// of two 64-bit unsigned words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordSum {
+    pub low_word: u64,
+    pub high_carry: bool,
+}
+
+/// Represents the 64-bit wrapped difference `lhs.wrapping_sub(rhs)` together
+/// with an explicit underflow borrow indicator (`lhs < rhs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordDiff {
+    pub diff_word: u64,
+    pub underflow_borrow: bool,
+}
+
+/// Adds two `u64` words in 64-bit register arithmetic and captures the 64-bit
+/// overflow carry flag (`low_word < lhs`).
+#[inline]
+pub fn add_u64_with_carry(lhs: u64, rhs: u64) -> WordSum {
+    let low_word: u64 = lhs.wrapping_add(rhs);
+    let high_carry: bool = low_word < lhs;
+    WordSum {
+        low_word,
+        high_carry,
+    }
+}
+
+/// Subtracts `rhs` from `lhs` in 64-bit register arithmetic and captures the
+/// underflow borrow flag (`lhs < rhs`).
+#[inline]
+pub fn sub_u64_with_borrow(lhs: u64, rhs: u64) -> WordDiff {
+    let diff_word: u64 = lhs.wrapping_sub(rhs);
+    let underflow_borrow: bool = lhs < rhs;
+    WordDiff {
+        diff_word,
+        underflow_borrow,
+    }
+}
+
+/// Extracts the low 16-bit limb `word & 0xFFFF` (`word mod 2^16`).
+#[inline]
+pub fn extract_low_u16(word: u64) -> u64 {
+    word & LIMB_MASK
+}
+
+/// Extracts the low 32-bit limb `word & 0xFFFF_FFFF` (`word mod 2^32`).
+#[inline]
+pub fn extract_low_u32(word: u64) -> u64 {
+    word & LOW32_MASK
+}
+
+/// Extracts the high 32-bit limb `word >> 32` (`floor(word / 2^32)`).
+#[inline]
+pub fn extract_high_u32(word: u64) -> u64 {
+    word >> 32u64
+}
+
+/// Recombines a 32-bit low limb and 32-bit high limb into a 64-bit word.
+#[inline]
+pub fn pack_u32_limbs(low_u32: u64, high_u32: u64) -> u64 {
+    (low_u32 & LOW32_MASK) | ((high_u32 & LOW32_MASK) << 32u64)
+}
+
+/// Classifies whether a 65-bit combined notional `sum` meets or exceeds
+/// `INSTITUTIONAL_BAND_MIN`.
+#[inline]
+pub fn is_institutional_notional(sum: WordSum) -> bool {
+    if sum.high_carry {
+        true
+    } else {
+        sum.low_word >= INSTITUTIONAL_BAND_MIN
+    }
+}
+
+/// Computes the exact remainder `(lhs + rhs) mod BPS_DENOM` (`BPS_DENOM = 10_000`)
+/// over the full 65-bit `WordSum` range in pure `u64` arithmetic.
+#[inline]
+pub fn rem_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        ((sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM) % BPS_DENOM
+    } else {
+        sum.low_word % BPS_DENOM
+    }
+}
+
+/// Computes the exact floor quotient `floor((lhs + rhs) / BPS_DENOM)` (`BPS_DENOM = 10_000`)
+/// over the full 65-bit `WordSum` range using pure `u64` carry folding.
+#[inline]
+pub fn floor_div_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + (folded_rem / BPS_DENOM)
+    } else {
+        sum.low_word / BPS_DENOM
+    }
+}
+
+/// Computes the ceiling quotient `ceil((lhs + rhs) / BPS_DENOM)` (`BPS_DENOM = 10_000`),
+/// equivalent in exact integer arithmetic to `floor((lhs + rhs + 9_999) / 10_000)`,
+/// over the full 65-bit `WordSum` range using pure `u64` arithmetic.
+#[inline]
+pub fn ceil_div_bps_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+        U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    } else {
+        let biased: u64 = sum.low_word.wrapping_add(BPS_MAX_REM);
+        if biased < sum.low_word {
+            (sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+        } else {
+            biased / BPS_DENOM
+        }
+    }
+}
+
+/// Computes the exact floor quotient `floor((lhs + rhs) / FLASH_DENOM)` (`FLASH_DENOM = 5_000`)
+/// over the full 65-bit `WordSum` range in pure `u64` arithmetic.
+#[inline]
+pub fn floor_div_flash_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % FLASH_DENOM) + U64_MOD_FLASH_REM;
+        U64_MOD_FLASH_QUOT + (sum.low_word / FLASH_DENOM) + (folded_rem / FLASH_DENOM)
+    } else {
+        sum.low_word / FLASH_DENOM
+    }
+}
+
+/// Computes the exact ceiling quotient `ceil((lhs + rhs) / FLASH_DENOM)` (`FLASH_DENOM = 5_000`),
+/// equivalent to `floor((lhs + rhs + 4_999) / 5_000)`, in pure `u64` arithmetic.
+#[inline]
+pub fn ceil_div_flash_u64(sum: WordSum) -> u64 {
+    if sum.high_carry {
+        let folded_rem: u64 = (sum.low_word % FLASH_DENOM) + U64_MOD_FLASH_REM;
+        U64_MOD_FLASH_QUOT + (sum.low_word / FLASH_DENOM) + ((folded_rem + FLASH_MAX_REM) / FLASH_DENOM)
+    } else {
+        let biased: u64 = sum.low_word.wrapping_add(FLASH_MAX_REM);
+        if biased < sum.low_word {
+            (sum.low_word / FLASH_DENOM) + (((sum.low_word % FLASH_DENOM) + FLASH_MAX_REM) / FLASH_DENOM)
+        } else {
+            biased / FLASH_DENOM
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_and_sub_carry_borrow_flags() {
+        let s0 = add_u64_with_carry(100u64, 250u64);
+        assert_eq!(s0.low_word, 350u64);
+        assert!(!s0.high_carry);
+
+        let s1 = add_u64_with_carry(u64::MAX, 1u64);
+        assert_eq!(s1.low_word, 0u64);
+        assert!(s1.high_carry);
+
+        let d0 = sub_u64_with_borrow(500u64, 120u64);
+        assert_eq!(d0.diff_word, 380u64);
+        assert!(!d0.underflow_borrow);
+
+        let d1 = sub_u64_with_borrow(10u64, 20u64);
+        assert!(d1.underflow_borrow);
+    }
+
+    #[test]
+    fn limb_extraction_and_packing_roundtrip() {
+        let w: u64 = 0x1234_5678_9ABC_DEF0u64;
+        assert_eq!(extract_low_u16(w), 0xDEF0u64);
+        assert_eq!(extract_low_u32(w), 0x9ABC_DEF0u64);
+        assert_eq!(extract_high_u32(w), 0x1234_5678u64);
+        assert_eq!(pack_u32_limbs(extract_low_u32(w), extract_high_u32(w)), w);
+    }
+
+    #[test]
+    fn bps_floor_and_ceil_at_zero_and_u64_max() {
+        let z = add_u64_with_carry(0u64, 0u64);
+        assert_eq!(floor_div_bps_u64(z), 0u64);
+        assert_eq!(ceil_div_bps_u64(z), 0u64);
+        assert_eq!(rem_bps_u64(z), 0u64);
+
+        let one = add_u64_with_carry(1u64, 0u64);
+        assert_eq!(floor_div_bps_u64(one), 0u64);
+        assert_eq!(ceil_div_bps_u64(one), 1u64);
+        assert_eq!(rem_bps_u64(one), 1u64);
+
+        let at_max = add_u64_with_carry(0u64, u64::MAX);
+        assert_eq!(floor_div_bps_u64(at_max), 1_844_674_407_370_955u64);
+        assert_eq!(ceil_div_bps_u64(at_max), 1_844_674_407_370_956u64);
+        assert_eq!(rem_bps_u64(at_max), 1_615u64);
+    }
+
+    #[test]
+    fn bps_carry_folding_above_u64_max() {
+        let wrapped = add_u64_with_carry(10_000u64, u64::MAX);
+        assert!(wrapped.high_carry);
+        assert_eq!(floor_div_bps_u64(wrapped), 1_844_674_407_370_956u64);
+        assert_eq!(ceil_div_bps_u64(wrapped), 1_844_674_407_370_957u64);
+        assert_eq!(rem_bps_u64(wrapped), 1_615u64);
+
+        let double_max = add_u64_with_carry(u64::MAX, u64::MAX);
+        assert_eq!(floor_div_bps_u64(double_max), 3_689_348_814_741_910u64);
+        assert_eq!(ceil_div_bps_u64(double_max), 3_689_348_814_741_911u64);
+    }
+
+    #[test]
+    fn flash_floor_and_ceil_across_boundaries() {
+        let s = add_u64_with_carry(0u64, u64::MAX - 2_500u64);
+        assert_eq!(ceil_div_flash_u64(s), 3_689_348_814_741_910u64);
+        assert_eq!(floor_div_flash_u64(s), 3_689_348_814_741_909u64);
+
+        let s_hi = add_u64_with_carry(u64::MAX, 5_000u64);
+        assert!(is_institutional_notional(s_hi));
+        assert_eq!(floor_div_flash_u64(s_hi), 3_689_348_814_741_911u64);
+        assert_eq!(ceil_div_flash_u64(s_hi), 3_689_348_814_741_912u64);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/fee_schedule.rs
+[?2004l//! Protocol basis-point settlement fee and tier rebate schedule calculator.
+//!
+//! Given a 65-bit combined notional `sum = add_u64_with_carry(amount, fee)`:
+//! 1. The gross settlement fee is the ceiling basis-point quotient
+//!    `gross_fee = ceil((amount + fee) / BPS_DENOM)` (`BPS_DENOM = 10_000`).
+//! 2. The tier rebate is the floor 10% discount
+//!    `rebate = floor(gross_fee / REBATE_DIVISOR)` (`REBATE_DIVISOR = 10`).
+//! 3. The net protocol settlement fee is `net_fee = gross_fee - rebate`.
+
+use crate::constants::*;
+use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64, is_institutional_notional};
+
+/// Active protocol fee schedule parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSchedule {
+    pub bps_denom: u64,
+    pub rebate_divisor: u64,
+    pub maker_cap_divisor: u64,
+}
+
+/// Complete two-stage fee quote (`gross_fee`, `rebate`, `net_fee`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeQuote {
+    pub gross_fee: u64,
+    pub rebate: u64,
+    pub net_fee: u64,
+}
+
+/// Returns the canonical protocol fee schedule configuration.
+#[inline]
+pub fn default_schedule() -> FeeSchedule {
+    FeeSchedule {
+        bps_denom: BPS_DENOM,
+        rebate_divisor: REBATE_DIVISOR,
+        maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+    }
+}
+
+/// Computes the 10% floor tier rebate `floor(gross_fee / REBATE_DIVISOR)`.
+#[inline]
+pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+    gross_fee / REBATE_DIVISOR
+}
+
+/// Computes a capped passive maker rebate `min(floor(gross_fee / 10), floor(cap_basis / 5))`
+/// used by order-book analytics.
+#[inline]
+pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+    let base_rebate: u64 = gross_fee / REBATE_DIVISOR;
+    let max_rebate: u64 = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+    if base_rebate <= max_rebate {
+        base_rebate
+    } else {
+        max_rebate
+    }
+}
+
+/// Evaluates the active clearing protocol fee quote (`gross_fee`, `rebate`, `net_fee`)
+/// from a 65-bit notional sum `sum = amount + fee` using ceiling basis-point division
+/// and floor tier rebate.
+#[inline]
+pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = ceil_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Evaluates a passive liquidity floor fee quote (`floor((amount + fee) / 10_000)`)
+/// for pool reserve telemetry.
+#[inline]
+pub fn evaluate_passive_floor_fee(sum: WordSum) -> FeeQuote {
+    let gross_fee: u64 = floor_div_bps_u64(sum);
+    let rebate: u64 = compute_tier_rebate(gross_fee);
+    let net_fee: u64 = gross_fee - rebate;
+    FeeQuote {
+        gross_fee,
+        rebate,
+        net_fee,
+    }
+}
+
+/// Computes the rounding spread (`ceil_quote.net_fee - floor_quote.net_fee`)
+/// between active ceiling settlement and passive floor settlement.
+#[inline]
+pub fn compute_fee_rounding_spread(sum: WordSum) -> u64 {
+    let ceil_q: FeeQuote = evaluate_settlement_fee(sum);
+    let floor_q: FeeQuote = evaluate_passive_floor_fee(sum);
+    ceil_q.net_fee - floor_q.net_fee
+}
+
+/// Classifies the fee tier code (`0 = zero`, `1 = retail`, `2 = institutional`)
+/// for batch telemetry reporting.
+#[inline]
+pub fn classify_settlement_tier(sum: WordSum) -> u64 {
+    if !sum.high_carry && sum.low_word == 0u64 {
+        0u64
+    } else if is_institutional_notional(sum) {
+        2u64
+    } else {
+        1u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::word_math::add_u64_with_carry;
+
+    #[test]
+    fn settlement_fee_and_rebate_rounding() {
+        let s = add_u64_with_carry(100_000u64, 25_000u64);
+        let q = evaluate_settlement_fee(s);
+        assert_eq!(q.gross_fee, 13u64);
+        assert_eq!(q.rebate, 1u64);
+        assert_eq!(q.net_fee, 12u64);
+
+        let pf = evaluate_passive_floor_fee(s);
+        assert_eq!(pf.gross_fee, 12u64);
+        assert_eq!(pf.rebate, 1u64);
+        assert_eq!(pf.net_fee, 11u64);
+        assert_eq!(compute_fee_rounding_spread(s), 1u64);
+    }
+
+    #[test]
+    fn capped_maker_rebate_and_default_schedule() {
+        let sched = default_schedule();
+        assert_eq!(sched.bps_denom, 10_000u64);
+        assert_eq!(compute_capped_maker_rebate(100u64, 30u64), 6u64);
+        assert_eq!(compute_capped_maker_rebate(100u64, 100u64), 10u64);
+    }
+
+    #[test]
+    fn settlement_tier_classification() {
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(0u64, 0u64)), 0u64);
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(50_000u64, 100u64)), 1u64);
+        assert_eq!(classify_settlement_tier(add_u64_with_carry(INSTITUTIONAL_BAND_MIN, 0u64)), 2u64);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/reciprocal_div.rs
+[?2004l//! Multiprecision 2-by-1 normalized reciprocal division (`alloy-rs/ruint` algorithm)
+//! for L1 data-availability blob gas slot partitioning.
+//!
+//! Given a normalized 16-bit divisor `D = MG10_DIVISOR = 0x8003 = 32_771` (`2^15 + 3`)
+//! with precomputed reciprocal `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65_524`,
+//! `div_2x1_mg10(u1, u0)` computes the exact floor quotient
+//! `floor((u1 * 2^16 + u0) / D)` for all `u1 < D` and `u0 < 2^16` using only
+//! shifts, bitwise masks, and `u64` multiplications (without hardware `/` or `%`
+//! in the core reciprocal step).
+
+use crate::constants::*;
+use crate::word_math::extract_low_u16;
+
+/// Captures the two-limb blob gas dividend `(high_limb, low_limb)` and its
+/// exact Euclidean division decomposition `high_limb * 2^16 + low_limb = D * slot_quotient + slot_remainder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobSlotQuote {
+    pub high_limb: u64,
+    pub low_limb: u64,
+    pub slot_quotient: u64,
+    pub slot_remainder: u64,
+}
+
+/// Möller-Granlund 2-by-1 normalized reciprocal division (`div_2x1_mg10`)
+/// for divisor `MG10_DIVISOR = 0x8003 = 32_771` and reciprocal `MG10_RECIPROCAL = 0xFFF4 = 65_524`.
+///
+/// Preconditions guaranteed by caller: `u1 < MG10_DIVISOR` and `u0 < 2^16`.
+/// Returns the exact integer quotient `floor((u1 * 65_536 + u0) / 32_771)`.
+#[inline]
+pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+    let q_full: u64 = (u1 * MG10_RECIPROCAL) + (u1 << 16u64) + u0 + (1u64 << 16u64);
+
+    let q1: u64 = q_full >> 16u64;
+    let q0: u64 = q_full & LIMB_MASK;
+    let r: u64 = (SUB_BIAS + u0 - q1 * MG10_DIVISOR) & LIMB_MASK;
+
+    let (q_corr, r_corr): (u64, u64) = if q0 < r {
+        (q1 - 1u64, (r + MG10_DIVISOR) & LIMB_MASK)
+    } else {
+        (q1, r)
+    };
+
+    if r_corr >= MG10_DIVISOR {
+        q_corr + 1u64
+    } else {
+        q_corr
+    }
+}
+
+/// Reconstructs the exact remainder `(u1 * 2^16 + u0) - quot * MG10_DIVISOR`
+/// from a computed quotient `quot = floor((u1 * 2^16 + u0) / MG10_DIVISOR)`.
+#[inline]
+pub fn rem_2x1_mg10(u1: u64, u0: u64, quot: u64) -> u64 {
+    let dividend: u64 = (u1 << 16u64) + u0;
+    dividend - (quot * MG10_DIVISOR)
+}
+
+/// Computes the L1 blob gas slot quotient and remainder for a settlement pair `(amount, fee)`:
+/// - `high_limb = fee % MG10_DIVISOR` (`u1 in [0, 32_770]`)
+/// - `low_limb = amount & 0xFFFF` (`u0 in [0, 65_535]`)
+/// - `slot_quotient = floor((high_limb * 65_536 + low_limb) / 32_771)`
+/// - `slot_remainder = (high_limb * 65_536 + low_limb) % 32_771`
+#[inline]
+pub fn quote_blob_gas_slots(amount: u64, fee: u64) -> BlobSlotQuote {
+    let high_limb: u64 = fee % MG10_DIVISOR;
+    let low_limb: u64 = extract_low_u16(amount);
+    let slot_quotient: u64 = div_2x1_mg10(high_limb, low_limb);
+    let slot_remainder: u64 = rem_2x1_mg10(high_limb, low_limb, slot_quotient);
+    BlobSlotQuote {
+        high_limb,
+        low_limb,
+        slot_quotient,
+        slot_remainder,
+    }
+}
+
+/// Verifies the Euclidean division invariant `0 <= slot_remainder < MG10_DIVISOR`
+/// and `slot_quotient * MG10_DIVISOR + slot_remainder == high_limb * 2^16 + low_limb`
+/// for diagnostic auditing.
+#[inline]
+pub fn verify_blob_slot_euclidean(quote: BlobSlotQuote) -> bool {
+    let dividend: u64 = (quote.high_limb << 16u64) + quote.low_limb;
+    let reconstructed: u64 = (quote.slot_quotient * MG10_DIVISOR) + quote.slot_remainder;
+    (quote.slot_remainder < MG10_DIVISOR) && (reconstructed == dividend)
+}
+
+/// Estimates raw L1 blob gas units `slot_quotient * BLOB_GAS_PER_SLOT` for telemetry.
+#[inline]
+pub fn estimate_blob_gas_units(quote: BlobSlotQuote) -> u64 {
+    quote.slot_quotient * BLOB_GAS_PER_SLOT
+}
+
+/// Computes the ceiling blob slot count `slot_quotient + (if slot_remainder > 0 { 1 } else { 0 })`
+/// for batch reservation telemetry.
+#[inline]
+pub fn ceil_blob_slots(quote: BlobSlotQuote) -> u64 {
+    if quote.slot_remainder > 0u64 {
+        quote.slot_quotient + 1u64
+    } else {
+        quote.slot_quotient
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mg10_zero_and_exact_multiples() {
+        assert_eq!(div_2x1_mg10(0u64, 0u64), 0u64);
+        assert_eq!(div_2x1_mg10(0u64, 32_770u64), 0u64);
+        assert_eq!(div_2x1_mg10(0u64, 32_771u64), 1u64);
+        assert_eq!(div_2x1_mg10(1u64, 0u64), 1u64);
+        assert_eq!(div_2x1_mg10(10u64, 32_771u64), 20u64);
+    }
+
+    #[test]
+    fn mg10_exhaustive_boundary_sweeps() {
+        for u1 in [0u64, 1u64, 2u64, 16_384u64, 21_845u64, 32_769u64, 32_770u64] {
+            for u0 in [0u64, 1u64, 2u64, 32_770u64, 32_771u64, 32_772u64, 65_534u64, 65_535u64] {
+                let expected: u64 = ((u1 << 16u64) + u0) / MG10_DIVISOR;
+                let actual: u64 = div_2x1_mg10(u1, u0);
+                assert_eq!(actual, expected, "mismatch at u1={}, u0={}", u1, u0);
+            }
+        }
+    }
+
+    #[test]
+    fn mg10_second_correction_branch_is_exact() {
+        let q_a = quote_blob_gas_slots(65_535u64, 16_384u64);
+        assert!(verify_blob_slot_euclidean(q_a));
+        assert_eq!(q_a.slot_quotient, 32_767u64);
+        assert_eq!(ceil_blob_slots(q_a), 32_768u64);
+
+        let q_b = quote_blob_gas_slots(65_534u64, 21_845u64);
+        assert!(verify_blob_slot_euclidean(q_b));
+        assert_eq!(q_b.slot_quotient, 43_688u64);
+    }
+
+    #[test]
+    fn blob_gas_unit_telemetry() {
+        let q = quote_blob_gas_slots(32_771u64, 0u64);
+        assert_eq!(q.slot_quotient, 1u64);
+        assert_eq!(q.slot_remainder, 0u64);
+        assert_eq!(ceil_blob_slots(q), 1u64);
+        assert_eq!(estimate_blob_gas_units(q), BLOB_GAS_PER_SLOT);
+    }
+
+    #[test]
+    fn mg10_maximum_two_limb_dividend() {
+        let q_max = quote_blob_gas_slots(65_535u64, 32_770u64);
+        assert!(verify_blob_slot_euclidean(q_max));
+        assert_eq!(q_max.slot_quotient, 65_535u64);
+        assert_eq!(q_max.slot_remainder, 32_770u64);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/broadword_swar.rs
+[?2004l//! Vigna (`tov/succinct-rs`) 8-lane SWAR (SIMD Within A Register) broadword byte
+//! inspection and accumulation kernels for L1 calldata compression pricing.
+//!
+//! Zero-knowledge rollup batches compress zero bytes in transaction fee parameters
+//! much more cheaply than non-zero bytes. For a 64-bit word `fee` viewed as 8 bytes
+//! `b_0, b_1, ..., b_7` (`b_i = (fee >> (8 * i)) & 0xFF`):
+//! - Each non-zero byte (`b_i > 0`) incurs a fixed `256`-unit activation surcharge.
+//! - Each byte additionally contributes its numeric value `b_i` (`0..=255`).
+//! Thus the total calldata byte-lane surcharge is:
+//! `256 * |{i in 0..8 : b_i > 0}| + sum_{i=0..7} b_i`.
+
+use crate::constants::*;
+
+/// Breakdown of the 8-byte SWAR calldata inspection on a 64-bit parameter word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalldataLaneQuote {
+    pub active_lanes: u64,
+    pub byte_weight_sum: u64,
+    pub surcharge: u64,
+}
+
+/// Vigna's broadword non-zero byte detector (`u_nz8`):
+/// Sets bit 7 (`0x80`) of byte lane `i` if and only if byte `i` of `x` is non-zero (`b_i > 0`),
+/// and clears all other bits in every lane.
+///
+/// Identity: `((((x | H8_MASK) - L8_MASK) | x) & H8_MASK)`:
+/// - Setting `| H8_MASK` ensures bit 7 of each byte is `1`, blocking borrow propagation
+///   between adjacent bytes when subtracting `L8_MASK` (`0x01` in each byte).
+/// - If low 7 bits of byte `i` are non-zero, subtracting `1` leaves bit 7 equal to `1`.
+/// - If byte `i` is `0x80` (`128`), subtracting `1` clears bit 7 to `0`, and `| x`
+///   restores bit 7 to `1`.
+/// - If byte `i` is `0x00`, subtracting `1` clears bit 7 to `0`, and `| x` leaves it `0`.
+#[inline]
+pub fn u_nz8(x: u64) -> u64 {
+    (((x | H8_MASK) - L8_MASK) | x) & H8_MASK
+}
+
+/// Counts the number of non-zero bytes (`0..=8`) in a 64-bit word `x` in `O(1)`
+/// register operations by shifting the `0x80` lane flags of `u_nz8(x)` down to `0x01`
+/// and multiplying by `L8_MASK` to sum all 8 lanes in the top byte (`>> 56`).
+#[inline]
+pub fn count_nz_bytes(x: u64) -> u64 {
+    ((u_nz8(x) >> 7u64) * L8_MASK) >> 56u64
+}
+
+/// Counts the number of zero bytes (`0..=8`) in a 64-bit word `x`.
+#[inline]
+pub fn count_zero_bytes_swar(x: u64) -> u64 {
+    8u64 - count_nz_bytes(x)
+}
+
+/// Checks whether any byte lane of `x` has its most significant bit (`0x80`) set.
+#[inline]
+pub fn has_high_bit_byte(x: u64) -> bool {
+    (x & H8_MASK) != 0u64
+}
+
+/// Computes the exact sum of all 8 bytes `b_0 + b_1 + ... + b_7` (`0..=2040`) of `x`
+/// using two-lane 16-bit SWAR accumulation (`M16_MASK`) followed by `L16_MASK`
+/// multiplication into the top 16-bit lane (`>> 48`).
+#[inline]
+pub fn sum_bytes(x: u64) -> u64 {
+    let pair_sum: u64 = (x & M16_MASK) + ((x >> 8u64) & M16_MASK);
+    ((pair_sum * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Computes the sum of even-indexed bytes `b_0 + b_2 + b_4 + b_6` of `x`.
+#[inline]
+pub fn sum_even_bytes_swar(x: u64) -> u64 {
+    let even_lanes: u64 = x & M16_MASK;
+    ((even_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Computes the sum of odd-indexed bytes `b_1 + b_3 + b_5 + b_7` of `x`.
+#[inline]
+pub fn sum_odd_bytes_swar(x: u64) -> u64 {
+    let odd_lanes: u64 = (x >> 8u64) & M16_MASK;
+    ((odd_lanes * L16_MASK) >> 48u64) & LIMB_MASK
+}
+
+/// Quotes the L1 calldata byte-lane surcharge for `fee`:
+/// `surcharge = (count_nz_bytes(fee) << 8) + sum_bytes(fee)`.
+#[inline]
+pub fn quote_calldata_lane_surcharge(fee: u64) -> CalldataLaneQuote {
+    let active_lanes: u64 = count_nz_bytes(fee);
+    let byte_weight_sum: u64 = sum_bytes(fee);
+    let surcharge: u64 = (active_lanes << CALLDATA_NZ_BYTE_SHIFT) + byte_weight_sum;
+    CalldataLaneQuote {
+        active_lanes,
+        byte_weight_sum,
+        surcharge,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swar_zero_and_single_byte_lanes() {
+        let q0 = quote_calldata_lane_surcharge(0u64);
+        assert_eq!(q0.active_lanes, 0u64);
+        assert_eq!(q0.byte_weight_sum, 0u64);
+        assert_eq!(q0.surcharge, 0u64);
+        assert_eq!(count_zero_bytes_swar(0u64), 8u64);
+
+        let q1 = quote_calldata_lane_surcharge(1u64);
+        assert_eq!(q1.active_lanes, 1u64);
+        assert_eq!(q1.byte_weight_sum, 1u64);
+        assert_eq!(q1.surcharge, 257u64);
+    }
+
+    #[test]
+    fn swar_high_bit_0x80_bytes_detected_as_nonzero() {
+        let single_0x80: u64 = 0x80u64;
+        let q_single = quote_calldata_lane_surcharge(single_0x80);
+        assert_eq!(q_single.active_lanes, 1u64);
+        assert_eq!(q_single.byte_weight_sum, 128u64);
+        assert_eq!(q_single.surcharge, 384u64);
+        assert!(has_high_bit_byte(single_0x80));
+
+        let all_0x80: u64 = H8_MASK;
+        let q_all = quote_calldata_lane_surcharge(all_0x80);
+        assert_eq!(q_all.active_lanes, 8u64);
+        assert_eq!(q_all.byte_weight_sum, 1024u64);
+        assert_eq!(q_all.surcharge, 3072u64);
+    }
+
+    #[test]
+    fn swar_all_0xff_max_word() {
+        let q_max = quote_calldata_lane_surcharge(u64::MAX);
+        assert_eq!(q_max.active_lanes, 8u64);
+        assert_eq!(q_max.byte_weight_sum, 2040u64);
+        assert_eq!(q_max.surcharge, 4088u64);
+        assert_eq!(count_zero_bytes_swar(u64::MAX), 0u64);
+    }
+
+    #[test]
+    fn swar_mixed_byte_pattern_and_even_odd_partition() {
+        let word: u64 = 0x0010_807F_00FF_0100u64;
+        let q = quote_calldata_lane_surcharge(word);
+        assert_eq!(q.active_lanes, 5u64);
+        assert_eq!(q.byte_weight_sum, 527u64);
+        assert_eq!(q.surcharge, 5u64 * 256u64 + 527u64);
+        assert_eq!(sum_even_bytes_swar(word) + sum_odd_bytes_swar(word), q.byte_weight_sum);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# cat challenge/src/montgomery_field.rs
+[?2004l//! `Plonky3` BabyBear (`P = 2_013_265_921 = 2^31 - 2^27 + 1`) 64-bit Montgomery
+//! reduction and STARK prover transcript commitment levy calculator.
+//!
+//! For radix `R = 2^32 = 4_294_967_296` and prime `P = 2_013_265_921`:
+//! - `R^{-1} mod P = 943_718_400`
+//! - `MU = -P^{-1} mod R = 2_281_701_377`
+//! Given a 64-bit packed transcript state `x < P * R`:
+//! 1. `t = ((x mod R) * MU) mod R`
+//! 2. `u = t * P` (so `x - u` is an exact multiple of `R = 2^32` in `(-P * R, P * R)`)
+//! 3. If `x < u`, `(x - u) / R + P` is computed in `u64` via
+//!    `P + (x.wrapping_sub(u) / R) - R`; otherwise `(x - u) / R`.
+//! The result equals `(x * R^{-1}) mod P` in `[0, P - 1]`.
+
+use crate::constants::*;
+
+/// Captures the packed 64-bit transcript state, Montgomery quotient limb `t`,
+/// and canonical BabyBear field element `prover_levy in [0, BABYBEAR_P - 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProverLevyQuote {
+    pub packed_transcript: u64,
+    pub monty_t: u64,
+    pub prover_levy: u64,
+}
+
+/// Packs the low 32-bit limb of `amount` (`amount mod 2^32`) and the canonical
+/// BabyBear residue of `fee` (`fee mod P`) into a 64-bit transcript integer
+/// `x = (amount % 2^32) + (fee % P) * 2^32 < P * 2^32`.
+#[inline]
+pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+    (amount % LIMB_BASE) + (fee % BABYBEAR_P) * LIMB_BASE
+}
+
+/// Computes the 32-bit Montgomery reduction multiplier `t = ((x mod 2^32) * MU) mod 2^32`.
+#[inline]
+pub fn monty_quotient(x: u64) -> u64 {
+    ((x % LIMB_BASE) * BABYBEAR_MU) % LIMB_BASE
+}
+
+/// Performs 64-bit BabyBear Montgomery reduction on `x < BABYBEAR_P * 2^32`,
+/// returning `(x * 943_718_400) mod 2_013_265_921` in pure `u64` arithmetic.
+#[inline]
+pub fn monty_reduce(x: u64) -> u64 {
+    let t: u64 = monty_quotient(x);
+    let u: u64 = BABYBEAR_P * t;
+    let diff: u64 = x.wrapping_sub(u);
+    let hi: u64 = diff / LIMB_BASE;
+    if x < u {
+        BABYBEAR_P + hi - LIMB_BASE
+    } else {
+        hi
+    }
+}
+
+/// Performs Montgomery multiplication `(a * b * R^{-1}) mod BABYBEAR_P`
+/// for two BabyBear field elements `a, b < BABYBEAR_P`.
+#[inline]
+pub fn monty_mul_babybear(a: u64, b: u64) -> u64 {
+    let prod: u64 = (a % BABYBEAR_P) * (b % BABYBEAR_P);
+    monty_reduce(prod)
+}
+
+/// Canonical modular addition `(a + b) mod BABYBEAR_P` for `a, b < BABYBEAR_P`.
+#[inline]
+pub fn canonical_add_babybear(a: u64, b: u64) -> u64 {
+    let sum: u64 = a + b;
+    if sum >= BABYBEAR_P {
+        sum - BABYBEAR_P
+    } else {
+        sum
+    }
+}
+
+/// Canonical modular subtraction `(a - b) mod BABYBEAR_P` for `a, b < BABYBEAR_P`.
+#[inline]
+pub fn canonical_sub_babybear(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        (a + BABYBEAR_P) - b
+    }
+}
+
+/// Quotes the STARK prover transcript commitment levy for `(amount, fee)`:
+/// `prover_levy = monty_reduce(pack_transcript(amount, fee))`.
+#[inline]
+pub fn quote_prover_transcript_levy(amount: u64, fee: u64) -> ProverLevyQuote {
+    let packed_transcript: u64 = pack_transcript(amount, fee);
+    let monty_t: u64 = monty_quotient(packed_transcript);
+    let prover_levy: u64 = monty_reduce(packed_transcript);
+    ProverLevyQuote {
+        packed_transcript,
+        monty_t,
+        prover_levy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monty_reduce_zero_and_multiples_of_p() {
+        assert_eq!(monty_reduce(0u64), 0u64);
+        assert_eq!(monty_reduce(BABYBEAR_P), 0u64);
+        assert_eq!(monty_reduce(BABYBEAR_P * 42u64), 0u64);
+    }
+
+    #[test]
+    fn monty_reduce_radix_r_gives_one() {
+        assert_eq!(monty_reduce(LIMB_BASE), 1u64);
+        let q = quote_prover_transcript_levy(0u64, 1u64);
+        assert_eq!(q.prover_levy, 1u64);
+    }
+
+    #[test]
+    fn monty_reduce_underflow_branch_and_non_underflow_branch() {
+        let q_under = quote_prover_transcript_levy(1u64, 0u64);
+        assert_eq!(q_under.prover_levy, 943_718_400u64);
+
+        assert_eq!(monty_reduce(BABYBEAR_P), 0u64);
+
+        let q_high = quote_prover_transcript_levy(u64::MAX, BABYBEAR_P - 1u64);
+        assert_eq!(q_high.prover_levy, 1_069_547_521u64);
+    }
+
+    #[test]
+    fn canonical_babybear_ring_operations() {
+        assert_eq!(canonical_add_babybear(BABYBEAR_P - 1u64, 2u64), 1u64);
+        assert_eq!(canonical_sub_babybear(1u64, 2u64), BABYBEAR_P - 1u64);
+        let r_mod_p: u64 = LIMB_BASE % BABYBEAR_P;
+        assert_eq!(monty_mul_babybear(17u64, r_mod_p), 17u64);
+    }
+}
+[?2004hroot@07b8edb2de26:/workspace# grep -n 'pub fn\|use crate' challenge/src/goldilocks_field.rs challenge/src/liquidity_pool.rs challenge/src/transcript_codec.rs
+[?2004l[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K11[m[K[36m[K:[m[K[01;31m[Kuse crate[m[K::constants::*;
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K24[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K reduce_goldilocks_step1(x_lo: u64, x_hi: u64) -> (u64, bool) {
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K32[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K reduce_goldilocks_128(x_lo: u64, x_hi: u64) -> u64 {
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K56[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K canonicalize_goldilocks_u64(x: u64) -> u64 {
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K66[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K add_goldilocks_mod(a: u64, b: u64) -> u64 {
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K72[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K sub_goldilocks_mod(a: u64, b: u64) -> u64 {
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K84[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K fold_goldilocks_challenge(commitment: u64, challenge_u32: u64) -> u64 {
+[35m[Kchallenge/src/goldilocks_field.rs[m[K[36m[K:[m[K[32m[K98[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K quote_bridge_verifier_fee(amount: u64, fee: u64) -> GoldilocksQuote {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K4[m[K[36m[K:[m[K[01;31m[Kuse crate[m[K::constants::*;
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K5[m[K[36m[K:[m[K[01;31m[Kuse crate[m[K::fee_schedule::FeeQuote;
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K6[m[K[36m[K:[m[K[01;31m[Kuse crate[m[K::word_math::{add_u64_with_carry, ceil_div_flash_u64, floor_div_flash_u64};
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K26[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K split_pool_reserve(quote: FeeQuote) -> PoolReserveQuote {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K37[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K quote_lp_retention(quote: FeeQuote) -> u64 {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K45[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K assess_flash_fee_ceil(principal: u64, surcharge: u64) -> u64 {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K53[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K assess_flash_fee_floor(principal: u64, surcharge: u64) -> u64 {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K60[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K quote_flash_repayment(principal: u64, surcharge: u64) -> Option<FlashLoanReceipt> {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K73[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K check_pool_reserve_solvency(current_reserve: u64, quote: FeeQuote, min_reserve: u64) -> bool {
+[35m[Kchallenge/src/liquidity_pool.rs[m[K[36m[K:[m[K[32m[K84[m[K[36m[K:[m[K    [01;31m[Kuse crate[m[K::fee_schedule::evaluate_settlement_fee;
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K3[m[K[36m[K:[m[K[01;31m[Kuse crate[m[K::constants::*;
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K4[m[K[36m[K:[m[K[01;31m[Kuse crate[m[K::word_math::{extract_high_u32, extract_low_u32};
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K18[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K decode_domain_tag(word: u64) -> u64 {
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K29[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K build_transcript_header(amount: u64, fee: u64) -> TranscriptHeader {
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K45[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K verify_header_version(header: TranscriptHeader) -> bool {
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K51[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K fold_header_digest(header: TranscriptHeader) -> u64 {
+[35m[Kchallenge/src/transcript_codec.rs[m[K[36m[K:[m[K[32m[K57[m[K[36m[K:[m[K[01;31m[Kpub fn[m[K mix_batch_header_digests(left: TranscriptHeader, right: TranscriptHeader) -> u64 {
+[?2004hroot@07b8edb2de26:/workspace# cat lean/SecurityChallenge.lean
+[?2004limport Lean
+import LeanModel.ClearingPipeline
+
+namespace SecurityChallenge
+
+export LeanModel.Constants (
+  bpsDenom bpsMaxRem u64ModBpsQuot u64ModBpsRem rebateDivisor
+  makerRebateCapDivisor treasuryCutDivisor flashDenom flashMaxRem
+  u64ModFlashQuot u64ModFlashRem institutionalBandMin
+  mg10Divisor mg10Reciprocal limbMask subBias blobGasPerSlot
+  l8Mask h8Mask m16Mask l16Mask calldataNzByteShift
+  babyBearP babyBearMu limbBase low32Mask
+  goldilocksP goldilocksEps
+  codecTagMask codecVersionV3 sequencerDomainTag
+  u64Max
+)
+export LeanModel.WordMath (
+  WordSum WordDiff addU64WithCarry subU64WithBorrow
+  extractLowU16 extractLowU32 extractHighU32 packU32Limbs
+  isInstitutionalNotional remBpsU64 floorDivBpsU64 ceilDivBpsU64
+  floorDivFlashU64 ceilDivFlashU64
+)
+export LeanModel.ReciprocalDiv (
+  BlobSlotQuote div2x1Mg10 rem2x1Mg10 quoteBlobGasSlots
+  verifyBlobSlotEuclidean estimateBlobGasUnits ceilBlobSlots
+)
+export LeanModel.BroadwordSwar (
+  CalldataLaneQuote uNz8 countNzBytes countZeroBytesSwar
+  hasHighBitByte sumBytes sumEvenBytesSwar sumOddBytesSwar
+  quoteCalldataLaneSurcharge
+)
+export LeanModel.MontgomeryField (
+  ProverLevyQuote packTranscript montyQuotient montyReduce
+  montyMulBabyBear canonicalAddBabyBear canonicalSubBabyBear
+  quoteProverTranscriptLevy
+)
+export LeanModel.GoldilocksField (
+  GoldilocksQuote reduceGoldilocksStep1 reduceGoldilocks128
+  canonicalizeGoldilocksU64 addGoldilocksMod subGoldilocksMod
+  foldGoldilocksChallenge quoteBridgeVerifierFee
+)
+export LeanModel.FeeSchedule (
+  FeeSchedule FeeQuote defaultSchedule computeTierRebate
+  computeCappedMakerRebate evaluateSettlementFee evaluatePassiveFloorFee
+  computeFeeRoundingSpread classifySettlementTier
+)
+export LeanModel.LiquidityPool (
+  PoolReserveQuote FlashLoanReceipt splitPoolReserve quoteLpRetention
+  assessFlashFeeCeil assessFlashFeeFloor quoteFlashRepayment
+  checkPoolReserveSolvency
+)
+export LeanModel.TranscriptCodec (
+  TranscriptHeader decodeDomainTag buildTranscriptHeader
+  verifyHeaderVersion foldHeaderDigest mixBatchHeaderDigests
+)
+export LeanModel.ClearingPipeline (
+  ClearingBreakdown ClearingTicket computeClearingBreakdown
+  assembleClearingTicket quoteClearingTicket commitClearingTicket
+  previewRemainingBalance verifyTicketConservation authorizeBreakdown
+  challengeAuthorize
+)
+
+structure AuthorizationSpec where
+  accepts : UInt64 → UInt64 → UInt64 → Prop
+  output : UInt64 → UInt64 → UInt64 → UInt64 → Prop
+
+inductive AuditVerdict where
+  | vulnerable
+  | safe
+  deriving Repr
+
+def Conforms (spec : AuthorizationSpec)
+    (authorize : UInt64 → UInt64 → UInt64 → Option UInt64) : Prop :=
+  (∀ b a f, (∃ total, authorize b a f = some total) ↔ spec.accepts b a f) ∧
+  (∀ b a f total, authorize b a f = some total → spec.output b a f total)
+
+def AuditClaim (spec : AuthorizationSpec) (_verdict : AuditVerdict) : Prop :=
+  Conforms spec challengeAuthorize
+
+end SecurityChallenge
+[?2004hroot@07b8edb2de26:/workspace# cat lean/LeanModel/ClearingPipeline.lean
+[?2004limport Lean
+import LeanModel.Constants
+import LeanModel.WordMath
+import LeanModel.ReciprocalDiv
+import LeanModel.BroadwordSwar
+import LeanModel.MontgomeryField
+import LeanModel.GoldilocksField
+import LeanModel.FeeSchedule
+import LeanModel.LiquidityPool
+import LeanModel.TranscriptCodec
+
+namespace LeanModel.ClearingPipeline
+
+open LeanModel.Constants
+open LeanModel.WordMath
+open LeanModel.ReciprocalDiv
+open LeanModel.BroadwordSwar
+open LeanModel.MontgomeryField
+open LeanModel.FeeSchedule
+
+structure ClearingBreakdown where
+  netBpsFee : UInt64
+  blobSlotQuotient : UInt64
+  calldataSurcharge : UInt64
+  proverLevy : UInt64
+  totalSurcharge : UInt64
+
+structure ClearingTicket where
+  principal : UInt64
+  netBpsFee : UInt64
+  blobSlotQuotient : UInt64
+  calldataSurcharge : UInt64
+  proverLevy : UInt64
+  totalSurcharge : UInt64
+  totalDebit : UInt64
+
+def computeClearingBreakdown (amount fee : UInt64) : ClearingBreakdown :=
+  let notionalSum : WordSum := addU64WithCarry amount fee
+  let feeQuote : FeeQuote := evaluateSettlementFee notionalSum
+  let blobQuote : BlobSlotQuote := quoteBlobGasSlots amount fee
+  let laneQuote : CalldataLaneQuote := quoteCalldataLaneSurcharge fee
+  let levyQuote : ProverLevyQuote := quoteProverTranscriptLevy amount fee
+  let netBpsFee : UInt64 := feeQuote.netFee
+  let blobSlotQuotient : UInt64 := blobQuote.slotQuotient
+  let calldataSurcharge : UInt64 := laneQuote.surcharge
+  let proverLevy : UInt64 := levyQuote.proverLevy
+  let totalSurcharge : UInt64 :=
+    netBpsFee + blobSlotQuotient + calldataSurcharge + proverLevy
+  {
+    netBpsFee := netBpsFee
+    blobSlotQuotient := blobSlotQuotient
+    calldataSurcharge := calldataSurcharge
+    proverLevy := proverLevy
+    totalSurcharge := totalSurcharge
+  }
+
+def assembleClearingTicket (amount : UInt64) (breakdown : ClearingBreakdown) : Option ClearingTicket :=
+  if breakdown.totalSurcharge ≤ u64Max - amount then
+    some {
+      principal := amount
+      netBpsFee := breakdown.netBpsFee
+      blobSlotQuotient := breakdown.blobSlotQuotient
+      calldataSurcharge := breakdown.calldataSurcharge
+      proverLevy := breakdown.proverLevy
+      totalSurcharge := breakdown.totalSurcharge
+      totalDebit := amount + breakdown.totalSurcharge
+    }
+  else
+    none
+
+def quoteClearingTicket (amount fee : UInt64) : Option ClearingTicket :=
+  let breakdown : ClearingBreakdown := computeClearingBreakdown amount fee
+  assembleClearingTicket amount breakdown
+
+def commitClearingTicket (balance : UInt64) (ticket : ClearingTicket) : Option UInt64 :=
+  if ticket.totalDebit ≤ balance then
+    some ticket.totalDebit
+  else
+    none
+
+def previewRemainingBalance (balance : UInt64) (ticket : ClearingTicket) : UInt64 :=
+  if ticket.totalDebit ≤ balance then
+    balance - ticket.totalDebit
+  else
+    0
+
+def verifyTicketConservation (ticket : ClearingTicket) : Bool :=
+  let recomputed : UInt64 :=
+    ticket.netBpsFee + ticket.blobSlotQuotient + ticket.calldataSurcharge + ticket.proverLevy
+  decide (recomputed = ticket.totalSurcharge ∧ ticket.principal + ticket.totalSurcharge = ticket.totalDebit)
+
+def authorizeBreakdown (balance amount : UInt64) (breakdown : ClearingBreakdown) : Option UInt64 :=
+  if breakdown.totalSurcharge ≤ u64Max - amount then
+    let totalDebit : UInt64 := amount + breakdown.totalSurcharge
+    if totalDebit ≤ balance then
+      some totalDebit
+    else
+      none
+  else
+    none
+
+def challengeAuthorize (balance amount fee : UInt64) : Option UInt64 :=
+  authorizeBreakdown balance amount (computeClearingBreakdown amount fee)
+
+end LeanModel.ClearingPipeline
+[?2004hroot@07b8edb2de26:/workspace# cat lean/LeanModel/ReciprocalDiv.lean lean/LeanModel/MontgomeryField.lean | grep -v '^\s*--' | head -150
+[?2004limport Lean
+import LeanModel.Constants
+import LeanModel.WordMath
+
+namespace LeanModel.ReciprocalDiv
+
+open LeanModel.Constants
+open LeanModel.WordMath
+
+structure BlobSlotQuote where
+  highLimb : UInt64
+  lowLimb : UInt64
+  slotQuotient : UInt64
+  slotRemainder : UInt64
+
+def div2x1Mg10 (u1 u0 : UInt64) : UInt64 :=
+  let qFull : UInt64 := (u1 * mg10Reciprocal) + (u1 <<< 16) + u0 + ((1 : UInt64) <<< 16)
+  let q1 : UInt64 := qFull >>> 16
+  let q0 : UInt64 := qFull &&& limbMask
+  let r : UInt64 := (subBias + u0 - q1 * mg10Divisor) &&& limbMask
+  let (qCorr, rCorr) :=
+    if q0 < r then
+      (q1 - 1, (r + mg10Divisor) &&& limbMask)
+    else
+      (q1, r)
+  if mg10Divisor ≤ rCorr then
+    qCorr + 1
+  else
+    qCorr
+
+def rem2x1Mg10 (u1 u0 quot : UInt64) : UInt64 :=
+  let dividend : UInt64 := (u1 <<< 16) + u0
+  dividend - (quot * mg10Divisor)
+
+def quoteBlobGasSlots (amount fee : UInt64) : BlobSlotQuote :=
+  let highLimb : UInt64 := fee % mg10Divisor
+  let lowLimb : UInt64 := extractLowU16 amount
+  let slotQuotient : UInt64 := div2x1Mg10 highLimb lowLimb
+  let slotRemainder : UInt64 := rem2x1Mg10 highLimb lowLimb slotQuotient
+  {
+    highLimb := highLimb
+    lowLimb := lowLimb
+    slotQuotient := slotQuotient
+    slotRemainder := slotRemainder
+  }
+
+def verifyBlobSlotEuclidean (quote : BlobSlotQuote) : Bool :=
+  let dividend : UInt64 := (quote.highLimb <<< 16) + quote.lowLimb
+  let reconstructed : UInt64 := (quote.slotQuotient * mg10Divisor) + quote.slotRemainder
+  decide (quote.slotRemainder < mg10Divisor ∧ reconstructed = dividend)
+
+def estimateBlobGasUnits (quote : BlobSlotQuote) : UInt64 :=
+  quote.slotQuotient * blobGasPerSlot
+
+def ceilBlobSlots (quote : BlobSlotQuote) : UInt64 :=
+  if 0 < quote.slotRemainder then
+    quote.slotQuotient + 1
+  else
+    quote.slotQuotient
+
+end LeanModel.ReciprocalDiv
+import Lean
+import LeanModel.Constants
+
+namespace LeanModel.MontgomeryField
+
+open LeanModel.Constants
+
+structure ProverLevyQuote where
+  packedTranscript : UInt64
+  montyT : UInt64
+  proverLevy : UInt64
+
+def packTranscript (amount fee : UInt64) : UInt64 :=
+  (amount % limbBase) + (fee % babyBearP) * limbBase
+
+def montyQuotient (x : UInt64) : UInt64 :=
+  ((x % limbBase) * babyBearMu) % limbBase
+
+def montyReduce (x : UInt64) : UInt64 :=
+  let t : UInt64 := montyQuotient x
+  let u : UInt64 := babyBearP * t
+  let diff : UInt64 := x - u
+  let hi : UInt64 := diff / limbBase
+  if x < u then
+    babyBearP + hi - limbBase
+  else
+    hi
+
+def montyMulBabyBear (a b : UInt64) : UInt64 :=
+  let prod : UInt64 := (a % babyBearP) * (b % babyBearP)
+  montyReduce prod
+
+def canonicalAddBabyBear (a b : UInt64) : UInt64 :=
+  let sum : UInt64 := a + b
+  if babyBearP ≤ sum then
+    sum - babyBearP
+  else
+    sum
+
+def canonicalSubBabyBear (a b : UInt64) : UInt64 :=
+  if b ≤ a then
+    a - b
+  else
+    (a + babyBearP) - b
+
+def quoteProverTranscriptLevy (amount fee : UInt64) : ProverLevyQuote :=
+  let packedTranscript : UInt64 := packTranscript amount fee
+  let montyT : UInt64 := montyQuotient packedTranscript
+  let proverLevy : UInt64 := montyReduce packedTranscript
+  {
+    packedTranscript := packedTranscript
+    montyT := montyT
+    proverLevy := proverLevy
+  }
+
+end LeanModel.MontgomeryField
+[?2004hroot@07b8edb2de26:/workspace# cat lean/lean-toolchain; grep -v '^\s*--' lean/LeanModel/Constants.lean | grep def
+[?2004lleanprover/lean4:v4.31.0
+[01;31m[Kdef[m[K bpsDenom : UInt64 := 10000
+[01;31m[Kdef[m[K bpsMaxRem : UInt64 := 9999
+[01;31m[Kdef[m[K u64ModBpsQuot : UInt64 := 1844674407370955
+[01;31m[Kdef[m[K u64ModBpsRem : UInt64 := 1616
+[01;31m[Kdef[m[K rebateDivisor : UInt64 := 10
+[01;31m[Kdef[m[K makerRebateCapDivisor : UInt64 := 5
+[01;31m[Kdef[m[K treasuryCutDivisor : UInt64 := 4
+[01;31m[Kdef[m[K flashDenom : UInt64 := 5000
+[01;31m[Kdef[m[K flashMaxRem : UInt64 := 4999
+[01;31m[Kdef[m[K u64ModFlashQuot : UInt64 := 3689348814741910
+[01;31m[Kdef[m[K u64ModFlashRem : UInt64 := 1616
+[01;31m[Kdef[m[K institutionalBandMin : UInt64 := 10000000000000
+[01;31m[Kdef[m[K mg10Divisor : UInt64 := 0x8003
+[01;31m[Kdef[m[K mg10Reciprocal : UInt64 := 0xFFF4
+[01;31m[Kdef[m[K limbMask : UInt64 := 0xFFFF
+[01;31m[Kdef[m[K subBias : UInt64 := 0xC0000000
+[01;31m[Kdef[m[K blobGasPerSlot : UInt64 := 131072
+[01;31m[Kdef[m[K l8Mask : UInt64 := 0x0101010101010101
+[01;31m[Kdef[m[K h8Mask : UInt64 := 0x8080808080808080
+[01;31m[Kdef[m[K m16Mask : UInt64 := 0x00FF00FF00FF00FF
+[01;31m[Kdef[m[K l16Mask : UInt64 := 0x0001000100010001
+[01;31m[Kdef[m[K calldataNzByteShift : UInt64 := 8
+[01;31m[Kdef[m[K babyBearP : UInt64 := 2013265921
+[01;31m[Kdef[m[K babyBearMu : UInt64 := 2281701377
+[01;31m[Kdef[m[K limbBase : UInt64 := 4294967296
+[01;31m[Kdef[m[K low32Mask : UInt64 := 0xFFFFFFFF
+[01;31m[Kdef[m[K goldilocksP : UInt64 := 0xFFFFFFFF00000001
+[01;31m[Kdef[m[K goldilocksEps : UInt64 := 0xFFFFFFFF
+[01;31m[Kdef[m[K codecTagMask : UInt64 := 0xFF
+[01;31m[Kdef[m[K codecVersionV3 : UInt64 := 3
+[01;31m[Kdef[m[K sequencerDomainTag : UInt64 := 0x5A
+[01;31m[Kdef[m[K u64Max : UInt64 := 18446744073709551615
+[?2004hroot@07b8edb2de26:/workspace# grep -v '^\s*--' lean/LeanModel/BroadwordSwar.lean | sed -n '1,80p'
+[?2004limport Lean
+import LeanModel.Constants
+
+namespace LeanModel.BroadwordSwar
+
+open LeanModel.Constants
+
+structure CalldataLaneQuote where
+  activeLanes : UInt64
+  byteWeightSum : UInt64
+  surcharge : UInt64
+
+def uNz8 (x : UInt64) : UInt64 :=
+  (((x ||| h8Mask) - l8Mask) ||| x) &&& h8Mask
+
+def countNzBytes (x : UInt64) : UInt64 :=
+  (((uNz8 x) >>> 7) * l8Mask) >>> 56
+
+def countZeroBytesSwar (x : UInt64) : UInt64 :=
+  8 - countNzBytes x
+
+def hasHighBitByte (x : UInt64) : Bool :=
+  decide ((x &&& h8Mask) != 0)
+
+def sumBytes (x : UInt64) : UInt64 :=
+  let pairSum : UInt64 := (x &&& m16Mask) + ((x >>> 8) &&& m16Mask)
+  ((pairSum * l16Mask) >>> 48) &&& limbMask
+
+def sumEvenBytesSwar (x : UInt64) : UInt64 :=
+  let evenLanes : UInt64 := x &&& m16Mask
+  ((evenLanes * l16Mask) >>> 48) &&& limbMask
+
+def sumOddBytesSwar (x : UInt64) : UInt64 :=
+  let oddLanes : UInt64 := (x >>> 8) &&& m16Mask
+  ((oddLanes * l16Mask) >>> 48) &&& limbMask
+
+def quoteCalldataLaneSurcharge (fee : UInt64) : CalldataLaneQuote :=
+  let activeLanes : UInt64 := countNzBytes fee
+  let byteWeightSum : UInt64 := sumBytes fee
+  let surcharge : UInt64 := (activeLanes <<< calldataNzByteShift) + byteWeightSum
+  {
+    activeLanes := activeLanes
+    byteWeightSum := byteWeightSum
+    surcharge := surcharge
+  }
+
+end LeanModel.BroadwordSwar
+[?2004hroot@07b8edb2de26:/workspace# cd challenge && cargo test --release 2>&1 | tail -15; cargo test 2>&1 | grep -E 'panicked|test result|FAILED' | head; cd ..
+[?2004ltest transcript_codec::tests::transcript_header_framing_and_digest ... ok
+test word_math::tests::add_and_sub_carry_borrow_flags ... ok
+test word_math::tests::bps_carry_folding_above_u64_max ... ok
+test word_math::tests::bps_floor_and_ceil_at_zero_and_u64_max ... ok
+test word_math::tests::flash_floor_and_ceil_across_boundaries ... ok
+test word_math::tests::limb_extraction_and_packing_roundtrip ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+test broadword_swar::tests::swar_all_0xff_max_word ... FAILED
+test broadword_swar::tests::swar_high_bit_0x80_bytes_detected_as_nonzero ... FAILED
+test broadword_swar::tests::swar_mixed_byte_pattern_and_even_odd_partition ... FAILED
+test clearing_pipeline::tests::ticket_overflow_rejected_near_u64_max ... FAILED
+test tests::authorize_ordinary_commercial_transfers ... FAILED
+test tests::authorize_rejects_total_debit_overflow ... FAILED
+test tests::authorize_wide_carry_folding_at_u64_max ... FAILED
+thread 'broadword_swar::tests::swar_all_0xff_max_word' panicked at src/broadword_swar.rs:43:5:
+thread 'broadword_swar::tests::swar_high_bit_0x80_bytes_detected_as_nonzero' panicked at src/broadword_swar.rs:43:5:
+thread 'broadword_swar::tests::swar_mixed_byte_pattern_and_even_odd_partition' panicked at src/broadword_swar.rs:43:5:
+[?2004hroot@07b8edb2de26:/workspace# mkdir -p /tmp/fz/src && cd /tmp/fz && printf '[package]\nname="fz"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsettlement-gate={path="/workspace/challenge"}\n[profile.release]\noverflow-checks=false\n' > Cargo.toml
+[?2004l[?2004hroot@07b8edb2de26:/tmp/fz# cat > src/main.rs <<'EOF'
+[?2004l[?2004h> use settlement_gate::*;
+[?2004l[?2004h> fn reference(b:u64,a:u64,f:u64)->Option<u64>{
+[?2004l[?2004h>   let s=a as u128+f as u128; let g=(s+9999)/10000; let net=g-g/10;
+[?2004l[?2004h>   let h=(f%32771) as u128; let l=(a&0xFFFF) as u128; let blob=(h*65536+l)/32771;
+[?2004l[?2004h>   let mut cd:u128=0; for i in 0..8 { let by=((f>>(8*i))&0xFF) as u128; if by>0 {cd+=256;} cd+=by; }
+[?2004l[?2004h>   let p:u128=2013265921; let rinv:u128=943718400;
+[?2004l[?2004h>   let x=(a as u128 % 4294967296)+(f as u128 % p)*4294967296; let lev=(x%p)*rinv%p;
+[?2004l[?2004h>   let t=a as u128+net+blob+cd+lev;
+[?2004l[?2004h>   if t<=b as u128 {Some(t as u64)} else {None}
+[?2004l[?2004h> }
+[?2004l[?2004h> struct R(u64);
+[?2004l[?2004h> impl R{fn n(&mut self)->u64{self.0^=self.0<<13;self.0^=self.0>>7;self.0^=self.0<<17;self.0}}
+[?2004l[?2004h> fn pick(r:&mut R)->u64{ let v=r.n(); match v%8 {0=>v,1=>u64::MAX-(r.n()%100000),2=>r.n()%100000,3=>r.n()&0xFFFF_FFFF,4=>v&0x8080_8080_8080_8080,5=>(r.n()%65536)*32771+(r.n()%3),6=>u64::MAX/2+(r.n()%1000)-500,_=>r.n()>>(r.n()%64)} }
+[?2004l[?2004h> fn main(){
+[?2004l[?2004h>   let args:Vec<String>=std::env::args().collect();
+[?2004l[?2004h>   if args.len()>1 && args[1]=="mg" {
+[?2004l[?2004h>     let mut bad=0u64;
+[?2004l[?2004h>     for u1 in 0..32771u64 { for u0 in 0..65536u64 { let q=reciprocal_div::div_2x1_mg10(u1,u0); if q!=((u1<<16)+u0)/32771 { if bad<5 {println!("MG bad u1={} u0={} got {} want {}",u1,u0,q,((u1<<16)+u0)/32771);} bad+=1; } } }
+[?2004l[?2004h>     println!("mg mismatches {}",bad); return;
+[?2004l[?2004h>   }
+[?2004l[?2004h>   let mut r=R(0x9E3779B97F4A7C15); let mut bad=0u64;
+[?2004l[?2004h>   for _ in 0..30_000_000u64 {
+[?2004l[?2004h>     let a=pick(&mut r); let f=pick(&mut r);
+[?2004l[?2004h>     let rf=reference(u64::MAX,a,f); let got=authorize(u64::MAX,a,f).map(|z|z.total_debit);
+[?2004l[?2004h>     let rb=match rf {Some(t)=>t, None=>{ if got.is_some(){ println!("ACCEPT-OVF a={} f={} got={:?}",a,f,got); bad+=1;} continue; }};
+[?2004l[?2004h>     for b in [rb, rb.wrapping_sub(1), 0u64] {
+[?2004l[?2004h>       let e=reference(b,a,f); let g=authorize(b,a,f).map(|z|z.total_debit);
+[?2004l[?2004h>       if e!=g { if bad<20 {println!("MISMATCH b={} a={} f={} exp={:?} got={:?}",b,a,f,e,g);} bad+=1; }
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }
+[?2004l[?2004h>   println!("fuzz mismatches {}",bad);
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/fz# cargo build --release 2>&1 | tail -3 && time ./target/release/fz mg && time ./target/release/fz
+[?2004l   Compiling settlement-gate v0.1.0 (/workspace/challenge)
+   Compiling fz v0.1.0 (/tmp/fz)
+    Finished `release` profile [optimized] target(s) in 0.37s
+mg mismatches 0
+
+real	0m5.407s
+user	0m5.403s
+sys	0m0.001s
+fuzz mismatches 0
+
+real	0m3.883s
+user	0m3.875s
+sys	0m0.000s
+[?2004hroot@07b8edb2de26:/tmp/fz# cd /workspace && grep -v '^\s*--' lean/LeanModel/WordMath.lean | sed -n '1,200p' | grep -v '^$' | head -120
+[?2004limport Lean
+import LeanModel.Constants
+namespace LeanModel.WordMath
+open LeanModel.Constants
+structure WordSum where
+  lowWord : UInt64
+  highCarry : Bool
+structure WordDiff where
+  diffWord : UInt64
+  underflowBorrow : Bool
+def addU64WithCarry (lhs rhs : UInt64) : WordSum :=
+  let lowWord := lhs + rhs
+  { lowWord := lowWord, highCarry := decide (lowWord < lhs) }
+def subU64WithBorrow (lhs rhs : UInt64) : WordDiff :=
+  let diffWord := lhs - rhs
+  { diffWord := diffWord, underflowBorrow := decide (lhs < rhs) }
+def extractLowU16 (word : UInt64) : UInt64 :=
+  word &&& limbMask
+def extractLowU32 (word : UInt64) : UInt64 :=
+  word &&& low32Mask
+def extractHighU32 (word : UInt64) : UInt64 :=
+  word >>> 32
+def packU32Limbs (lowU32 highU32 : UInt64) : UInt64 :=
+  (lowU32 &&& low32Mask) ||| ((highU32 &&& low32Mask) <<< 32)
+def isInstitutionalNotional (sum : WordSum) : Bool :=
+  if sum.highCarry then
+    true
+  else
+    decide (institutionalBandMin ≤ sum.lowWord)
+def remBpsU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    ((sum.lowWord % bpsDenom) + u64ModBpsRem) % bpsDenom
+  else
+    sum.lowWord % bpsDenom
+def floorDivBpsU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % bpsDenom) + u64ModBpsRem
+    u64ModBpsQuot + (sum.lowWord / bpsDenom) + (foldedRem / bpsDenom)
+  else
+    sum.lowWord / bpsDenom
+def ceilDivBpsU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % bpsDenom) + u64ModBpsRem
+    u64ModBpsQuot + (sum.lowWord / bpsDenom) + ((foldedRem + bpsMaxRem) / bpsDenom)
+  else
+    let biased := sum.lowWord + bpsMaxRem
+    if biased < sum.lowWord then
+      (sum.lowWord / bpsDenom) + (((sum.lowWord % bpsDenom) + bpsMaxRem) / bpsDenom)
+    else
+      biased / bpsDenom
+def floorDivFlashU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % flashDenom) + u64ModFlashRem
+    u64ModFlashQuot + (sum.lowWord / flashDenom) + (foldedRem / flashDenom)
+  else
+    sum.lowWord / flashDenom
+def ceilDivFlashU64 (sum : WordSum) : UInt64 :=
+  if sum.highCarry then
+    let foldedRem := (sum.lowWord % flashDenom) + u64ModFlashRem
+    u64ModFlashQuot + (sum.lowWord / flashDenom) + ((foldedRem + flashMaxRem) / flashDenom)
+  else
+    let biased := sum.lowWord + flashMaxRem
+    if biased < sum.lowWord then
+      (sum.lowWord / flashDenom) + (((sum.lowWord % flashDenom) + flashMaxRem) / flashDenom)
+    else
+      biased / flashDenom
+end LeanModel.WordMath
+[?2004hroot@07b8edb2de26:/workspace# grep -A12 'def evaluateSettlementFee\|def computeTierRebate' lean/LeanModel/FeeSchedule.lean; cat submission/*.lean; cat lean/Signature.lean | head -40
+[?2004l[01;31m[Kdef computeTierRebate[m[K (grossFee : UInt64) : UInt64 :=
+  grossFee / rebateDivisor
+
+def computeCappedMakerRebate (grossFee capBasis : UInt64) : UInt64 :=
+  let baseRebate : UInt64 := grossFee / rebateDivisor
+  let maxRebate : UInt64 := capBasis / makerRebateCapDivisor
+  if baseRebate ≤ maxRebate then baseRebate else maxRebate
+
+[01;31m[Kdef evaluateSettlementFee[m[K (sum : WordSum) : FeeQuote :=
+  let grossFee : UInt64 := ceilDivBpsU64 sum
+  let rebate : UInt64 := computeTierRebate grossFee
+  let netFee : UInt64 := grossFee - rebate
+  {
+    grossFee := grossFee
+    rebate := rebate
+    netFee := netFee
+  }
+
+def evaluatePassiveFloorFee (sum : WordSum) : FeeQuote :=
+  let grossFee : UInt64 := floorDivBpsU64 sum
+  let rebate : UInt64 := computeTierRebate grossFee
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+import SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+[?2004hroot@07b8edb2de26:/workspace# cat lean/check.py | head -150
+[?2004l#!/usr/bin/env python3
+"""Local Lean compilation check; isolated grading remains authoritative."""
+from pathlib import Path
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+
+root = Path(__file__).resolve().parent
+submission = root.parent / 'submission'
+
+LEAN_MODEL_ORDER = (
+    'Constants',
+    'WordMath',
+    'ReciprocalDiv',
+    'BroadwordSwar',
+    'MontgomeryField',
+    'GoldilocksField',
+    'FeeSchedule',
+    'LiquidityPool',
+    'TranscriptCodec',
+    'ClearingPipeline',
+)
+
+
+def _extra_lean_paths():
+    paths = []
+    deps_root = Path('/opt/rvb-deps')
+    if deps_root.is_dir():
+        top_lib = deps_root / '.lake/build/lib/lean'
+        if top_lib.is_dir():
+            paths.append(str(top_lib))
+        pkgs = deps_root / 'packages'
+        if pkgs.is_dir():
+            for pkg_lib in sorted(pkgs.glob('*/.lake/build/lib/lean')):
+                if pkg_lib.is_dir():
+                    paths.append(str(pkg_lib))
+    return paths
+
+
+def _split_imports(text):
+    text = re.sub(r'--[^\n]*', '', text)
+    while '/-' in text:
+        start = text.index('/-')
+        pos = start + 2
+        depth = 1
+        while depth and pos < len(text):
+            if text.startswith('/-', pos):
+                depth += 1
+                pos += 2
+            elif text.startswith('-/', pos):
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth:
+            raise ValueError('unterminated Lean comment')
+        text = text[:start] + ' ' + text[pos:]
+    extra_imports = []
+    for line in text.splitlines():
+        if line.strip().startswith('import '):
+            for m in line.split()[1:]:
+                if m != 'SecurityChallenge' and m not in extra_imports:
+                    extra_imports.append(m)
+    remaining = re.sub(r'^\s*import [^\n]*', '', text, flags=re.M)
+    import_block = ''.join(f'import {m}\n' for m in extra_imports)
+    return import_block, remaining
+
+
+with tempfile.TemporaryDirectory(prefix='local-lean-') as raw:
+    tmp = Path(raw)
+    lean_paths = [str(tmp), str(root)] + _extra_lean_paths()
+    env = {**os.environ, 'LEAN_PATH': ':'.join(lean_paths)}
+    sub_lean = submission / 'LeanModel'
+    root_lean = root / 'LeanModel'
+    if sub_lean.is_dir() and root_lean.is_dir():
+        (tmp / 'LeanModel').mkdir(parents=True, exist_ok=True)
+        changed_mods = set()
+        for m in LEAN_MODEL_ORDER:
+            rel = f'LeanModel/{m}.lean'
+            rel_olean = f'LeanModel/{m}.olean'
+            orig_file = root_lean / f'{m}.lean'
+            orig_olean = root / rel_olean
+            sub_file = sub_lean / f'{m}.lean'
+            if not orig_file.is_file():
+                continue
+            orig_text = orig_file.read_text()
+            src_text = sub_file.read_text() if sub_file.is_file() else orig_text
+            deps = set(re.findall(r'import\s+LeanModel\.([A-Za-z0-9_]+)', src_text))
+            if src_text.strip() != orig_text.strip() or (deps & changed_mods) or not orig_olean.is_file():
+                changed_mods.add(m)
+                (tmp / rel).write_text(src_text)
+                subprocess.run(['lean', '-j1', '-M4096', '-o', rel_olean, rel], cwd=tmp, env=env, check=True)
+            else:
+                shutil.copy(orig_olean, tmp / rel_olean)
+        if changed_mods and (root / 'SecurityChallenge.lean').is_file():
+            shutil.copy(root / 'SecurityChallenge.lean', tmp / 'SecurityChallenge.lean')
+            subprocess.run(['lean', '-j1', '-M4096', '-o', 'SecurityChallenge.olean', 'SecurityChallenge.lean'], cwd=tmp, env=env, check=True)
+    for name, rel in [('CandidateSpec', 'Spec.lean'), ('CandidateAudit', 'Audit.lean')]:
+        imp, body = _split_imports((submission / rel).read_text())
+        (tmp / (name + '.lean')).write_text('import SecurityChallenge\n' + imp + body + '\n')
+        subprocess.run(['lean', '-j1', '-M4096', '-o', name + '.olean', name + '.lean'], cwd=tmp, env=env, check=True)
+    imp, body = _split_imports((submission / 'Proof.lean').read_text())
+    proof = (
+        'import SecurityChallenge\nimport CandidateSpec\nimport CandidateAudit\nimport Lean\nimport Std\n'
+        + imp
+        + 'open SecurityChallenge\ntheorem auditEvidence : AuditClaim candidateSpec verdict := (\n'
+        + body
+        + '\n)\n'
+    )
+    (tmp / 'CandidateProof.lean').write_text(proof)
+    raise SystemExit(subprocess.call(['lean', '-j1', '-M4096', 'CandidateProof.lean'], cwd=tmp, env=env))
+[?2004hroot@07b8edb2de26:/workspace# cat lean/Signature.lean; wc -l harness/checkpoint.py lean/check.py
+[?2004limport SecurityChallenge
+open SecurityChallenge
+-- Define candidateSpec in Spec.lean and verdict in Audit.lean.
+-- Proof.lean is a proof term with exact type:
+-- SecurityChallenge.AuditClaim candidateSpec verdict
+   8 harness/checkpoint.py
+ 113 lean/check.py
+ 121 total
+[?2004hroot@07b8edb2de26:/workspace# ls /opt/rvb-deps 2>/dev/null | head; mkdir -p /tmp/lt && cd /tmp/lt
+[?2004lpackages
+requirements-verifier.txt
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > t.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> #check @UInt64.toNat_add
+[?2004l[?2004h> #check @UInt64.toNat_sub
+[?2004l[?2004h> #check @UInt64.toNat_mul
+[?2004l[?2004h> #check @UInt64.toNat_div
+[?2004l[?2004h> #check @UInt64.toNat_mod
+[?2004l[?2004h> #check @UInt64.toNat_or
+[?2004l[?2004h> #check @UInt64.toNat_and
+[?2004l[?2004h> #check @UInt64.toNat_shiftRight
+[?2004l[?2004h> #check @UInt64.toNat_shiftLeft
+[?2004l[?2004h> #check @UInt64.le_iff_toNat_le
+[?2004l[?2004h> #check @UInt64.lt_iff_toNat_lt
+[?2004l[?2004h> #check @UInt64.toNat_lt
+[?2004l[?2004h> #check @Nat.testBit_mul_pow_two_add
+[?2004l[?2004h> #check @Nat.eq_of_testBit_eq
+[?2004l[?2004h> #check @Nat.testBit_or
+[?2004l[?2004h> #check @Nat.testBit_and
+[?2004l[?2004h> #check @Nat.or_lt_two_pow
+[?2004l[?2004h> #check @Nat.and_lt_two_pow
+[?2004l[?2004h> #check @Nat.shiftRight_eq_div_pow
+[?2004l[?2004h> #check @Nat.shiftLeft_eq
+[?2004l[?2004h> #check @Nat.and_two_pow_sub_one_eq_mod
+[?2004l[?2004h> #check @UInt64.toNat_ofNat
+[?2004l[?2004h> #check @UInt64.ext_iff
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# LEAN_PATH=/workspace/lean lean t.lean 2>&1 | head -60
+[?2004lUInt64.toNat_add : ∀ (a b : UInt64), (a + b).toNat = (a.toNat + b.toNat) % 2 ^ 64
+UInt64.toNat_sub : ∀ (a b : UInt64), (a - b).toNat = (2 ^ 64 - b.toNat + a.toNat) % 2 ^ 64
+UInt64.toNat_mul : ∀ (a b : UInt64), (a * b).toNat = a.toNat * b.toNat % 2 ^ 64
+UInt64.toNat_div : ∀ (a b : UInt64), (a / b).toNat = a.toNat / b.toNat
+UInt64.toNat_mod : ∀ (a b : UInt64), (a % b).toNat = a.toNat % b.toNat
+UInt64.toNat_or : ∀ (a b : UInt64), (a ||| b).toNat = a.toNat ||| b.toNat
+UInt64.toNat_and : ∀ (a b : UInt64), (a &&& b).toNat = a.toNat &&& b.toNat
+UInt64.toNat_shiftRight : ∀ (a b : UInt64), (a >>> b).toNat = a.toNat >>> (b.toNat % 64)
+UInt64.toNat_shiftLeft : ∀ (a b : UInt64), (a <<< b).toNat = a.toNat <<< (b.toNat % 64) % 2 ^ 64
+@UInt64.le_iff_toNat_le : ∀ {a b : UInt64}, a ≤ b ↔ a.toNat ≤ b.toNat
+@UInt64.lt_iff_toNat_lt : ∀ {a b : UInt64}, a < b ↔ a.toNat < b.toNat
+UInt64.toNat_lt : ∀ (n : UInt64), n.toNat < 2 ^ 64
+t.lean:14:8: error(lean.unknownIdentifier): Unknown constant `Nat.testBit_mul_pow_two_add`
+@Nat.eq_of_testBit_eq : ∀ {x y : Nat}, (∀ (i : Nat), x.testBit i = y.testBit i) → x = y
+Nat.testBit_or : ∀ (x y i : Nat), (x ||| y).testBit i = (x.testBit i || y.testBit i)
+Nat.testBit_and : ∀ (x y i : Nat), (x &&& y).testBit i = (x.testBit i && y.testBit i)
+@Nat.or_lt_two_pow : ∀ {x y n : Nat}, x < 2 ^ n → y < 2 ^ n → x ||| y < 2 ^ n
+Nat.and_lt_two_pow : ∀ (x : Nat) {y n : Nat}, y < 2 ^ n → x &&& y < 2 ^ n
+Nat.shiftRight_eq_div_pow : ∀ (m n : Nat), m >>> n = m / 2 ^ n
+Nat.shiftLeft_eq : ∀ (a b : Nat), a <<< b = a * 2 ^ b
+Nat.and_two_pow_sub_one_eq_mod : ∀ (x n : Nat), x &&& 2 ^ n - 1 = x % 2 ^ n
+@UInt64.toNat_ofNat : ∀ {n : Nat}, (OfNat.ofNat n).toNat = n % 2 ^ 64
+t.lean:24:8: error(lean.unknownIdentifier): Unknown constant `UInt64.ext_iff`
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > fee.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> open SecurityChallenge LeanModel.Constants LeanModel.WordMath LeanModel.FeeSchedule LeanModel.MontgomeryField
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem fee_eq (a f : UInt64) :
+[?2004l[?2004h>     (evaluateSettlementFee (addU64WithCarry a f)).netFee.toNat =
+[?2004l[?2004h>       (a.toNat + f.toNat + 9999) / 10000 - (a.toNat + f.toNat + 9999) / 10000 / 10 := by
+[?2004l[?2004h>   have ha := a.toNat_lt; have hf := f.toNat_lt
+[?2004l[?2004h>   simp only [evaluateSettlementFee, computeTierRebate, ceilDivBpsU64, addU64WithCarry, bpsDenom, bpsMaxRem, u64ModBpsQuot, u64ModBpsRem, rebateDivisor]
+[?2004l[?2004h>   split <;> rename_i h <;> simp only [decide_eq_true_eq, UInt64.lt_iff_toNat_lt, UInt64.toNat_add] at h
+[?2004l[?2004h>   · simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat] at *
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · split <;> rename_i h2 <;> simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat] at * <;> omega
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_eq (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   have h := x.toNat_lt
+[?2004l[?2004h>   simp only [montyReduce, montyQuotient, babyBearP, babyBearMu, limbBase]
+[?2004l[?2004h>   split <;> rename_i h1 <;> simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_mul, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat] at * <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# time LEAN_PATH=/workspace/lean lean fee.lean 2>&1 | head -40
+[?2004lfee.lean:11:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ m - 10*n ≤ 9
+  m - n ≥ 0
+  l ≤ 18446744073709551616
+  -1844674407370955 ≤ e - 18446744073709551616*g ≤ 18444899399302180660
+  -1844674407370955 ≤ e - 18446744073709551616*g + i - 18446744073709551616*j ≤ 18444899399302180660
+  -18448588748116922571 ≤ e - 18446744073709551616*g + i - 18446744073709551616*j - 18446744073709551616*k - l ≤ -1844674407370956
+  e - 18446744073709551616*g + i - 18446744073709551616*j - 18446744073709551616*k - l - m + n ≤ -18448588748116922572
+  0 ≤ c ≤ 18446744073709551615
+  c - 18446744073709551616*d ≤ -1
+  0 ≤ b ≤ 18446744073709551615
+  0 ≤ b + c - 18446744073709551616*d ≤ 18446744073709551615
+  -9999 ≤ b + c - 10000*m ≤ 0
+where
+ b := ↑a.toNat
+ c := ↑f.toNat
+ d := ↑(a.toNat + f.toNat) / 18446744073709551616
+ e := ↑((a.toNat + f.toNat) % 2 ^ 64) / ↑(10000 % 2 ^ 64)
+ g := ↑(1844674407370955 % 2 ^ 64 + (a.toNat + f.toNat) % 2 ^ 64 / (10000 % 2 ^ 64)) / 18446744073709551616
+ i := ↑((((a.toNat + f.toNat) % 2 ^ 64 % (10000 % 2 ^ 64) + 1616 % 2 ^ 64) % 2 ^ 64 + 9999 % 2 ^ 64) % 2 ^ 64) /
+  ↑(10000 % 2 ^ 64)
+ j := ↑((1844674407370955 % 2 ^ 64 + (a.toNat + f.toNat) % 2 ^ 64 / (10000 % 2 ^ 64)) % 2 ^ 64 +
+      (((a.toNat + f.toNat) % 2 ^ 64 % (10000 % 2 ^ 64) + 1616 % 2 ^ 64) % 2 ^ 64 + 9999 % 2 ^ 64) % 2 ^ 64 /
+        (10000 % 2 ^ 64)) /
+  18446744073709551616
+ k := ↑(2 ^ 64 -
+        ((1844674407370955 % 2 ^ 64 + (a.toNat + f.toNat) % 2 ^ 64 / (10000 % 2 ^ 64)) % 2 ^ 64 +
+              (((a.toNat + f.toNat) % 2 ^ 64 % (10000 % 2 ^ 64) + 1616 % 2 ^ 64) % 2 ^ 64 + 9999 % 2 ^ 64) % 2 ^ 64 /
+                (10000 % 2 ^ 64)) %
+            2 ^ 64 /
+          (10 % 2 ^ 64) +
+      ((1844674407370955 % 2 ^ 64 + (a.toNat + f.toNat) % 2 ^ 64 / (10000 % 2 ^ 64)) % 2 ^ 64 +
+          (((a.toNat + f.toNat) % 2 ^ 64 % (10000 % 2 ^ 64) + 1616 % 2 ^ 64) % 2 ^ 64 + 9999 % 2 ^ 64) % 2 ^ 64 /
+            (10000 % 2 ^ 64)) %
+        2 ^ 64) /
+  18446744073709551616
+ l := ↑(((1844674407370955 % 2 ^ 64 + (a.toNat + f.toNat) % 2 ^ 64 / (10000 % 2 ^ 64)) % 2 ^ 64 +
+        (((a.toNat + f.toNat) % 2 ^ 64 % (10000 % 2 ^ 64) + 1616 % 2 ^ 64) % 2 ^ 64 + 9999 % 2 ^ 64) % 2 ^ 64 /
+          (10000 % 2 ^ 64)) %
+
+real	0m1.138s
+user	0m0.740s
+sys	0m0.447s
+[?2004hroot@07b8edb2de26:/tmp/lt# sed -i 's/UInt64.toNat_ofNat\]/UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod, Nat.reduceMul, Nat.reduceAdd]/g' fee.lean && grep -c reducePow fee.lean && time LEAN_PATH=/workspace/lean lean fee.lean 2>&1 | head -30
+[?2004l3
+fee.lean:10:137: warning: This simp argument is unused:
+  Nat.reduceMul
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+  ̲  ̲ ̲ ̲UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod, Nat.reduceM̵u̵l̵,̵ ̵N̵a̵t̵.̵r̵e̵d̵u̵c̵e̵Add] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+fee.lean:10:152: warning: This simp argument is unused:
+  Nat.reduceAdd
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod,
+  ̲  ̲ ̲ ̲UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod, Nat.reduceMul,̵ ̵N̵a̵t̵.̵r̵e̵d̵u̵c̵e̵A̵d̵d̵] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+fee.lean:12:187: warning: This simp argument is unused:
+  Nat.reduceMul
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_sub,
+  ̲  ̲ ̲ ̲UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_mod, UInt64.toNat_ofNat, Nat.reducePow,
+  ̲  ̲ ̲ ̲Nat.reduceMod, Nat.reduceM̵u̵l̵,̵ ̵N̵a̵t̵.̵r̵e̵d̵u̵c̵e̵Add] at *
+
+Note: This linter can be disabled with `set_option linter.unusedSimpArgs false`
+fee.lean:12:202: warning: This simp argument is unused:
+  Nat.reduceAdd
+
+Hint: Omit it from the simp argument list.
+  simp only [UInt64.lt_iff_toNat_lt, UInt64.toNat_sub,
+
+real	0m4.770s
+user	0m4.976s
+sys	0m0.603s
+[?2004hroot@07b8edb2de26:/tmp/lt# sed -i '2a set_option linter.unusedSimpArgs false' fee.lean && LEAN_PATH=/workspace/lean lean fee.lean 2>&1 | grep -A20 error | head -40; echo EXIT=${PIPESTATUS[0]}
+[?2004lfee.lean:19:242: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ a ≤ 8646911288846319615
+  0 ≤ a - 4294967296*b ≤ 4294967295
+  0 ≤ 943718400*a - 2013265921*f ≤ 2013265920
+  1069547521*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e ≥ 1
+  1 ≤ 1069547521*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e + 4294967296*j ≤ 4294967296
+  -18446744067401318398 ≤ 1069547521*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e + 18446744073709551616*g + 4294967296*j ≤ 6308233217
+  2013265922 ≤ 1069547521*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e + 18446744073709551616*g + 18446744073709551616*i + 4294967296*j ≤ 18446744075722817537
+  2013265921*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e - 2013265921*f + 18446744073709551616*g + 18446744073709551616*i + 4294967296*j ≥ 18446744075722817538
+  0 ≤ 2281701377*a - 9799832793453166592*b - 18446744073709551616*c ≤ 18446744073709551615
+  0 ≤ 2281701377*a - 9799832793453166592*b - 18446744073709551616*c - 4294967296*d ≤ 4294967295
+  0 ≤ 4593671624212873217*a - 19729669394557492209209311232*b - 37138201197008152320683278336*c - 8646911288846319616*d - 18446744073709551616*e ≤ 18446744073709551615
+  4593671624212873217*a - 19729669394557492209209311232*b - 37138201197008152320683278336*c - 8646911288846319616*d - 18446744073709551616*e ≤ 18446744073709551616
+where
+ a := ↑x.toNat
+ b := ↑x.toNat / 4294967296
+ c := ↑(x.toNat % 4294967296 * 2281701377) / 18446744073709551616
+ d := ↑(x.toNat % 4294967296 * 2281701377 % 18446744073709551616) / 4294967296
+ e := ↑(2013265921 * (x.toNat % 4294967296 * 2281701377 % 18446744073709551616 % 4294967296)) / 18446744073709551616
+ f := ↑(x.toNat * 943718400) / 2013265921
+--
+fee.lean:19:242: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ a ≤ 8646911288846319615
+  0 ≤ a - 4294967296*b ≤ 4294967295
+  0 ≤ 943718400*a - 2013265921*f ≤ 2013265920
+  1069547521*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e ≤ 0
+  1 ≤ 1069547521*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e + 4294967296*g ≤ 4294967296
+  2013265921*a - 4593671624212873217*b - 8646911288846319616*c - 2013265921*d - 4294967296*e - 2013265921*f + 4294967296*g ≥ 4294967297
+  0 ≤ 2281701377*a - 9799832793453166592*b - 18446744073709551616*c ≤ 18446744073709551615
+  0 ≤ 2281701377*a - 9799832793453166592*b - 18446744073709551616*c - 4294967296*d ≤ 4294967295
+  0 ≤ 4593671624212873217*a - 19729669394557492209209311232*b - 37138201197008152320683278336*c - 8646911288846319616*d - 18446744073709551616*e ≤ 18446744073709551615
+  4593671624212873217*a - 19729669394557492209209311232*b - 37138201197008152320683278336*c - 8646911288846319616*d - 18446744073709551616*e ≤ 18446744073709551616
+where
+ a := ↑x.toNat
+ b := ↑x.toNat / 4294967296
+ c := ↑(x.toNat % 4294967296 * 2281701377) / 18446744073709551616
+ d := ↑(x.toNat % 4294967296 * 2281701377 % 18446744073709551616) / 4294967296
+ e := ↑(2013265921 * (x.toNat % 4294967296 * 2281701377 % 18446744073709551616 % 4294967296)) / 18446744073709551616
+EXIT=1
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > mont.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> set_option linter.unusedSimpArgs false
+[?2004l[?2004h> open SecurityChallenge LeanModel.Constants LeanModel.MontgomeryField
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_key (y : Nat) (hy : y < 4294967296) :
+[?2004l[?2004h>     2013265921 * (y * 2281701377 % 4294967296) % 4294967296 = y := by
+[?2004l[?2004h>   rw [Nat.mul_mod, Nat.mod_mod, ← Nat.mul_mod, Nat.mul_comm y, ← Nat.mul_assoc, Nat.mul_mod,
+[?2004l[?2004h>     (by decide : 2013265921 * 2281701377 % 4294967296 = 1), Nat.one_mul, Nat.mod_mod, Nat.mod_eq_of_lt hy]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_eq (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   have hxl := x.toNat_lt
+[?2004l[?2004h>   simp only [montyReduce, montyQuotient, babyBearP, babyBearMu, limbBase]
+[?2004l[?2004h>   have hT : ((x % 4294967296 * 2281701377 % 4294967296 : UInt64)).toNat
+[?2004l[?2004h>       = x.toNat % 4294967296 * 2281701377 % 4294967296 := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_mul, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>     rw [Nat.mod_eq_of_lt (by omega : x.toNat % 4294967296 * 2281701377 < 18446744073709551616)]
+[?2004l[?2004h>   generalize x % 4294967296 * 2281701377 % 4294967296 = t at hT ⊢
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by rw [hT]; exact Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   have hkey : 2013265921 * t.toNat % 4294967296 = x.toNat % 4294967296 := by
+[?2004l[?2004h>     rw [hT]; exact monty_key _ (Nat.mod_lt _ (by decide))
+[?2004l[?2004h>   have hU : (2013265921 * t).toNat = 2013265921 * t.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mul, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>     exact Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   generalize 2013265921 * t = u at hU ⊢
+[?2004l[?2004h>   have h1 := Nat.div_add_mod (2013265921 * t.toNat) 4294967296
+[?2004l[?2004h>   have h2 := Nat.div_add_mod x.toNat 4294967296
+[?2004l[?2004h>   split <;> rename_i hlt <;> rw [UInt64.lt_iff_toNat_lt, hU] at hlt <;>
+[?2004l[?2004h>     simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_ofNat, hU,
+[?2004l[?2004h>       Nat.reducePow, Nat.reduceMod] <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# time LEAN_PATH=/workspace/lean lean mont.lean 2>&1 | head -60
+[?2004lmont.lean:30:40: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  b ≥ 0
+  0 ≤ a ≤ 8646911288846319615
+  0 ≤ a - 4294967296*b ≤ 4294967295
+  0 ≤ a - 4294967296*b ≤ 4294967295
+  0 ≤ 943718400*a - 2013265921*d ≤ 2013265920
+  1069547521*a - 4593671624212873217*b - 2013265921*c ≥ 1
+  1 ≤ 1069547521*a - 4593671624212873217*b - 2013265921*c + 4294967296*g ≤ 4294967296
+  -18446744067401318398 ≤ 1069547521*a - 4593671624212873217*b - 2013265921*c + 18446744073709551616*e + 4294967296*g ≤ 6308233217
+  2013265922 ≤ 1069547521*a - 4593671624212873217*b - 2013265921*c + 18446744073709551616*e + 18446744073709551616*f + 4294967296*g ≤ 18446744075722817537
+  1069547521*a - 4593671624212873216*b - 2013265921*c ≥ 0
+  2013265921*a - 4593671624212873217*b - 2013265921*c - 2013265921*d + 18446744073709551616*e + 18446744073709551616*f + 4294967296*g ≥ 18446744075722817538
+  0 ≤ 2281701377*a - 9799832793453166592*b - 4294967296*c ≤ 4294967295
+  2281701377*a - 9799832793453166592*b - 4294967296*c ≥ 0
+  2281701377*a - 9799832793453166592*b - 4294967296*c ≤ 9162596893
+where
+ a := ↑x.toNat
+ b := ↑x.toNat / 4294967296
+ c := ↑(x.toNat % 4294967296 * 2281701377) / 4294967296
+ d := ↑(x.toNat * 943718400) / 2013265921
+ e := ↑(2013265921 + (18446744073709551616 - 2013265921 * t.toNat + x.toNat) % 18446744073709551616 / 4294967296) /
+  18446744073709551616
+ f := ↑(18446744073709551616 - 4294967296 +
+      (2013265921 + (18446744073709551616 - 2013265921 * t.toNat + x.toNat) % 18446744073709551616 / 4294967296) %
+        18446744073709551616) /
+  18446744073709551616
+ g := ↑(18446744073709551616 - 2013265921 * t.toNat + x.toNat) / 18446744073709551616
+mont.lean:30:40: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  b ≥ 0
+  0 ≤ a ≤ 8646911288846319615
+  0 ≤ a - 4294967296*b ≤ 4294967295
+  0 ≤ a - 4294967296*b ≤ 4294967295
+  0 ≤ 943718400*a - 2013265921*d ≤ 2013265920
+  1069547521*a - 4593671624212873217*b - 2013265921*c ≤ 0
+  1 ≤ 1069547521*a - 4593671624212873217*b - 2013265921*c + 4294967296*e ≤ 4294967296
+  1069547521*a - 4593671624212873216*b - 2013265921*c ≥ 0
+  2013265921*a - 4593671624212873217*b - 2013265921*c - 2013265921*d + 4294967296*e ≥ 4294967297
+  0 ≤ 2281701377*a - 9799832793453166592*b - 4294967296*c ≤ 4294967295
+  2281701377*a - 9799832793453166592*b - 4294967296*c ≥ 0
+  2281701377*a - 9799832793453166592*b - 4294967296*c ≤ 9162596893
+where
+ a := ↑x.toNat
+ b := ↑x.toNat / 4294967296
+ c := ↑(x.toNat % 4294967296 * 2281701377) / 4294967296
+ d := ↑(x.toNat * 943718400) / 2013265921
+ e := ↑(18446744073709551616 - 2013265921 * t.toNat + x.toNat) / 18446744073709551616
+
+real	0m1.436s
+user	0m0.859s
+sys	0m0.543s
+[?2004hroot@07b8edb2de26:/tmp/lt# python3 -c "n=4294967296*943718400; P=2013265921; print((n-1)//P, (n-1)%P)"
+[?2004l2013265919 0
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > mont.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> set_option linter.unusedSimpArgs false
+[?2004l[?2004h> open SecurityChallenge LeanModel.Constants LeanModel.MontgomeryField
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_key (y : Nat) (hy : y < 4294967296) :
+[?2004l[?2004h>     2013265921 * (y * 2281701377 % 4294967296) % 4294967296 = y := by
+[?2004l[?2004h>   rw [Nat.mul_mod, Nat.mod_mod, ← Nat.mul_mod, Nat.mul_comm y, ← Nat.mul_assoc, Nat.mul_mod,
+[?2004l[?2004h>     (by decide : 2013265921 * 2281701377 % 4294967296 = 1), Nat.one_mul, Nat.mod_mod, Nat.mod_eq_of_lt hy]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_eq (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   have hxl := x.toNat_lt
+[?2004l[?2004h>   simp only [montyReduce, montyQuotient, babyBearP, babyBearMu, limbBase]
+[?2004l[?2004h>   have hT : ((x % 4294967296 * 2281701377 % 4294967296 : UInt64)).toNat
+[?2004l[?2004h>       = x.toNat % 4294967296 * 2281701377 % 4294967296 := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_mul, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>     rw [Nat.mod_eq_of_lt (by omega : x.toNat % 4294967296 * 2281701377 < 18446744073709551616)]
+[?2004l[?2004h>   generalize x % 4294967296 * 2281701377 % 4294967296 = t at hT ⊢
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by rw [hT]; exact Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   have hkey : 2013265921 * t.toNat % 4294967296 = x.toNat % 4294967296 := by
+[?2004l[?2004h>     rw [hT]; exact monty_key _ (Nat.mod_lt _ (by decide))
+[?2004l[?2004h>   have hU : (2013265921 * t).toNat = 2013265921 * t.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mul, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>     exact Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   generalize 2013265921 * t = u at hU ⊢
+[?2004l[?2004h>   have hk : 4294967296 * 943718400 = 1 + 2013265921 * KVAL := by decide
+[?2004l[?2004h>   split <;> rename_i hlt <;> rw [UInt64.lt_iff_toNat_lt, hU] at hlt <;>
+[?2004l[?2004h>     simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_ofNat, hU,
+[?2004l[?2004h>       Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>   · obtain ⟨s, hs⟩ : ∃ s, 2013265921 * t.toNat = x.toNat + s * 4294967296 :=
+[?2004l[?2004h>       ⟨(2013265921 * t.toNat - x.toNat) / 4294967296, by omega⟩
+[?2004l[?2004h>     have hs1 : 1 ≤ s := by omega
+[?2004l[?2004h>     have hsP : s < 2013265921 := by omega
+[?2004l[?2004h>     have heq : x.toNat * 943718400 =
+[?2004l[?2004h>         (2013265921 - s) + 2013265921 * (t.toNat * 943718400 - s * KVAL - 1) := by omega
+[?2004l[?2004h>     rw [heq, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt (by omega)]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · obtain ⟨q, hq⟩ : ∃ q, x.toNat = 2013265921 * t.toNat + q * 4294967296 :=
+[?2004l[?2004h>       ⟨(x.toNat - 2013265921 * t.toNat) / 4294967296, by omega⟩
+[?2004l[?2004h>     have hqP : q < 2013265921 := by omega
+[?2004l[?2004h>     have heq : x.toNat * 943718400 = q + 2013265921 * (q * KVAL + t.toNat * 943718400) := by omega
+[?2004l[?2004h>     rw [heq, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hqP]
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# K=$(python3 -c "print((4294967296*943718400-1)//2013265921)"); sed -i "s/KVAL/$K/g" mont.lean; time LEAN_PATH=/workspace/lean lean mont.lean 2>&1 | head -50
+[?2004lmont.lean:35:89: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+mont.lean:36:61: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  c ≥ 0
+  -4294967294 ≤ 2013265919*a - b - c ≤ 1
+  -1 ≤ 2281701377*a + b + c ≤ 8646911288846319614
+  -943718399 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c ≤ 1069547520
+  -943718400 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c - 18446744073709551616*d - 4294967296*e ≤ 18446744068470865919
+  -3225419775 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c - 4294967296*e ≤ 1069547520
+  -2013265918 ≤ 4593671619649470463*a + 2013265919*b - 2281701377*c ≤ 2281701377
+  4593671619649470463*a + 2013265919*b - 2281701377*c ≥ -6880895516
+where
+ a := ↑x.toNat / 4294967296
+ b := ↑(x.toNat % 4294967296 * 2281701377) / 4294967296
+ c := ↑(t.toNat * 943718400 - (s * 2013265919 + 1))
+ d := ↑(2013265921 + (18446744073709551616 - 2013265921 * t.toNat + x.toNat) % 18446744073709551616 / 4294967296) /
+  18446744073709551616
+ e := ↑(18446744073709551616 - 2013265921 * t.toNat + x.toNat) / 18446744073709551616
+mont.lean:37:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  18446744073709551616*d - 2013265921*e + 4294967296*f ≤ 18446744073709551615
+  c ≥ 0
+  -4294967294 ≤ 2013265919*a - b - c ≤ 1
+  -1 ≤ 2281701377*a + b + c ≤ 8646911288846319614
+  -943718399 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c ≤ 1069547520
+  -5238685696 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c - 18446744073709551616*d - 4294967296*f ≤ 18446744068470865919
+  -943718400 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c - 2013265921*e ≤ 1069547520
+  -3225419775 ≤ 2153283572780236800*a + 943718400*b - 1069547521*c - 4294967296*f ≤ 1069547520
+  -2013265918 ≤ 4593671619649470463*a + 2013265919*b - 2281701377*c ≤ 2281701377
+  4593671619649470463*a + 2013265919*b - 2281701377*c ≥ -6880895516
+where
+ a := ↑x.toNat / 4294967296
+ b := ↑(x.toNat % 4294967296 * 2281701377) / 4294967296
+ c := ↑(t.toNat * 943718400 - (s * 2013265919 + 1))
+ d := ↑(2013265921 + (18446744073709551616 - 2013265921 * t.toNat + x.toNat) % 18446744073709551616 / 4294967296) /
+  18446744073709551616
+ e := ↑(2013265921 - s) / 2013265921
+ f := ↑(18446744073709551616 - 2013265921 * t.toNat + x.toNat) / 18446744073709551616
+mont.lean:41:99: error: maximum recursion depth has been reached
+use `set_option maxRecDepth <num>` to increase limit
+use `set_option diagnostics true` to get diagnostic information
+
+real	0m1.518s
+user	0m1.349s
+sys	0m0.487s
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > mont.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> set_option linter.unusedSimpArgs false
+[?2004l[?2004h> set_option maxRecDepth 100000
+[?2004l[?2004h> open SecurityChallenge LeanModel.Constants LeanModel.MontgomeryField
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_key (y : Nat) (hy : y < 4294967296) :
+[?2004l[?2004h>     2013265921 * (y * 2281701377 % 4294967296) % 4294967296 = y := by
+[?2004l[?2004h>   rw [Nat.mul_mod, Nat.mod_mod, ← Nat.mul_mod, Nat.mul_comm y, ← Nat.mul_assoc, Nat.mul_mod,
+[?2004l[?2004h>     (by decide : 2013265921 * 2281701377 % 4294967296 = 1), Nat.one_mul, Nat.mod_mod, Nat.mod_eq_of_lt hy]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_neg_case (x t s : Nat) (hs : 2013265921 * t = x + s * 4294967296) (hs1 : 1 ≤ s)
+[?2004l[?2004h>     (hsP : s < 2013265921) : x * 943718400 % 2013265921 = 2013265921 - s := by
+[?2004l[?2004h>   have heq : x * 943718400 = (2013265921 - s) + 2013265921 * (t * 943718400 - s * 2013265919 - 1) := by
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   rw [heq, Nat.add_mul_mod_self_left]
+[?2004l[?2004h>   exact Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_pos_case (x t q : Nat) (hq : x = 2013265921 * t + q * 4294967296)
+[?2004l[?2004h>     (hqP : q < 2013265921) : x * 943718400 % 2013265921 = q := by
+[?2004l[?2004h>   have heq : x * 943718400 = q + 2013265921 * (q * 2013265919 + t * 943718400) := by
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   rw [heq, Nat.add_mul_mod_self_left]
+[?2004l[?2004h>   exact Nat.mod_eq_of_lt hqP
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem monty_eq (x : UInt64) (hx : x.toNat < 2013265921 * 4294967296) :
+[?2004l[?2004h>     (montyReduce x).toNat = x.toNat * 943718400 % 2013265921 := by
+[?2004l[?2004h>   have hxl := x.toNat_lt
+[?2004l[?2004h>   simp only [montyReduce, montyQuotient, babyBearP, babyBearMu, limbBase]
+[?2004l[?2004h>   have hT : ((x % 4294967296 * 2281701377 % 4294967296 : UInt64)).toNat
+[?2004l[?2004h>       = x.toNat % 4294967296 * 2281701377 % 4294967296 := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mod, UInt64.toNat_mul, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>     rw [Nat.mod_eq_of_lt (by omega : x.toNat % 4294967296 * 2281701377 < 18446744073709551616)]
+[?2004l[?2004h>   generalize x % 4294967296 * 2281701377 % 4294967296 = t at hT ⊢
+[?2004l[?2004h>   have htl : t.toNat < 4294967296 := by rw [hT]; exact Nat.mod_lt _ (by decide)
+[?2004l[?2004h>   have hkey : 2013265921 * t.toNat % 4294967296 = x.toNat % 4294967296 := by
+[?2004l[?2004h>     rw [hT]; exact monty_key _ (Nat.mod_lt _ (by decide))
+[?2004l[?2004h>   clear hT
+[?2004l[?2004h>   have hU : (2013265921 * t).toNat = 2013265921 * t.toNat := by
+[?2004l[?2004h>     simp only [UInt64.toNat_mul, UInt64.toNat_ofNat, Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>     exact Nat.mod_eq_of_lt (by omega)
+[?2004l[?2004h>   generalize 2013265921 * t = u at hU ⊢
+[?2004l[?2004h>   generalize hxn : x.toNat = X at *
+[?2004l[?2004h>   generalize htn : t.toNat = T at *
+[?2004l[?2004h>   split <;> rename_i hlt <;> rw [UInt64.lt_iff_toNat_lt, hU, hxn] at hlt <;>
+[?2004l[?2004h>     simp only [UInt64.toNat_sub, UInt64.toNat_add, UInt64.toNat_div, UInt64.toNat_ofNat, hU, hxn,
+[?2004l[?2004h>       Nat.reducePow, Nat.reduceMod]
+[?2004l[?2004h>   · have h1 := Nat.div_add_mod (2013265921 * T - X) 4294967296
+[?2004l[?2004h>     have hm : (2013265921 * T - X) % 4294967296 = 0 := by omega
+[?2004l[?2004h>     rw [monty_neg_case X T ((2013265921 * T - X) / 4294967296) (by omega) (by omega) (by omega)]
+[?2004l[?2004h>     omega
+[?2004l[?2004h>   · have h1 := Nat.div_add_mod (X - 2013265921 * T) 4294967296
+[?2004l[?2004h>     have hm : (X - 2013265921 * T) % 4294967296 = 0 := by omega
+[?2004l[?2004h>     rw [monty_pos_case X T ((X - 2013265921 * T) / 4294967296) (by omega) (by omega)]
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# time LEAN_PATH=/workspace/lean lean mont.lean 2>&1 | head -50
+[?2004lmont.lean:50:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  0 ≤ e ≤ 2013265921
+  -2281701375 ≤ e - 4294967296*f ≤ 2013265920
+  e ≤ 2013265920
+  4294967296*c + 4294967296*d + f ≤ 4294967295
+  -18446744069414584319 ≤ 18446744073709551616*c - e + 4294967296*f ≤ 4294967296
+  1 ≤ 18446744073709551616*c + 18446744073709551616*d - e + 4294967296*f ≤ 18446744073709551616
+  0 ≤ a ≤ 4294967295
+  a ≥ 0
+  a ≤ 9162596893
+  8646911288846319616 ≤ 2013265921*a - 4294967296*b + 4294967296*e ≤ 8646911293141286911
+  8646911288846319616 ≤ 2013265921*a + 4294967296*e ≤ 17293822577692639231
+where
+ a := ↑T
+ b := ↑X / 4294967296
+ c := ↑(2013265921 + (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 / 4294967296) /
+  18446744073709551616
+ d := ↑(18446744073709551616 - 4294967296 +
+      (2013265921 + (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616 / 4294967296) %
+        18446744073709551616) /
+  18446744073709551616
+ e := ↑(2013265921 - (2013265921 * T - X) / 4294967296)
+ f := ↑(18446744073709551616 - 2013265921 * T + X) / 18446744073709551616
+
+real	0m1.692s
+user	0m1.684s
+sys	0m0.481s
+[?2004hroot@07b8edb2de26:/tmp/lt# python3 - <<'EOF'
+[?2004l[?2004h> p='mont.lean'; s=open(p).read()
+[?2004l[?2004h> old=s[s.index('  · have h1 := Nat.div_add_mod (2013265921 * T - X)'):s.index('  · have h1 := Nat.div_add_mod (X - 2013265921 * T)')]
+[?2004l[?2004h> new='''  · have h1 := Nat.div_add_mod (2013265921 * T - X) 4294967296
+[?2004l[?2004h>     have hm : (2013265921 * T - X) % 4294967296 = 0 := by omega
+[?2004l[?2004h>     obtain ⟨s, hs, hs1, hsP⟩ : ∃ s, 2013265921 * T = X + s * 4294967296 ∧ 1 ≤ s ∧ s < 2013265921 :=
+[?2004l[?2004h>       ⟨(2013265921 * T - X) / 4294967296, by omega, by omega, by omega⟩
+[?2004l[?2004h>     rw [monty_neg_case X T s hs hs1 hsP]
+[?2004l[?2004h>     have e1 : (18446744073709551616 - 2013265921 * T + X) % 18446744073709551616
+[?2004l[?2004h>         = (4294967296 - s) * 4294967296 := by
+[?2004l[?2004h>       rw [Nat.mod_eq_of_lt (by omega)]; omega
+[?2004l[?2004h>     have e2 : (4294967296 - s) * 4294967296 / 4294967296 = 4294967296 - s :=
+[?2004l[?2004h>       Nat.mul_div_cancel _ (by decide)
+[?2004l[?2004h>     rw [e1, e2]
+[?2004l[?2004h>     omega
+[?2004l[?2004h> '''
+[?2004l[?2004h> s=s.replace(old,new); open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# time LEAN_PATH=/workspace/lean lean mont.lean 2>&1 | head -40; echo DONE
+[?2004l
+real	0m1.890s
+user	0m2.000s
+sys	0m0.479s
+DONE
+[?2004hroot@07b8edb2de26:/tmp/lt# ls /opt/rvb-deps /opt/rvb-deps/packages 2>&1 | head; TC=$(dirname $(dirname $(readlink -f $(which lean)))); grep -rhoE 'theorem testBit_[A-Za-z_]*(two_pow|mul)[A-Za-z_]*' $TC/src/lean/Init/Data/Nat/ 2>/dev/null | sort -u | head -30
+[?2004l/opt/rvb-deps:
+packages
+requirements-verifier.txt
+
+/opt/rvb-deps/packages:
+Cli
+LeanSearchClient
+Qq
+aeneas
+aesop
+theorem testBit_div_two_pow
+theorem testBit_lt_two_pow
+theorem testBit_mod_two_pow
+theorem testBit_mul_two_pow
+theorem testBit_mul_two_pow_add_eq
+theorem testBit_of_two_pow_le_and_two_pow_add_one_gt
+theorem testBit_two_pow
+theorem testBit_two_pow_add_eq
+theorem testBit_two_pow_add_gt
+theorem testBit_two_pow_mul
+theorem testBit_two_pow_mul_add
+theorem testBit_two_pow_of_ne
+theorem testBit_two_pow_self
+theorem testBit_two_pow_sub_one
+theorem testBit_two_pow_sub_succ
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > mg.lean <<'EOF'
+[?2004l[?2004h> import SecurityChallenge
+[?2004l[?2004h> set_option linter.unusedSimpArgs false
+[?2004l[?2004h> set_option maxRecDepth 100000
+[?2004l[?2004h> open SecurityChallenge LeanModel.Constants LeanModel.ReciprocalDiv
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem and_ffff (x : UInt64) : (x &&& 65535).toNat = x.toNat % 65536 := by
+[?2004l[?2004h>   rw [UInt64.toNat_and]
+[?2004l[?2004h>   have : (65535 : UInt64).toNat = 2 ^ 16 - 1 := rfl
+[?2004l[?2004h>   rw [this, Nat.and_two_pow_sub_one_eq_mod]
+[?2004l[?2004h> 
+[?2004l[?2004h> theorem mg_eq (u1 u0 : UInt64) (h1 : u1.toNat < 32771) (h0 : u0.toNat < 65536) :
+[?2004l[?2004h>     (div2x1Mg10 u1 u0).toNat = (u1.toNat * 65536 + u0.toNat) / 32771 := by
+[?2004l[?2004h>   simp only [div2x1Mg10, mg10Reciprocal, mg10Divisor, limbMask, subBias]
+[?2004l[?2004h>   split <;> rename_i hc <;> split <;> rename_i hd <;>
+[?2004l[?2004h>     simp only [UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_ffff, UInt64.toNat_sub, UInt64.toNat_add,
+[?2004l[?2004h>       UInt64.toNat_mul, UInt64.toNat_shiftRight, UInt64.toNat_shiftLeft, UInt64.toNat_ofNat,
+[?2004l[?2004h>       Nat.shiftRight_eq_div_pow, Nat.shiftLeft_eq, Nat.reducePow, Nat.reduceMod, Nat.reduceMul] at * <;>
+[?2004l[?2004h>     omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# time LEAN_PATH=/workspace/lean lean mg.lean 2>&1 | head -30; echo DONE
+[?2004lmg.lean:18:4: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  k ≥ 0
+  k - n - 18446744073709551616*o - 18446744073709551616*p ≤ -18446744073709551617
+  -18446744073709551615 ≤ k - 18446744073709551616*o ≤ 0
+  -18446744073709551616 ≤ k - 18446744073709551616*o - 18446744073709551616*p ≤ -1
+  0 ≤ 32771*k - 18446744073709551616*q ≤ 18446744073709551615
+  0 ≤ b ≤ 65535
+  -3221225472 ≤ b - 18446744073709551616*c ≤ 18446744070488326143
+  -18446744076930777088 ≤ b - 18446744073709551616*c - 18446744073709551616*d - 65536*e - 32771*k - 18446744073709551616*l - 65536*m + 18446744073709551616*q ≤ -18446744076930744324
+  -18446744076930809859 ≤ b - 18446744073709551616*c - 18446744073709551616*d - 65536*e - 32771*k - 18446744073709551616*l + 18446744073709551616*q ≤ -3221258244
+  -18446744076930777088 ≤ b - 18446744073709551616*c - 18446744073709551616*d - 65536*e - 32771*k + 18446744073709551616*q ≤ -18446744076930711553
+  -18446744076930777088 ≤ b - 18446744073709551616*c - 18446744073709551616*d - 32771*k + 18446744073709551616*q ≤ -3221225473
+  0 ≤ a ≤ 32770
+  0 ≤ a - 281474976710656*g ≤ 281474976710655
+  0 ≤ 16381*a - 4611686018427387904*f ≤ 4611686018427387903
+  0 ≤ 32765*a - 4611686018427387904*f - 4611686018427387904*g - 4611686018427387904*h ≤ 4611686018427387903
+  0 ≤ 65536*a + b - 32771*n ≤ 32770
+  131060*a + 18446744073709551616*c + 18446744073709551616*d + 65536*e - 18446744073709551616*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 32765*k - 18446744073709551616*q ≤ 18446744076930711551
+  0 ≤ 131060*a + b - 18446744073709551616*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i ≤ 18446744073709551615
+  -65536 ≤ 131060*a + b - 18446744073709551616*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j ≤ 18446744073709486079
+  -65536 ≤ 131060*a + b - 18446744073709551616*f - 18446744073709551616*g - 18446744073709551616*h - 18446744073709551616*i - 18446744073709551616*j - 65536*k ≤ -1
+where
+ a := ↑u1.toNat
+ b := ↑u0.toNat
+ c := ↑(3221225472 + u0.toNat) / 18446744073709551616
+ d := ↑(18446744073709551616 -
+        (((u1.toNat * 65524 % 18446744073709551616 + u1.toNat * 65536 % 18446744073709551616) % 18446744073709551616 +
+                      u0.toNat) %
+                    18446744073709551616 +
+
+real	0m18.477s
+user	0m16.023s
+sys	0m2.725s
+DONE
+[?2004hroot@07b8edb2de26:/tmp/lt# cat > mgn.lean <<'EOF'
+[?2004l[?2004h> set_option maxRecDepth 100000
+[?2004l[?2004h> theorem mg_nat (a b : Nat) (ha : a < 32771) (hb : b < 65536) :
+[?2004l[?2004h>     (if (a*131060 + b + 65536) % 65536 < (3221225472 + b - (a*131060 + b + 65536)/65536*32771) % 65536 then
+[?2004l[?2004h>       (if 32771 ≤ ((3221225472 + b - (a*131060 + b + 65536)/65536*32771) % 65536 + 32771) % 65536
+[?2004l[?2004h>         then (a*131060 + b + 65536)/65536 - 1 + 1 else (a*131060 + b + 65536)/65536 - 1)
+[?2004l[?2004h>     else (if 32771 ≤ (3221225472 + b - (a*131060 + b + 65536)/65536*32771) % 65536
+[?2004l[?2004h>         then (a*131060 + b + 65536)/65536 + 1 else (a*131060 + b + 65536)/65536))
+[?2004l[?2004h>     = (a*65536 + b)/32771 := by
+[?2004l[?2004h>   split <;> split <;> omega
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@07b8edb2de26:/tmp/lt# time lean mgn.lean 2>&1 | head -20; echo DONE
+[?2004lmgn.lean:9:22: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  e ≥ 0
+  32771 ≤ e - 65536*f ≤ 65535
+  d ≥ 0
+  d - g ≥ 0
+  3221225472 ≤ 32771*d + e ≤ 3221291007
+  0 ≤ c ≤ 32770
+  3221225472 ≤ 65536*c + 32771*d + e - 32771*g ≤ 3221258242
+  131060*c - 32765*d + 65536*f ≥ 3221159936
+  3221159936 ≤ 131060*c - 32765*d + e ≤ 3221225471
+where
+ c := ↑a
+ d := ↑(a * 131060 + b + 65536) / 65536
+ e := ↑(3221225472 + b - (a * 131060 + b + 65536) / 65536 * 32771)
+ f := ↑(3221225472 + b - (a * 131060 + b + 65536) / 65536 * 32771) / 65536
+ g := ↑(a * 65536 + b) / 32771
+mgn.lean:9:22: error: omega could not prove the goal:
+a possible counterexample may satisfy the constraints
+  e ≥ 0
+
+real	0m0.945s
+user	0m0.916s
+sys	0m0.201s
+DONE
+[?2004hroot@07b8edb2de26:/tmp/lt# python3 -c "
+[?2004l[?2004h> D=32771;S=set()
+[?2004l[?2004h> for a in range(0,D,7):
+[?2004l[?2004h>   for b in range(0,65536,3):
+[?2004l[?2004h>     Q=a*131060+b+65536;q1=Q>>16;q=(a*65536+b)//D;e=a*65536+b-q1*D
+[?2004l[?2004h>     S.add((q-q1, e//65536))
+[?2004l[?2004h> print(S)"
+[?2004l{(1, 0), (-1, -1), (0, 0)}
+[?2004hroot@07b8edb2de26:/tmp/lt# 

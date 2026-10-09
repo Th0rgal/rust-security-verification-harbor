@@ -2,8 +2,8 @@
 """Generate the Markdown benchmark summary table from evidence/v3/ Harbor traces.
 
 Usage:
-  python3 scripts/summarize-results.py            # 6 Challenge pairs (12 tasks)
-  python3 scripts/summarize-results.py --all      # All 9 benchmarked pairs (18 tasks)
+  python3 scripts/summarize-results.py            # Flagship zk-clearing pair (2 tasks)
+  python3 scripts/summarize-results.py --all      # Flagship + 9 calibration pairs (20 tasks)
 """
 from __future__ import annotations
 import argparse
@@ -14,15 +14,16 @@ ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "evidence" / "v3"
 
 CHALLENGE_PROBLEMS = (
+    "zk-clearing",
+)
+
+AUXILIARY_PROBLEMS = (
     "ruint",
     "succinct",
     "plonky3",
     "settlement-engine",
     "whirlpool",
     "goldilocks",
-)
-
-AUXILIARY_PROBLEMS = (
     "settlement-modular",
     "settlement",
     "openpql",
