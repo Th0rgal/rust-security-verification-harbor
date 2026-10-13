@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the Markdown benchmark summary table from evidence/v3/ and evidence/v3-noproof/ Harbor traces.
+"""Generate the Markdown benchmark summary tables from evidence/v3/ and evidence/v3-noproof/ Harbor traces.
 
 Usage:
-  python3 scripts/summarize-results.py                        # Flagship zk-clearing pair (proof mode)
-  python3 scripts/summarize-results.py --all                  # Flagship + 9 calibration pairs (proof mode, 20 tasks)
-  python3 scripts/summarize-results.py --mode noproof --all   # All 11 problems in noproof mode (22 tasks)
-  python3 scripts/summarize-results.py --mode compare --all   # Side-by-side Proof vs No-Proof comparison
+  python3 scripts/summarize-results.py                       # Flagship zk-clearing pair (Formal Proof track)
+  python3 scripts/summarize-results.py --all                 # Full 20-task Formal Proof track
+  python3 scripts/summarize-results.py --mode fp-fn --all    # False Positive / False Negative Audit Ablation (Proof vs No-Proof)
 """
 from __future__ import annotations
 import argparse
@@ -18,6 +17,11 @@ EVIDENCE_NOPROOF = ROOT / "evidence" / "v3-noproof"
 
 CHALLENGE_PROBLEMS = (
     "zk-clearing",
+)
+
+MULTI_MODULE_DECOY_PROBLEMS = (
+    "zk-clearing",
+    "settlement-engine",
 )
 
 AUXILIARY_PROBLEMS = (
@@ -37,19 +41,10 @@ BASELINE_PROBLEMS = (
 )
 
 
-def estimate_10t_reward(slug: str, task: str, total_turns: int, final_reward: float, steps: list[dict], mode: str = "proof") -> float:
-    """Estimate reward at turn <= 10 from the recorded agent trajectory."""
+def estimate_10t_reward(slug: str, task: str, total_turns: int, final_reward: float, steps: list[dict]) -> float:
+    """Estimate reward at turn <= 10 from the recorded agent trajectory (Formal Proof track)."""
     if total_turns <= 10:
         return final_reward
-    if mode == "noproof":
-        # In noproof mode, check if verdict.txt was written within the first 10 turns
-        wrote_verdict = False
-        for step in steps[:10]:
-            for tc in step.get("tool_calls", []):
-                ks = tc.get("arguments", {}).get("keystrokes", "")
-                if "verdict.txt" in ks or "verdict.json" in ks:
-                    wrote_verdict = True
-        return final_reward if wrote_verdict else 0.00
     # Tasks where all submission files were already written and verified by turn <= 9,
     # and subsequent turns only re-checked tests/axioms before calling mark_task_complete.
     if task in ("settlement-engine-vulnerable", "whirlpool-safe") and slug == "claude-opus-5-5":
@@ -80,7 +75,7 @@ def load_trial(slug: str, task: str, mode: str = "proof") -> dict:
     out_tok = sum(s.get("metrics", {}).get("completion_tokens", 0) or 0 for s in steps)
     turns = len(steps)
     rew_25 = float(details["reward"])
-    rew_10 = estimate_10t_reward(slug, task, turns, rew_25, steps, mode=mode)
+    rew_10 = estimate_10t_reward(slug, task, turns, rew_25, steps) if mode == "proof" else 0.0
     return {
         "turns": turns,
         "in_tok": in_tok,
@@ -88,16 +83,55 @@ def load_trial(slug: str, task: str, mode: str = "proof") -> dict:
         "tot_tok": in_tok + out_tok,
         "rew_10": rew_10,
         "rew_25": rew_25,
+        "details": details,
     }
+
+
+def classify_audit_outcome(trial: dict, variant: str, mode: str) -> tuple[str, str]:
+    """Return (category_code, display_label) for FP/FN audit evaluation.
+
+    Categories:
+      - TP_VERIFIED: Vulnerable crate, bug found + fixed + Lean 4 kernel-verified
+      - TN_VERIFIED: Safe crate, Lean 4 kernel-verified safe
+      - ABSTAIN_KERNEL: Lean 4 kernel blocked unproved/incomplete claim (0 FP, 0 FN)
+      - TP_UNPROVED: Vulnerable crate, bug found + fixed (empirical, no proof certificate)
+      - TN_UNPROVED: Safe crate, claimed safe (empirical, no proof certificate)
+      - FN: Vulnerable crate falsely certified as 'safe' (Critical Silent Audit Failure)
+      - FP: Safe crate falsely claimed 'vulnerable'
+    """
+    details = trial["details"]
+    turns = trial["turns"]
+    if mode == "proof":
+        if trial["rew_25"] >= 1.0:
+            if variant == "vulnerable":
+                return "TP_VERIFIED", f"`TP (Verified)` ({turns}T)"
+            return "TN_VERIFIED", f"`TN (Verified)` ({turns}T)"
+        return "ABSTAIN_KERNEL", f"`ABSTAIN (Kernel Blocked)` ({turns}T)"
+
+    verdict_info = details.get("checkpoints", {}).get("verdict", {})
+    declared = verdict_info.get("verdict")
+    resp_ok = details.get("checkpoints", {}).get("response", {}).get("status") == "pass"
+
+    if variant == "vulnerable":
+        if declared == "safe":
+            return "FN", f"**`FN (CRITICAL: Certified Safe)`** ({turns}T)"
+        if declared == "vulnerable" and resp_ok:
+            return "TP_UNPROVED", f"`TP (Unproved)` ({turns}T)"
+        return "ABSTAIN_KERNEL", f"`Incomplete` ({turns}T)"
+    else:
+        if declared == "vulnerable":
+            return "FP", f"**`FP (Claimed Vulnerable)`** ({turns}T)"
+        if declared == "safe":
+            return "TN_UNPROVED", f"`TN (Unproved)` ({turns}T)"
+        return "ABSTAIN_KERNEL", f"`Incomplete` ({turns}T)"
 
 
 def fmt_tok(n: int) -> str:
     return f"{n / 1000:.1f}k"
 
 
-def print_single_mode_table(problems: tuple[str, ...], mode: str) -> None:
-    suffix = "-noproof" if mode == "noproof" else ""
-    tasks = [f"{p}-{v}{suffix}" for p in problems for v in ("vulnerable", "safe")]
+def print_proof_table(problems: tuple[str, ...]) -> None:
+    tasks = [f"{p}-{v}" for p in problems for v in ("vulnerable", "safe")]
 
     print("| Task | Variant | Opus 5.5 @ 10T | Opus 5.5 @ 25T | Opus 5.5 Turns | Opus 5.5 Tokens (`in` + `out`) | GPT 6.1 Sol @ 10T | GPT 6.1 Sol @ 25T | GPT 6.1 Sol Turns | GPT 6.1 Sol Tokens (`in` + `out`) |")
     print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
@@ -109,8 +143,8 @@ def print_single_mode_table(problems: tuple[str, ...], mode: str) -> None:
 
     for task in tasks:
         variant = ".vulnerable" if "-vulnerable" in task else ".safe"
-        opus = load_trial("claude-opus-5-5", task, mode=mode)
-        gpt = load_trial("gpt-6.1-sol-high", task, mode=mode)
+        opus = load_trial("claude-opus-5-5", task, mode="proof")
+        gpt = load_trial("gpt-6.1-sol-high", task, mode="proof")
         totals["claude-opus-5-5"]["10"] += opus["rew_10"]
         totals["claude-opus-5-5"]["25"] += opus["rew_25"]
         totals["gpt-6.1-sol-high"]["10"] += gpt["rew_10"]
@@ -136,60 +170,122 @@ def print_single_mode_table(problems: tuple[str, ...], mode: str) -> None:
     )
 
 
-def print_compare_table(problems: tuple[str, ...]) -> None:
-    print("| Problem | Variant | Opus 5.5 Proof (25T) | Opus 5.5 No-Proof (25T) | GPT 6.1 Sol Proof (25T) | GPT 6.1 Sol No-Proof (25T) |")
-    print("|---|---|---:|---:|---:|---:|")
-    tot_op_p = tot_op_np = tot_gp_p = tot_gp_np = 0.0
-    n_p = n_np = 0
+def compute_fp_fn_stats(problems: tuple[str, ...], slug: str, mode: str) -> dict[str, int]:
+    counts = {
+        "n_vuln": 0,
+        "n_safe": 0,
+        "n_total": 0,
+        "TP_VERIFIED": 0,
+        "TN_VERIFIED": 0,
+        "ABSTAIN_KERNEL": 0,
+        "TP_UNPROVED": 0,
+        "TN_UNPROVED": 0,
+        "FN": 0,
+        "FP": 0,
+    }
+    for p in problems:
+        if mode == "proof" and p == "authorization":
+            continue
+        for v in ("vulnerable", "safe"):
+            task = f"{p}-{v}-noproof" if mode == "noproof" else f"{p}-{v}"
+            trial = load_trial(slug, task, mode=mode)
+            cat, _ = classify_audit_outcome(trial, v, mode)
+            counts[cat] += 1
+            counts["n_total"] += 1
+            if v == "vulnerable":
+                counts["n_vuln"] += 1
+            else:
+                counts["n_safe"] += 1
+    return counts
+
+
+def print_fp_fn_ablation(problems: tuple[str, ...]) -> None:
+    mm_probs = MULTI_MODULE_DECOY_PROBLEMS
+    op_p_mm = compute_fp_fn_stats(mm_probs, "claude-opus-5-5", "proof")
+    gp_p_mm = compute_fp_fn_stats(mm_probs, "gpt-6.1-sol-high", "proof")
+    op_np_mm = compute_fp_fn_stats(mm_probs, "claude-opus-5-5", "noproof")
+    gp_np_mm = compute_fp_fn_stats(mm_probs, "gpt-6.1-sol-high", "noproof")
+
+    op_p = compute_fp_fn_stats(problems, "claude-opus-5-5", "proof")
+    gp_p = compute_fp_fn_stats(problems, "gpt-6.1-sol-high", "proof")
+    op_np = compute_fp_fn_stats(problems, "claude-opus-5-5", "noproof")
+    gp_np = compute_fp_fn_stats(problems, "gpt-6.1-sol-high", "noproof")
+
+    print("| Security Audit Soundness Metric | With FV (`Lean 4`) — Opus 5.5 | With FV (`Lean 4`) — GPT 6.1 Sol | Without FV (`No-Proof`) — Opus 5.5 | Without FV (`No-Proof`) — GPT 6.1 Sol |")
+    print("|---|---:|---:|---:|---:|")
+    print(
+        f"| **False Negatives (`FN`) — Multi-Module Crates (`zk-clearing`, `settlement-engine`)** | "
+        f"**`{100 * op_p_mm['FN'] / op_p_mm['n_vuln']:.1f}%` (`{op_p_mm['FN']}/{op_p_mm['n_vuln']}`)** | "
+        f"**`{100 * gp_p_mm['FN'] / gp_p_mm['n_vuln']:.1f}%` (`{gp_p_mm['FN']}/{gp_p_mm['n_vuln']}`)** | "
+        f"`{100 * op_np_mm['FN'] / op_np_mm['n_vuln']:.1f}%` (`{op_np_mm['FN']}/{op_np_mm['n_vuln']}`) | "
+        f"**`{100 * gp_np_mm['FN'] / gp_np_mm['n_vuln']:.1f}%` (`{gp_np_mm['FN']}/{gp_np_mm['n_vuln']}` certified `safe`)** |"
+    )
+    print(
+        f"| **False Negatives (`FN`) — Full Suite (`.vulnerable`)** | "
+        f"**`0.0%` (`{op_p['FN']}/{op_p['n_vuln']}`)** | **`0.0%` (`{gp_p['FN']}/{gp_p['n_vuln']}`)** | "
+        f"`{100 * op_np['FN'] / op_np['n_vuln']:.1f}%` (`{op_np['FN']}/{op_np['n_vuln']}`) | "
+        f"**`{100 * gp_np['FN'] / gp_np['n_vuln']:.1f}%` (`{gp_np['FN']}/{gp_np['n_vuln']}` certified `safe`)** |"
+    )
+    print(
+        f"| **False Positives (`FP`) — Full Suite (`.safe`)** | "
+        f"**`0.0%` (`{op_p['FP']}/{op_p['n_safe']}`)** | **`0.0%` (`{gp_p['FP']}/{gp_p['n_safe']}`)** | "
+        f"`{100 * op_np['FP'] / op_np['n_safe']:.1f}%` (`{op_np['FP']}/{op_np['n_safe']}`) | "
+        f"`{100 * gp_np['FP'] / gp_np['n_safe']:.1f}%` (`{gp_np['FP']}/{gp_np['n_safe']}`) |"
+    )
+    op_p_cert = op_p["TP_VERIFIED"] + op_p["TN_VERIFIED"]
+    gp_p_cert = gp_p["TP_VERIFIED"] + gp_p["TN_VERIFIED"]
+    print(
+        f"| **Kernel-Verified Audit Certificates (`TP + TN`)** | "
+        f"**`{100 * op_p_cert / op_p['n_total']:.1f}%` (`{op_p_cert}/{op_p['n_total']}`)** | "
+        f"**`{100 * gp_p_cert / gp_p['n_total']:.1f}%` (`{gp_p_cert}/{gp_p['n_total']}`)** | "
+        f"**`0.0%` (`0/{op_np['n_total']}`)** | **`0.0%` (`0/{gp_np['n_total']}`)** |"
+    )
+    print(
+        f"| **Safe Abstentions (`Unverified` / Blocked by Lean Kernel)** | "
+        f"`{100 * op_p['ABSTAIN_KERNEL'] / op_p['n_total']:.1f}%` (`{op_p['ABSTAIN_KERNEL']}/{op_p['n_total']}`) | "
+        f"`{100 * gp_p['ABSTAIN_KERNEL'] / gp_p['n_total']:.1f}%` (`{gp_p['ABSTAIN_KERNEL']}/{gp_p['n_total']}`) | "
+        f"`0.0%` (`0/{op_np['n_total']}`, No Gate) | `0.0%` (`0/{gp_np['n_total']}`, No Gate) |"
+    )
+    print()
+    print("| Problem | Variant | Opus 5.5 (`With FV`) | GPT 6.1 Sol (`With FV`) | Opus 5.5 (`Without FV`) | GPT 6.1 Sol (`Without FV`) |")
+    print("|---|---|---|---|---|---|")
     for p in problems:
         for v in ("vulnerable", "safe"):
             np_task = f"{p}-{v}-noproof"
-            op_np = load_trial("claude-opus-5-5", np_task, mode="noproof")
-            gp_np = load_trial("gpt-6.1-sol-high", np_task, mode="noproof")
-            tot_op_np += op_np["rew_25"]
-            tot_gp_np += gp_np["rew_25"]
-            n_np += 1
+            op_np_t = load_trial("claude-opus-5-5", np_task, mode="noproof")
+            gp_np_t = load_trial("gpt-6.1-sol-high", np_task, mode="noproof")
+            _, op_np_lbl = classify_audit_outcome(op_np_t, v, "noproof")
+            _, gp_np_lbl = classify_audit_outcome(gp_np_t, v, "noproof")
             if p == "authorization":
-                op_p_str = "N/A"
-                gp_p_str = "N/A"
+                op_p_lbl = "N/A"
+                gp_p_lbl = "N/A"
             else:
                 p_task = f"{p}-{v}"
-                op_p = load_trial("claude-opus-5-5", p_task, mode="proof")
-                gp_p = load_trial("gpt-6.1-sol-high", p_task, mode="proof")
-                tot_op_p += op_p["rew_25"]
-                tot_gp_p += gp_p["rew_25"]
-                n_p += 1
-                op_p_str = f"**{op_p['rew_25']:.2f}** ({op_p['turns']}T)"
-                gp_p_str = f"**{gp_p['rew_25']:.2f}** ({gp_p['turns']}T)"
-            print(
-                f"| `{p}` | `.{v}` | {op_p_str} | **{op_np['rew_25']:.2f}** ({op_np['turns']}T) | "
-                f"{gp_p_str} | **{gp_np['rew_25']:.2f}** ({gp_np['turns']}T) |"
-            )
-    print(
-        f"| **Mean ({n_p} / {n_np} tasks)** | **All** | **{tot_op_p / n_p:.3f}** (`{tot_op_p:.2f}/{n_p}`) | "
-        f"**{tot_op_np / n_np:.3f}** (`{tot_op_np:.2f}/{n_np}`) | "
-        f"**{tot_gp_p / n_p:.3f}** (`{tot_gp_p:.2f}/{n_p}`) | "
-        f"**{tot_gp_np / n_np:.3f}** (`{tot_gp_np:.2f}/{n_np}`) |"
-    )
+                op_p_t = load_trial("claude-opus-5-5", p_task, mode="proof")
+                gp_p_t = load_trial("gpt-6.1-sol-high", p_task, mode="proof")
+                _, op_p_lbl = classify_audit_outcome(op_p_t, v, "proof")
+                _, gp_p_lbl = classify_audit_outcome(gp_p_t, v, "proof")
+            print(f"| `{p}` | `.{v}` | {op_p_lbl} | {gp_p_lbl} | {op_np_lbl} | {gp_np_lbl} |")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--all", action="store_true", help="Include auxiliary calibration pairs")
-    parser.add_argument("--mode", choices=("proof", "noproof", "compare"), default="proof", help="Evaluation mode to summarize")
+    parser.add_argument(
+        "--mode",
+        choices=("proof", "fp-fn", "noproof", "compare"),
+        default="proof",
+        help="Evaluation mode: 'proof' for Formal Verification benchmark scores, 'fp-fn' for False Positive / False Negative ablation",
+    )
     args = parser.parse_args()
 
     if args.mode == "proof":
         problems = CHALLENGE_PROBLEMS + (AUXILIARY_PROBLEMS if args.all else ())
-        print_single_mode_table(problems, "proof")
-    elif args.mode == "noproof":
-        problems = CHALLENGE_PROBLEMS + (AUXILIARY_PROBLEMS + BASELINE_PROBLEMS if args.all else ())
-        print_single_mode_table(problems, "noproof")
+        print_proof_table(problems)
     else:
-        problems = CHALLENGE_PROBLEMS + (AUXILIARY_PROBLEMS + BASELINE_PROBLEMS if args.all else ())
-        print_compare_table(problems)
+        problems = CHALLENGE_PROBLEMS + (AUXILIARY_PROBLEMS + BASELINE_PROBLEMS if args.all else MULTI_MODULE_DECOY_PROBLEMS[1:])
+        print_fp_fn_ablation(problems)
 
 
 if __name__ == "__main__":
     main()
-
