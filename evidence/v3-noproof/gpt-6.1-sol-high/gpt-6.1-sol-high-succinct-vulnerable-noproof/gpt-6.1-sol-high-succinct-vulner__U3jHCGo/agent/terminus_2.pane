@@ -1,0 +1,470 @@
+[?2004hroot@73447434e653:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@73447434e653:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@73447434e653:/workspace# find /workspace/challenge -maxdepth 4 -type f -print | sort
+[?2004l/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@73447434e653:/workspace# printf '%s\n' '--- Cargo.toml ---'; cat /workspace/challenge/Cargo.toml 2>/dev/null || true; printf '%s\n' '--- source files ---'; for f in $(find /workspace/challenge/src -type f -print | sort); do echo "===== $f ====="; cat "$f"; done
+[?2004l--- Cargo.toml ---
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+--- source files ---
+===== /workspace/challenge/src/lib.rs =====
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod broadword {
+    pub const L8: u64 = 0x0101_0101_0101_0101u64;
+    pub const H8: u64 = 0x8080_8080_8080_8080u64;
+    pub const M16: u64 = 0x00FF_00FF_00FF_00FFu64;
+    pub const L16: u64 = 0x0001_0001_0001_0001u64;
+
+    /// Vigna's SWAR broadword non-zero byte indicator (`tov/succinct-rs` `src/broadword.rs`):
+    /// Sets bit `8*i + 7` iff byte `i` of `x` is non-zero.
+    #[inline]
+    pub fn u_nz8(x: u64) -> u64 {
+        ((x | H8) - L8) & H8
+    }
+
+    /// Count non-zero bytes in `x` in parallel using SWAR multiplication by `L8`.
+    #[inline]
+    pub fn count_nz_bytes(x: u64) -> u64 {
+        ((u_nz8(x) >> 7u64).wrapping_mul(L8)) >> 56u64
+    }
+
+    /// Sum all 8 bytes of `x` in parallel using 16-bit lane folding and `L16`.
+    #[inline]
+    pub fn sum_bytes(x: u64) -> u64 {
+        let pairs: u64 = (x & M16) + ((x >> 8u64) & M16);
+        (pairs.wrapping_mul(L16) >> 48u64) & 0xFFFFu64
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::broadword;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SuccinctQuote {
+        pub principal_share: u64,
+        pub active_bytes: u64,
+        pub byte_sum: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<SuccinctQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let active_bytes: u64 = broadword::count_nz_bytes(fee);
+        let byte_sum: u64 = broadword::sum_bytes(fee);
+        let total_debit: u64 = principal_share + (active_bytes << 8u64) + byte_sum;
+        Some(SuccinctQuote {
+            principal_share,
+            active_bytes,
+            byte_sum,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: SuccinctQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Succinct SWAR broadword byte-schedule settlement against `balance`.
+///
+/// In exact integer arithmetic, let the 8 bytes of `fee` be
+/// `b_i = (fee >> (8 * i)) & 0xFF` for `i in {0, ..., 7}`:
+/// - `active_bytes = sum_{i=0..7} (if b_i > 0 then 1 else 0)`
+/// - `byte_sum = sum_{i=0..7} b_i`
+/// - `total_debit = floor(amount / 2) + 256 * active_bytes + byte_sum`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::SuccinctQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn low_bit_bytes_are_counted_and_summed() {
+        assert_eq!(
+            authorize(565, 100, 0x0201),
+            Some(Authorization { total_debit: 565 })
+        );
+        assert_eq!(authorize(564, 100, 0x0201), None);
+    }
+
+    #[test]
+    fn full_low_bits_across_all_bytes() {
+        assert_eq!(
+            authorize(2056, 0, broadword::L8),
+            Some(Authorization { total_debit: 2056 })
+        );
+    }
+}
+[?2004hroot@73447434e653:/workspace# printf '%s\n' '--- tests and other manifests ---'; find /workspace/challenge -maxdepth 4 -type f \( -path '*/tests/*' -o -name '*.md' -o -name '*.toml' \) -print | sort | while read f; do echo "===== $f ====="; cat "$f"; done
+[?2004l--- tests and other manifests ---
+===== /workspace/challenge/Cargo.toml =====
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@73447434e653:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.33s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::full_low_bits_across_all_bytes ... [32mok[m
+test tests::low_bit_bytes_are_counted_and_summed ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@73447434e653:/workspace/challenge# cat > /tmp/check.py <<'PY'
+[?2004l[?2004h> import random
+[?2004l[?2004h> MASK = (1 << 64) - 1
+[?2004l[?2004h> H8 = 0x8080808080808080
+[?2004l[?2004h> L8 = 0x0101010101010101
+[?2004l[?2004h> M16 = 0x00FF00FF00FF00FF
+[?2004l[?2004h> L16 = 0x0001000100010001
+[?2004l[?2004h> 
+[?2004l[?2004h> def u_nz8(x):
+[?2004l[?2004h>     return (((x | H8) - L8) & MASK) & H8
+[?2004l[?2004h> 
+[?2004l[?2004h> def count_nz(x):
+[?2004l[?2004h>     return (((u_nz8(x) >> 7) * L8) & MASK) >> 56
+[?2004l[?2004h> 
+[?2004l[?2004h> def sum_bytes(x):
+[?2004l[?2004h>     pairs = ((x & M16) + ((x >> 8) & M16)) & MASK
+[?2004l[?2004h>     return (((pairs * L16) & MASK) >> 48) & 0xffff
+[?2004l[?2004h> 
+[?2004l[?2004h> def expected(x):
+[?2004l[?2004h>     bs = [(x >> (8*i)) & 0xff for i in range(8)]
+[?2004l[?2004h>     return sum(b != 0 for b in bs), sum(bs)
+[?2004l[?2004h> 
+[?2004l[?2004h> for b in range(256):
+[?2004l[?2004h>     x = b * L8
+[?2004l[?2004h>     assert count_nz(x) == (8 if b else 0), (b, count_nz(x))
+[?2004l[?2004h>     assert sum_bytes(x) == 8*b, (b, sum_bytes(x))
+[?2004l[?2004h> 
+[?2004l[?2004h> vals = [0, 1, MASK, H8, L8, M16, 0x0123456789abcdef, 0xfedcba9876543210]
+[?2004l[?2004h> vals += [random.getrandbits(64) for _ in range(200000)]
+[?2004l[?2004h> for x in vals:
+[?2004l[?2004h>     c, s = expected(x)
+[?2004l[?2004h>     assert count_nz(x) == c, (hex(x), count_nz(x), c)
+[?2004l[?2004h>     assert sum_bytes(x) == s, (hex(x), sum_bytes(x), s)
+[?2004l[?2004h>     amount = random.getrandbits(64)
+[?2004l[?2004h>     balance = random.getrandbits(64)
+[?2004l[?2004h>     debit = amount // 2 + 256*c + s
+[?2004l[?2004h>     assert debit <= MASK
+[?2004l[?2004h>     assert ((debit <= balance) == (((amount >> 1) + (count_nz(x) << 8) + sum_bytes(x)) <= balance))
+[?2004l[?2004h> print('independent SWAR and policy checks passed')
+[?2004l[?2004h> print('maximum debit bound:', MASK // 2 + 2048 + 2040)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@73447434e653:/workspace/challenge# python3 /tmp/check.py
+[?2004lTraceback (most recent call last):
+  File "/tmp/check.py", line 24, in <module>
+    assert count_nz(x) == (8 if b else 0), (b, count_nz(x))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (128, 0)
+[?2004hroot@73447434e653:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission && printf 'safe\n' > /workspace/submission/verdict.txt && test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src && cat /workspace/submission/verdict.txt && find /workspace/submission -maxdepth 2 -print
+[?2004lsafe
+/workspace/submission
+/workspace/submission/verdict.txt
+[?2004hroot@73447434e653:/workspace/challenge# mkdir -p /workspace/submission/src && printf 'vulnerable\n' > /workspace/submission/verdict.txt && printf '%s\n' '{"balance":128,"amount":0,"fee":128}' > /workspace/submission/counterexample.json
+[?2004l[?2004hroot@73447434e653:/workspace/challenge# cat > /workspace/submission/src/lib.rs <<'RS'
+[?2004l[?2004h> #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h> pub struct Authorization {
+[?2004l[?2004h>     pub total_debit: u64,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod broadword {
+[?2004l[?2004h>     pub const L8: u64 = 0x0101_0101_0101_0101u64;
+[?2004l[?2004h>     pub const H8: u64 = 0x8080_8080_8080_8080u64;
+[?2004l[?2004h>     pub const M16: u64 = 0x00FF_00FF_00FF_00FFu64;
+[?2004l[?2004h>     pub const L16: u64 = 0x0001_0001_0001_0001u64;
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Sets bit 8*i + 7 iff byte i of x is non-zero.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn u_nz8(x: u64) -> u64 {
+[?2004l[?2004h>         let b0 = x & 0xFFu64;
+[?2004l[?2004h>         let b1 = (x >> 8u64) & 0xFFu64;
+[?2004l[?2004h>         let b2 = (x >> 16u64) & 0xFFu64;
+[?2004l[?2004h>         let b3 = (x >> 24u64) & 0xFFu64;
+[?2004l[?2004h>         let b4 = (x >> 32u64) & 0xFFu64;
+[?2004l[?2004h>         let b5 = (x >> 40u64) & 0xFFu64;
+[?2004l[?2004h>         let b6 = (x >> 48u64) & 0xFFu64;
+[?2004l[?2004h>         let b7 = (x >> 56u64) & 0xFFu64;
+[?2004l[?2004h>         (if b0 != 0 { 0x80u64 } else { 0 })
+[?2004l[?2004h>             | ((if b1 != 0 { 0x80u64 } else { 0 }) << 8u64)
+[?2004l[?2004h>             | ((if b2 != 0 { 0x80u64 } else { 0 }) << 16u64)
+[?2004l[?2004h>             | ((if b3 != 0 { 0x80u64 } else { 0 }) << 24u64)
+[?2004l[?2004h>             | ((if b4 != 0 { 0x80u64 } else { 0 }) << 32u64)
+[?2004l[?2004h>             | ((if b5 != 0 { 0x80u64 } else { 0 }) << 40u64)
+[?2004l[?2004h>             | ((if b6 != 0 { 0x80u64 } else { 0 }) << 48u64)
+[?2004l[?2004h>             | ((if b7 != 0 { 0x80u64 } else { 0 }) << 56u64)
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Count non-zero bytes in x in parallel using SWAR multiplication by L8.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn count_nz_bytes(x: u64) -> u64 {
+[?2004l[?2004h>         ((u_nz8(x) >> 7u64).wrapping_mul(L8)) >> 56u64
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Sum all 8 bytes of x in parallel using 16-bit lane folding and L16.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn sum_bytes(x: u64) -> u64 {
+[?2004l[?2004h>         let pairs: u64 = (x & M16) + ((x >> 8u64) & M16);
+[?2004l[?2004h>         (pairs.wrapping_mul(L16) >> 48u64) & 0xFFFFu64
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod settlement {
+[?2004l[?2004h>     use crate::Authorization;
+[?2004l[?2004h>     use crate::broadword;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h>     pub struct SuccinctQuote {
+[?2004l[?2004h>         pub principal_share: u64,
+[?2004l[?2004h>         pub active_bytes: u64,
+[?2004l[?2004h>         pub byte_sum: u64,
+[?2004l[?2004h>         pub total_debit: u64,
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn build_quote(amount: u64, fee: u64) -> Option<SuccinctQuote> {
+[?2004l[?2004h>         let principal_share: u64 = amount >> 1u64;
+[?2004l[?2004h>         let active_bytes: u64 = broadword::count_nz_bytes(fee);
+[?2004l[?2004h>         let byte_sum: u64 = broadword::sum_bytes(fee);
+[?2004l[?2004h>         let total_debit: u64 = principal_share + (active_bytes << 8u64) + byte_sum;
+[?2004l[?2004h>         Some(SuccinctQuote {
+[?2004l[?2004h>             principal_share,
+[?2004l[?2004h>             active_bytes,
+[?2004l[?2004h>             byte_sum,
+[?2004l[?2004h>             total_debit,
+[?2004l[?2004h>         })
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn verify_affordability(balance: u64, quote: SuccinctQuote) -> Option<Authorization> {
+[?2004l[?2004h>         if quote.total_debit <= balance {
+[?2004l[?2004h>             Some(Authorization {
+[?2004l[?2004h>                 total_debit: quote.total_debit,
+[?2004l[?2004h>             })
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             None
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> /// Authorize a Succinct SWAR broadword byte-schedule settlement against `balance`.
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// In exact integer arithmetic, let the 8 bytes of `fee` be
+[?2004l[?2004h> /// `b_i = (fee >> (8 * i)) & 0xFF` for `i in {0, ..., 7}`:
+[?2004l[?2004h> /// - `active_bytes = sum_{i=0..7} (if b_i > 0 then 1 else 0)`
+[?2004l[?2004h> /// - `byte_sum = sum_{i=0..7} b_i`
+[?2004l[?2004h> /// - `total_debit = floor(amount / 2) + 256 * active_bytes + byte_sum`
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// The payment is authorized iff `total_debit <= balance`.
+[?2004l[?2004h> /// Production code in this crate operates on `u64` words only (`u128` is not used).
+[?2004l[?2004h> pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+[?2004l[?2004h>     let quote: settlement::SuccinctQuote = settlement::build_quote(amount, fee)?;
+[?2004l[?2004h>     settlement::verify_affordability(balance, quote)
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn zero_payment_is_authorized() {
+[?2004l[?2004h>         assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn low_bit_bytes_are_counted_and_summed() {
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(565, 100, 0x0201),
+[?2004l[?2004h>             Some(Authorization { total_debit: 565 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>         assert_eq!(authorize(564, 100, 0x0201), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn full_low_bits_across_all_bytes() {
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(2056, 0, broadword::L8),
+[?2004l[?2004h>             Some(Authorization { total_debit: 2056 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@73447434e653:/workspace/challenge# mkdir -p /tmp/repaired/src && cp /workspace/challenge/Cargo.toml /tmp/repaired/Cargo.toml && cp /workspace/submission/src/lib.rs /tmp/repaired/src/lib.rs && mkdir -p /tmp/repaired/tests && cat > /tmp/repaired/tests/universal_checks.rs <<'RS'
+[?2004l[?2004h> use settlement_gate::{authorize, broadword};
+[?2004l[?2004h> 
+[?2004l[?2004h> fn expected(fee: u64) -> (u64, u64) {
+[?2004l[?2004h>     let mut active = 0;
+[?2004l[?2004h>     let mut sum = 0;
+[?2004l[?2004h>     let mut i = 0;
+[?2004l[?2004h>     while i < 8 {
+[?2004l[?2004h>         let b = (fee >> (8 * i)) & 0xff;
+[?2004l[?2004h>         if b != 0 { active += 1; }
+[?2004l[?2004h>         sum += b;
+[?2004l[?2004h>         i += 1;
+[?2004l[?2004h>     }
+[?2004l[?2004h>     (active, sum)
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> #[test]
+[?2004l[?2004h> fn every_byte_value_in_every_position() {
+[?2004l[?2004h>     for pos in 0..8 {
+[?2004l[?2004h>         for b in 0..=255u64 {
+[?2004l[?2004h>             let fee = b << (8 * pos);
+[?2004l[?2004h>             let (active, sum) = expected(fee);
+[?2004l[?2004h>             assert_eq!(broadword::count_nz_bytes(fee), active);
+[?2004l[?2004h>             assert_eq!(broadword::sum_bytes(fee), sum);
+[?2004l[?2004h>             assert_eq!(broadword::u_nz8(fee), if b == 0 { 0 } else { 0x80 << (8 * pos) });
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> #[test]
+[?2004l[?2004h> fn structured_words_and_policy() {
+[?2004l[?2004h>     let values = [0, 1, u64::MAX, 0x8080808080808080, 0x0101010101010101,
+[?2004l[?2004h>         0x0123456789abcdef, 0xfedcba9876543210, 0x8000000000000000];
+[?2004l[?2004h>     for &fee in &values {
+[?2004l[?2004h>         let (active, sum) = expected(fee);
+[?2004l[?2004h>         assert_eq!(broadword::count_nz_bytes(fee), active);
+[?2004l[?2004h>         assert_eq!(broadword::sum_bytes(fee), sum);
+[?2004l[?2004h>         let amount = u64::MAX;
+[?2004l[?2004h>         let debit = amount / 2 + 256 * active + sum;
+[?2004l[?2004h>         assert!(debit <= u64::MAX);
+[?2004l[?2004h>         assert_eq!(authorize(debit, amount, fee).unwrap().total_debit, debit);
+[?2004l[?2004h>         if debit < u64::MAX { assert!(authorize(debit - 1, amount, fee).is_none()); }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@73447434e653:/workspace/challenge# cd /tmp/repaired && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/repaired)
+[1m[36m    Building[0m [                             ] 0/4: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [======>                      ] 1/4: settlement_gate(test), universal_checks(test)                                                               [1m[36m    Building[0m [====================>        ] 3/4: universal_checks(test)                                                                                      [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.32s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::full_low_bits_across_all_bytes ... [32mok[m
+test tests::low_bit_bytes_are_counted_and_summed ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m     Running[0m tests/universal_checks.rs (target/release/deps/universal_checks-575c6aff7a805032)
+
+running 2 tests
+test every_byte_value_in_every_position ... [32mok[m
+test structured_words_and_policy ... [32mok[m
+
+test result: [32mok[m. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@73447434e653:/tmp/repaired# mkdir -p /tmp/original_witness/tests && cp /workspace/challenge/Cargo.toml /tmp/original_witness/Cargo.toml && cp /workspace/challenge/src/lib.rs /tmp/original_witness/src_lib.rs && mkdir -p /tmp/original_witness/src && cp /workspace/challenge/src/lib.rs /tmp/original_witness/src/lib.rs && cat > /tmp/original_witness/tests/witness.rs <<'RS'
+[?2004l[?2004h> use settlement_gate::authorize;
+[?2004l[?2004h> 
+[?2004l[?2004h> #[test]
+[?2004l[?2004h> fn original_accepts_unaffordable_witness() {
+[?2004l[?2004h>     assert_eq!(authorize(128, 0, 128).map(|x| x.total_debit), Some(128));
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@73447434e653:/tmp/repaired# cd /tmp/original_witness && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/original_witness)
+[1m[36m    Building[0m [                             ] 0/4: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [======>                      ] 1/4: settlement_gate(test), witness(test)                                                                        [1m[36m    Building[0m [====================>        ] 3/4: witness(test)                                                                                               [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.27s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::full_low_bits_across_all_bytes ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+test tests::low_bit_bytes_are_counted_and_summed ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m     Running[0m tests/witness.rs (target/release/deps/witness-1d21ac4c959e0998)
+
+running 1 test
+test original_accepts_unaffordable_witness ... [32mok[m
+
+test result: [32mok[m. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@73447434e653:/tmp/original_witness# python3 - <<'PY'
+[?2004l[?2004h> import json
+[?2004l[?2004h> p='/workspace/submission/counterexample.json'
+[?2004l[?2004h> with open(p) as f: x=json.load(f)
+[?2004l[?2004h> assert list(x.keys()) == ['balance','amount','fee']
+[?2004l[?2004h> assert x == {'balance':128,'amount':0,'fee':128}
+[?2004l[?2004h> print('counterexample verified:', x)
+[?2004l[?2004h> PY
+[?2004lcounterexample verified: {'balance': 128, 'amount': 0, 'fee': 128}
+[?2004hroot@73447434e653:/tmp/original_witness# printf '%s\n' '--- submission ---'; find /workspace/submission -maxdepth 3 -type f -print | sort; printf '%s\n' '--- verdict ---'; cat /workspace/submission/verdict.txt
+[?2004l--- submission ---
+/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/verdict.txt
+--- verdict ---
+vulnerable
+[?2004hroot@73447434e653:/tmp/original_witness# 

@@ -31,17 +31,20 @@ By default (`python3 scripts/make-family.py /tmp/security-family`), the benchmar
   6. Sequencer transcript domain tag surcharge (`transcript_codec`) + Goldilocks 128-bit field reduction bridge surcharge (`goldilocks_field`)
 - **Hidden Vulnerability & Cross-Module Counterexample Coupling in `.vulnerable`:** While `word_math::ceil_div_bps_u64` (`10_000`) is completely sound (acting as a realistic decoy), `word_math::ceil_div_flash_u64` (`5_000`) folds `biased + U64_MOD_FLASH_REM` in its non-carry `biased < sum.low_word` wrap branch (`2^64 - 4999 <= amount + fee <= 2^64 - 1617`), under-computing the flash LP surcharge across a 3,383-wide interior pocket. Because `bridge_surcharge = (amount + fee * 2^64) mod P_GL` exceeds `2^64 - 7e12` for small `amount` in that pocket, naive `amount = 0` boundary probes always overflow `u64::MAX`; constructing a valid counterexample requires simultaneously satisfying the `WordMath` pocket and keeping the 128-bit `GoldilocksField` residue small (e.g. `fee = GOLDILOCKS_P`).
 
-We evaluate frontier models in Harbor 0.9.0 (`terminus-2`, `reasoning_effort=high`) under a **10-turn budget (`max_turns=10`)** and an **extended 25-turn budget (`max_turns=25`)**:
+We evaluate frontier models in Harbor 0.9.0 (`terminus-2`, `reasoning_effort=high`) across both tracks:
+- **Formal Proof Track (`--mode proof`, default):** Requires `Spec.lean` (`25%`), `Audit.lean` (`15%`), `Proof.lean` (`25%`), and `counterexample.json` (`15%`) + repaired Rust/Lean (`20%`) on `.vulnerable`.
+- **Direct Security Audit Track without Formal Proof (`--mode noproof`):** Gives the agent a clean Rust workspace without Lean 4 and asks only for an audit verdict (`verdict.txt`: `safe` or `vulnerable`, `20%` gated on justification) and, if `vulnerable`, a concrete `counterexample.json` (`30%`) and repaired pure-`u64` Rust crate (`50%`, verified universally by Z3 `rust_symbolic.py`).
 
-| Flagship Benchmark (`zk-clearing`, 2 Tasks) | Claude Opus 5.5 (`high`) @ **10T** | Claude Opus 5.5 (`high`) @ **25T** | GPT 6.1 Sol (`high`) @ **10T** | GPT 6.1 Sol (`high`) @ **25T** | Reference Oracle |
+| Flagship Benchmark (`zk-clearing`, 2 Tasks) | Opus 5.5 (`proof` @ 25T) | Opus 5.5 (`noproof` @ 25T) | GPT 6.1 Sol (`proof` @ 25T) | GPT 6.1 Sol (`noproof` @ 25T) | Reference Oracle |
 |---|---:|---:|---:|---:|---:|
-| **`zk-clearing-vulnerable`** | **0.000** | **0.000** | **0.000** | **0.000** | **1.000** |
-| **`zk-clearing-safe`** | **0.000** | **0.000** | **0.000** | **0.000** | **1.000** |
-| **Overall Mean (`2` tasks)** | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **0.000** (`0.00 / 2`) | **1.000** (`2.00 / 2`) |
+| **`zk-clearing-vulnerable`** | **0.000** (25T) | **1.000** (24T) | **0.000** (25T) | **0.000** (21T, false `safe`) | **1.000** |
+| **`zk-clearing-safe`** | **0.000** (25T) | **1.000** (15T) | **0.000** (25T) | **1.000** (14T) | **1.000** |
+| **Flagship Mean (`2` tasks)** | **0.000** (`0.00 / 2`) | **1.000** (`2.00 / 2`) | **0.000** (`0.00 / 2`) | **0.500** (`1.00 / 2`) | **1.000** (`2.00 / 2`) |
+| **Full Suite Mean (`20` / `22` tasks)** | **0.900** (`18.00 / 20`) | **1.000** (`22.00 / 22`) | **0.787** (`15.75 / 20`) | **0.909** (`20.00 / 22`) | **1.000** |
 
-*(Passing `--problem all` to `scripts/make-family.py` or `--all` to `scripts/summarize-results.py` also includes the 9 single-kernel calibration pairs: `ruint`, `succinct`, `plonky3`, `settlement-engine`, `whirlpool`, `goldilocks`, `settlement-modular`, `settlement`, and `openpql`.)*
+*(Passing `--problem all` to `scripts/make-family.py` or `--all` to `scripts/summarize-results.py` includes all calibration pairs across both `proof` and `noproof` modes.)*
 
-- **Specification formula, per-task token/turn breakdown, failure analysis, and calibration suite results:** [evidence/v3/VALIDATION.md](evidence/v3/VALIDATION.md)
+- **Specification formula, per-task token/turn breakdown, failure analysis, and `Proof` vs `No-Proof` comparison:** [evidence/v3/VALIDATION.md](evidence/v3/VALIDATION.md)
 - **Verifier architecture and AST lowering details:** [BACKEND.md](BACKEND.md)
 
 ---
@@ -49,14 +52,17 @@ We evaluate frontier models in Harbor 0.9.0 (`terminus-2`, `reasoning_effort=hig
 ## Quick Start
 
 ```bash
-# 1. Print the @10T vs @25T summary table from the committed Harbor traces:
-python3 scripts/summarize-results.py
+# 1. Print the summary tables (proof, noproof, or side-by-side comparison):
+python3 scripts/summarize-results.py --all
+python3 scripts/summarize-results.py --mode noproof --all
+python3 scripts/summarize-results.py --mode compare --all
 
-# 2. Generate the flagship zk-clearing Harbor task pair into /tmp/security-family:
-python3 scripts/make-family.py /tmp/security-family
+# 2. Generate the flagship zk-clearing Harbor task pairs (proof, noproof, or both):
+python3 scripts/make-family.py /tmp/security-family --mode both
 
-# 3. Run a Harbor evaluation on either generated task:
-harbor run -p /tmp/security-family/zk-clearing-vulnerable \
+# 3. Run a Harbor evaluation on a generated task:
+harbor run -p /tmp/security-family/zk-clearing-vulnerable-noproof \
   -a terminus-2 -m <model> \
   --ak reasoning_effort=high --ak max_turns=25 -e docker -n 1
 ```
+

@@ -1,0 +1,214 @@
+[?2004hroot@72ee28273f52:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@72ee28273f52:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@72ee28273f52:/workspace# pwd; printf '\n--- workspace ---\n'; find /workspace -maxdepth 3 -type f -o -type d | sort
+[?2004l/workspace
+
+--- workspace ---
+/workspace
+/workspace/challenge
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src
+/workspace/challenge/src/lib.rs
+/workspace/submission
+/workspace/submission/src
+[?2004hroot@72ee28273f52:/workspace# printf '\n--- Cargo.toml ---\n'; cat /workspace/challenge/Cargo.toml; printf '\n--- source files ---\n'; find /workspace/challenge/src -type f -maxdepth 5 -print -exec sh -c 'echo "--- $1 ---"; sed -n "1,240p" "$1"' _ {} \;
+[?2004l
+--- Cargo.toml ---
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+
+--- source files ---
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs ---
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod broadword {
+    pub const L8: u64 = 0x0101_0101_0101_0101u64;
+    pub const H8: u64 = 0x8080_8080_8080_8080u64;
+    pub const M16: u64 = 0x00FF_00FF_00FF_00FFu64;
+    pub const L16: u64 = 0x0001_0001_0001_0001u64;
+
+    /// Vigna's SWAR broadword non-zero byte indicator (`tov/succinct-rs` `src/broadword.rs`):
+    /// Sets bit `8*i + 7` iff byte `i` of `x` is non-zero.
+    #[inline]
+    pub fn u_nz8(x: u64) -> u64 {
+        (((x | H8) - L8) | x) & H8
+    }
+
+    /// Count non-zero bytes in `x` in parallel using SWAR multiplication by `L8`.
+    #[inline]
+    pub fn count_nz_bytes(x: u64) -> u64 {
+        ((u_nz8(x) >> 7u64).wrapping_mul(L8)) >> 56u64
+    }
+
+    /// Sum all 8 bytes of `x` in parallel using 16-bit lane folding and `L16`.
+    #[inline]
+    pub fn sum_bytes(x: u64) -> u64 {
+        let pairs: u64 = (x & M16) + ((x >> 8u64) & M16);
+        (pairs.wrapping_mul(L16) >> 48u64) & 0xFFFFu64
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::broadword;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SuccinctQuote {
+        pub principal_share: u64,
+        pub active_bytes: u64,
+        pub byte_sum: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<SuccinctQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let active_bytes: u64 = broadword::count_nz_bytes(fee);
+        let byte_sum: u64 = broadword::sum_bytes(fee);
+        let total_debit: u64 = principal_share + (active_bytes << 8u64) + byte_sum;
+        Some(SuccinctQuote {
+            principal_share,
+            active_bytes,
+            byte_sum,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: SuccinctQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Succinct SWAR broadword byte-schedule settlement against `balance`.
+///
+/// In exact integer arithmetic, let the 8 bytes of `fee` be
+/// `b_i = (fee >> (8 * i)) & 0xFF` for `i in {0, ..., 7}`:
+/// - `active_bytes = sum_{i=0..7} (if b_i > 0 then 1 else 0)`
+/// - `byte_sum = sum_{i=0..7} b_i`
+/// - `total_debit = floor(amount / 2) + 256 * active_bytes + byte_sum`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::SuccinctQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn low_bit_bytes_are_counted_and_summed() {
+        // fee = 0x0000_0000_0000_0201 -> b0 = 1, b1 = 2 -> active = 2, sum = 3
+        // total_debit = 50 + 2 * 256 + 3 = 565
+        assert_eq!(
+            authorize(565, 100, 0x0201),
+            Some(Authorization { total_debit: 565 })
+        );
+        assert_eq!(authorize(564, 100, 0x0201), None);
+    }
+
+    #[test]
+    fn full_low_bits_across_all_bytes() {
+        // fee = L8 -> all 8 bytes = 1 -> active = 8, sum = 8 -> surcharge = 8 * 256 + 8 = 2056
+        assert_eq!(
+            authorize(2056, 0, broadword::L8),
+            Some(Authorization { total_debit: 2056 })
+        );
+    }
+}
+[?2004hroot@72ee28273f52:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.31s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::full_low_bits_across_all_bytes ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+test tests::low_bit_bytes_are_counted_and_summed ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@72ee28273f52:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> L8 = 0x0101010101010101
+[?2004l[?2004h> H8 = 0x8080808080808080
+[?2004l[?2004h> M16 = 0x00ff00ff00ff00ff
+[?2004l[?2004h> L16 = 0x0001000100010001
+[?2004l[?2004h> MASK = (1 << 64) - 1
+[?2004l[?2004h> 
+[?2004l[?2004h> def swar_count(x):
+[?2004l[?2004h>     nz = ((((x | H8) - L8) & MASK) | x) & H8
+[?2004l[?2004h>     return (((nz >> 7) * L8) & MASK) >> 56
+[?2004l[?2004h> 
+[?2004l[?2004h> def swar_sum(x):
+[?2004l[?2004h>     pairs = (x & M16) + ((x >> 8) & M16)
+[?2004l[?2004h>     return (((pairs * L16) & MASK) >> 48) & 0xffff
+[?2004l[?2004h> 
+[?2004l[?2004h> def model_count(x):
+[?2004l[?2004h>     return sum(1 for i in range(8) if ((x >> (8*i)) & 0xff) != 0)
+[?2004l[?2004h> 
+[?2004l[?2004h> def model_sum(x):
+[?2004l[?2004h>     return sum((x >> (8*i)) & 0xff for i in range(8))
+[?2004l[?2004h> 
+[?2004l[?2004h> for x in range(1 << 16):
+[?2004l[?2004h>     assert swar_count(x) == model_count(x), (hex(x), swar_count(x), model_count(x))
+[?2004l[?2004h>     assert swar_sum(x) == model_sum(x), (hex(x), swar_sum(x), model_sum(x))
+[?2004l[?2004h> 
+[?2004l[?2004h> values = [0, 1, 0xff, 0x100, 0x0101010101010101, 0x8080808080808080, 0xffffffffffffffff, 0x8000000000000000, 0x7fffffffffffffff]
+[?2004l[?2004h> for x in values:
+[?2004l[?2004h>     assert swar_count(x) == model_count(x), hex(x)
+[?2004l[?2004h>     assert swar_sum(x) == model_sum(x), hex(x)
+[?2004l[?2004h>     assert 0 <= model_count(x) <= 8
+[?2004l[?2004h>     assert 0 <= model_sum(x) <= 2040
+[?2004l[?2004h> 
+[?2004l[?2004h> for amount in [0, 1, 2, (1 << 64) - 1]:
+[?2004l[?2004h>     debit = amount // 2 + 8 * 256 + 8 * 255
+[?2004l[?2004h>     assert debit < (1 << 64)
+[?2004l[?2004h> print('SWAR/model checks passed')
+[?2004l[?2004h> PY
+[?2004lSWAR/model checks passed
+[?2004hroot@72ee28273f52:/workspace/challenge# rm -rf /workspace/submission/counterexample.json /workspace/submission/src; printf 'safe\n' > /workspace/submission/verdict.txt; printf '%s\n' '--- submission ---'; find /workspace/submission -maxdepth 2 -print -exec sh -c 'if [ -f "$1" ]; then echo "--- $1 ---"; cat "$1"; fi' _ {} \;
+[?2004l--- submission ---
+/workspace/submission
+/workspace/submission/verdict.txt
+--- /workspace/submission/verdict.txt ---
+safe
+[?2004hroot@72ee28273f52:/workspace/challenge# 

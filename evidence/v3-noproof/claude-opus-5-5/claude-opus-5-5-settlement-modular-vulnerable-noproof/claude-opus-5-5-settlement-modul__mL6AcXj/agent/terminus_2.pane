@@ -1,0 +1,279 @@
+[?2004hroot@dbabc2950f85:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@dbabc2950f85:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@dbabc2950f85:/workspace# cd /workspace/challenge && find . -type f -not -path './target/*' | head -50 && cat Cargo.toml
+[?2004l./src/lib.rs
+./Cargo.toml
+./Cargo.lock
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@dbabc2950f85:/workspace/challenge# for f in $(find src -name '*.rs'); do echo "=== $f"; cat -n $f; done
+[?2004l=== src/lib.rs
+     1	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     2	pub struct Authorization {
+     3	    pub total_debit: u64,
+     4	}
+     5	
+     6	pub mod constants {
+     7	    /// Basis-point denominator (100% = 10_000 bps).
+     8	    pub const BPS_DENOM: u64 = 10_000;
+     9	    /// Ceiling-division bias for `BPS_DENOM` (`BPS_DENOM - 1`).
+    10	    pub const BPS_MAX_REM: u64 = 9_999;
+    11	    /// Floor quotient of `2^64` by `BPS_DENOM`: `floor(2^64 / 10_000)`.
+    12	    pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+    13	    /// Exact remainder of `2^64` modulo `BPS_DENOM`: `2^64 % 10_000 = 1_616`.
+    14	    pub const U64_MOD_BPS_REM: u64 = 1_616;
+    15	    /// Protocol tier rebate divisor (10% rebate on gross fee, rounded down).
+    16	    pub const REBATE_DIVISOR: u64 = 10;
+    17	    /// Reference liquidity band threshold for diagnostics.
+    18	    pub const HIGH_VALUE_THRESHOLD: u64 = 1_000_000_000_000;
+    19	}
+    20	
+    21	pub mod bps_math {
+    22	    use crate::constants::*;
+    23	
+    24	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    25	    pub struct SumFold {
+    26	        pub low_word: u64,
+    27	        pub wrapped_u64: bool,
+    28	    }
+    29	
+    30	    /// Folds the unbounded notional sum `amount + fee` into a 64-bit low word
+    31	    /// and an explicit `2^64` carry flag without `u128` promotion.
+    32	    #[inline]
+    33	    pub fn fold_u64_sum(amount: u64, fee: u64) -> SumFold {
+    34	        let low_word = amount.wrapping_add(fee);
+    35	        let wrapped_u64 = low_word < amount;
+    36	        SumFold { low_word, wrapped_u64 }
+    37	    }
+    38	
+    39	    /// Computes the floor basis-point levy `floor((amount + fee) / 10_000)`
+    40	    /// in pure `u64` arithmetic across the `2^64` boundary.
+    41	    #[inline]
+    42	    pub fn floor_div_bps_folded(fold: SumFold) -> u64 {
+    43	        if fold.wrapped_u64 {
+    44	            let rem_sum = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+    45	            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + (rem_sum / BPS_DENOM)
+    46	        } else {
+    47	            fold.low_word / BPS_DENOM
+    48	        }
+    49	    }
+    50	
+    51	    /// Computes the ceiling basis-point levy `ceil((amount + fee) / 10_000)`
+    52	    /// in pure `u64` arithmetic from a folded 64-bit sum.
+    53	    #[inline]
+    54	    pub fn ceil_div_bps_folded(fold: SumFold) -> u64 {
+    55	        if fold.wrapped_u64 {
+    56	            let folded_rem = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+    57	            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    58	        } else {
+    59	            let biased = fold.low_word.wrapping_add(BPS_MAX_REM);
+    60	            if biased < fold.low_word {
+    61	                (fold.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+    62	            } else {
+    63	                biased / BPS_DENOM
+    64	            }
+    65	        }
+    66	    }
+    67	}
+    68	
+    69	pub mod rebate {
+    70	    use crate::constants::*;
+    71	
+    72	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    73	    pub struct FeeBreakdown {
+    74	        pub gross_fee: u64,
+    75	        pub rebate: u64,
+    76	        pub net_fee: u64,
+    77	    }
+    78	
+    79	    /// Computes the floor tier rebate `floor(gross_fee / 10)` in favor of the protocol.
+    80	    #[inline]
+    81	    pub fn tier_rebate_floor(gross_fee: u64) -> u64 {
+    82	        gross_fee / REBATE_DIVISOR
+    83	    }
+    84	
+    85	    /// Assembles the gross fee, floor rebate, and net settlement fee `gross_fee - rebate`.
+    86	    #[inline]
+    87	    pub fn compute_fee_breakdown(gross_fee: u64) -> FeeBreakdown {
+    88	        let rebate = tier_rebate_floor(gross_fee);
+    89	        let net_fee = gross_fee - rebate;
+    90	        FeeBreakdown { gross_fee, rebate, net_fee }
+    91	    }
+    92	
+    93	    /// Diagnostic helper checking whether a fee breakdown qualifies as high-volume.
+    94	    #[inline]
+    95	    pub fn is_high_volume_levy(breakdown: FeeBreakdown) -> bool {
+    96	        breakdown.gross_fee >= HIGH_VALUE_THRESHOLD
+    97	    }
+    98	}
+    99	
+   100	pub mod quote {
+   101	    use crate::Authorization;
+   102	    use crate::rebate::FeeBreakdown;
+   103	
+   104	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   105	    pub struct SettlementQuote {
+   106	        pub principal: u64,
+   107	        pub net_fee: u64,
+   108	        pub total_debit: u64,
+   109	    }
+   110	
+   111	    /// Combines the payment principal `amount` with `breakdown.net_fee`, rejecting
+   112	    /// if the resulting settlement debit exceeds `u64::MAX`.
+   113	    #[inline]
+   114	    pub fn build_settlement_quote(amount: u64, breakdown: FeeBreakdown) -> Option<SettlementQuote> {
+   115	        let total_debit = amount.checked_add(breakdown.net_fee)?;
+   116	        Some(SettlementQuote {
+   117	            principal: amount,
+   118	            net_fee: breakdown.net_fee,
+   119	            total_debit,
+   120	        })
+   121	    }
+   122	
+   123	    /// Authorizes the settlement quote iff `quote.total_debit <= balance`.
+   124	    #[inline]
+   125	    pub fn verify_affordability(balance: u64, quote: SettlementQuote) -> Option<Authorization> {
+   126	        if quote.total_debit <= balance {
+   127	            Some(Authorization { total_debit: quote.total_debit })
+   128	        } else {
+   129	            None
+   130	        }
+   131	    }
+   132	}
+   133	
+   134	/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+   135	///
+   136	/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+   137	/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+   138	///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+   139	/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+   140	///    rounded down (`floor(gross_fee / 10)`).
+   141	/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+   142	///
+   143	/// Authorize every affordable transfer (`total_debit <= balance`) and return
+   144	/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+   145	/// Target word constraint: production code must use `u64` only (no `u128`).
+   146	pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+   147	    let fold = bps_math::fold_u64_sum(amount, fee);
+   148	    let gross_fee = bps_math::ceil_div_bps_folded(fold);
+   149	    let breakdown = rebate::compute_fee_breakdown(gross_fee);
+   150	    let settlement_quote = quote::build_settlement_quote(amount, breakdown)?;
+   151	    quote::verify_affordability(balance, settlement_quote)
+   152	}
+   153	
+   154	#[cfg(test)]
+   155	mod tests {
+   156	    use super::*;
+   157	
+   158	    #[test]
+   159	    fn ordinary_settlement() {
+   160	        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+   161	        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+   162	    }
+   163	
+   164	    #[test]
+   165	    fn ceiling_rounding_and_rebate() {
+   166	        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+   167	        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+   168	        assert_eq!(authorize(8, 0, 99_991), None);
+   169	    }
+   170	
+   171	    #[test]
+   172	    fn wide_basis_carry_folding() {
+   173	        let expected = 1_660_206_966_643_862;
+   174	        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+   175	        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+   176	    }
+   177	
+   178	    #[test]
+   179	    fn ceiling_bias_wrap_at_u64_max() {
+   180	        let expected = 1_660_206_966_633_861;
+   181	        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+   182	        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+   183	    }
+   184	
+   185	    #[test]
+   186	    fn total_debit_overflow_rejected() {
+   187	        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+   188	        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+   189	    }
+   190	
+   191	    #[test]
+   192	    fn floor_div_helper_matches_exact_quotient() {
+   193	        let fold = bps_math::fold_u64_sum(10_000, 18_446_744_073_709_550_000);
+   194	        assert_eq!(bps_math::floor_div_bps_folded(fold), 1_844_674_407_370_956);
+   195	    }
+   196	}
+[?2004hroot@dbabc2950f85:/workspace/challenge# mkdir -p /workspace/submission/src /tmp/orig && cp -r /workspace/challenge/* /tmp/orig/ && cp src/lib.rs /workspace/submission/src/lib.rs && sed -i 's|(fold.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)|U64_MOD_BPS_QUOT + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)|' /workspace/submission/src/lib.rs && diff src/lib.rs /workspace/submission/src/lib.rs
+[?2004l61c61
+<                 (fold.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+---
+>                 U64_MOD_BPS_QUOT + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+[?2004hroot@dbabc2950f85:/workspace/challenge# mkdir -p /tmp/fixed && cp -r /workspace/challenge/* /tmp/fixed/ && cp /workspace/submission/src/lib.rs /tmp/fixed/src/lib.rs
+[?2004l[?2004hroot@dbabc2950f85:/workspace/challenge# cat > /tmp/reftest.rs <<'EOF'
+[?2004l[?2004h> use settlement_gate::*;
+[?2004l[?2004h> fn reference(b: u64, a: u64, f: u64) -> Option<u64> {
+[?2004l[?2004h>     let s = a as u128 + f as u128;
+[?2004l[?2004h>     let g = (s + 9999) / 10000;
+[?2004l[?2004h>     let net = g - g / 10;
+[?2004l[?2004h>     let t = a as u128 + net;
+[?2004l[?2004h>     if t <= b as u128 { Some(t as u64) } else { None }
+[?2004l[?2004h> }
+[?2004l[?2004h> #[test]
+[?2004l[?2004h> fn cex() {
+[?2004l[?2004h>     let (b, a, f) = (1660206966633859u64, 0u64, 18446744073709549616u64);
+[?2004l[?2004h>     println!("impl={:?} ref={:?}", authorize(b, a, f), reference(b, a, f));
+[?2004l[?2004h> }
+[?2004l[?2004h> #[test]
+[?2004l[?2004h> fn sweep() {
+[?2004l[?2004h>     let mut x: u64 = 0x9E3779B97F4A7C15;
+[?2004l[?2004h>     let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+[?2004l[?2004h>     let edges: Vec<u64> = { let mut v = vec![]; for k in 0..20000u64 { v.push(u64::MAX - k); v.push(k); } for k in [1615u64,1616,1617,9998,9999,10000,10001] { v.push(k); v.push(u64::MAX-k);} v };
+[?2004l[?2004h>     let mut bad = 0u64;
+[?2004l[?2004h>     for i in 0..2_000_000u64 {
+[?2004l[?2004h>         let a = if i % 3 == 0 { edges[(next() % edges.len() as u64) as usize] } else { next() >> (next() % 64) };
+[?2004l[?2004h>         let f = if i % 2 == 0 { edges[(next() % edges.len() as u64) as usize] } else { next() >> (next() % 64) };
+[?2004l[?2004h>         let r = reference(u64::MAX, a, f);
+[?2004l[?2004h>         let bal = match r { Some(t) => [t, t.wrapping_sub(1), next()][(i % 3) as usize], None => next() };
+[?2004l[?2004h>         let got = authorize(bal, a, f).map(|z| z.total_debit);
+[?2004l[?2004h>         if got != reference(bal, a, f) { bad += 1; if bad < 3 { println!("MISMATCH b={} a={} f={} got={:?} ref={:?}", bal, a, f, got, reference(bal,a,f)); } } M[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[K}
+[?2004l[?2004h>     }
+[?2004l[?2004h>     for a in [0u64, 1, 5000, 10000] { for k in 0..30000u64 { let f = (u64::MAX - k).wrapping_sub(a); let r = reference(u64::MAX,a,f); if let Some(t)=r { for bal in [t, t-1] { if authorize(bal,a,f).map(|z|z.total_debit) != reference(bal,a,f) { bad+=1; } } } } }
+[?2004l[?2004h>     println!("bad={}", bad);
+[?2004l[?2004h>     assert_eq!(bad, 0);
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@dbabc2950f85:/workspace/challenge# for d in orig fixed; do mkdir -p /tmp/$d/tests && cp /tmp/reftest.rs /tmp/$d/tests/; done
+[?2004l[?2004hroot@dbabc2950f85:/workspace/challenge# cd /tmp/orig && cargo test --release --offline -- --nocapture 2>&1 | grep -E 'impl=|MISMATCH|bad=|test result' ; cd /tmp/fixed && cargo test --release --offline -- --nocapture 2>&1 | grep -E 'impl=|MISMATCH|bad=|test result|error'; cd /workspace
+[?2004l[01;31m[Ktest result[m[K: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Kimpl=[m[KSome(Authorization { total_debit: 1660206966633859 }) ref=None
+[01;31m[KMISMATCH[m[K b=1660206966644031 a=10171 f=18446744073709533696 got=Some(1660206966644030) ref=Some(1660206966644031)
+[01;31m[KMISMATCH[m[K b=1660206966636670 a=2810 f=18446744073709542400 got=Some(1660206966636669) ref=Some(1660206966636670)
+[01;31m[Kbad=[m[K124239
+[01;31m[Ktest result[m[K: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+[01;31m[Ktest result[m[K: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Kimpl=[m[KNone ref=None
+[01;31m[Kbad=[m[K0
+[01;31m[Ktest result[m[K: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+[01;31m[Ktest result[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[?2004hroot@dbabc2950f85:/workspace# cd /workspace/submission && printf 'vulnerable\n' > verdict.txt && printf '{"balance": 1660206966633859, "amount": 0, "fee": 18446744073709549616}\n' > counterexample.json && cat verdict.txt counterexample.json && find /workspace/submission -type f && python3 -c "import json;print(json.load(open('counterexample.json')))"
+[?2004lvulnerable
+{"balance": 1660206966633859, "amount": 0, "fee": 18446744073709549616}
+/workspace/submission/src/lib.rs
+/workspace/submission/counterexample.json
+/workspace/submission/verdict.txt
+{'balance': 1660206966633859, 'amount': 0, 'fee': 18446744073709549616}
+[?2004hroot@dbabc2950f85:/workspace/submission# 

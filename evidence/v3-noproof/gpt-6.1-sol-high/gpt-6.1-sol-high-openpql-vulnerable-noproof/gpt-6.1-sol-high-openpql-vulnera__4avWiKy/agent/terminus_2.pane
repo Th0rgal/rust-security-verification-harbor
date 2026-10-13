@@ -1,0 +1,377 @@
+[?2004hroot@12c7fc84e5ce:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@12c7fc84e5ce:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@12c7fc84e5ce:/workspace# pwd; printf '\n-- workspace --\n'; find /workspace -maxdepth 3 -type f -o -type d | sort
+[?2004l/workspace
+
+-- workspace --
+/workspace
+/workspace/challenge
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src
+/workspace/challenge/src/lib.rs
+/workspace/submission
+/workspace/submission/src
+[?2004hroot@12c7fc84e5ce:/workspace# printf '\n-- Cargo.toml --\n'; cat /workspace/challenge/Cargo.toml; printf '\n-- source files --\n'; find /workspace/challenge/src -type f -maxdepth 5 -print -exec sh -c 'echo "--- $1"; sed -n "1,240p" "$1"' _ {} \;
+[?2004l
+-- Cargo.toml --
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+
+-- source files --
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mixed_radix {
+    pub const RADIX_MASK: u64 = 0xFFFFu64;
+    pub const SHIFT_16: u64 = 16u64;
+    pub const SHIFT_32: u64 = 32u64;
+    pub const SHIFT_48: u64 = 48u64;
+
+    #[inline]
+    pub fn clamp_digit(a: u64, b: u64) -> u64 {
+        if a < b {
+            a
+        } else {
+            b - 1u64
+        }
+    }
+
+    /// Encode a 4-level mixed-radix coordinate `(d0, d1, d2, d3)` with radices
+    /// `(b0, b1, b2, b3)` in `[1, 65536]` extracted from `fee` (`waugh_indexer::MixedRadix`).
+    #[inline]
+    pub fn encode(amount: u64, fee: u64) -> u64 {
+        let b0: u64 = (fee & RADIX_MASK) + 1u64;
+        let b1: u64 = ((fee >> SHIFT_16) & RADIX_MASK) + 1u64;
+        let b2: u64 = ((fee >> SHIFT_32) & RADIX_MASK) + 1u64;
+        let b3: u64 = ((fee >> SHIFT_48) & RADIX_MASK) + 1u64;
+        let a0: u64 = amount & RADIX_MASK;
+        let a1: u64 = (amount >> SHIFT_16) & RADIX_MASK;
+        let a2: u64 = (amount >> SHIFT_32) & RADIX_MASK;
+        let a3: u64 = (amount >> SHIFT_48) & RADIX_MASK;
+        let d0: u64 = clamp_digit(a0, b0);
+        let d1: u64 = clamp_digit(a1, b1);
+        let d2: u64 = clamp_digit(a2, b2);
+        let d3: u64 = clamp_digit(a3, b3);
+        let o2: u64 = b3;
+        let o1: u64 = b2 * o2;
+        let o0: u64 = b1 * o1;
+        let raw_idx: u64 = d0 * o0 + d1 * o1 + d2 * o2 + d3;
+        let space_size: u64 = o0.wrapping_mul(b0);
+        if raw_idx < space_size {
+            raw_idx
+        } else {
+            0u64
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mixed_radix;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OpenPqlQuote {
+        pub principal_share: u64,
+        pub encoded_idx: u64,
+        pub index_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<OpenPqlQuote> {
+        let principal_share: u64 = amount >> 1u64;
+        let encoded_idx: u64 = mixed_radix::encode(amount, fee);
+        let index_surcharge: u64 = encoded_idx >> 1u64;
+        let total_debit: u64 = principal_share + index_surcharge;
+        Some(OpenPqlQuote {
+            principal_share,
+            encoded_idx,
+            index_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: OpenPqlQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize an OpenPQL 4-level mixed-radix settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - For `i in {0, 1, 2, 3}`:
+///   - `b_i = ((fee >> (16 * i)) & 0xFFFF) + 1` in `[1, 65536]`
+///   - `a_i = (amount >> (16 * i)) & 0xFFFF` in `[0, 65535]`
+///   - `d_i = min(a_i, b_i - 1)`
+/// - Suffix-product offsets: `o2 = b3`, `o1 = b2 * o2`, `o0 = b1 * o1`
+/// - `encoded_idx = d0 * o0 + d1 * o1 + d2 * o2 + d3`
+/// - `total_debit = floor(amount / 2) + floor(encoded_idx / 2)`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::OpenPqlQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_mixed_radix_coordinates_match_policy() {
+        let fee: u64 = 0x0003_0003_0003_0003;
+        let amount: u64 = 0x0001_0002_0001_0002;
+        assert_eq!(
+            authorize(140_741_783_355_469, amount, fee),
+            Some(Authorization {
+                total_debit: 140_741_783_355_469
+            })
+        );
+        assert_eq!(authorize(140_741_783_355_468, amount, fee), None);
+    }
+
+    #[test]
+    fn clamps_digits_to_radix_minus_one() {
+        assert_eq!(
+            authorize(50, 100, 0),
+            Some(Authorization { total_debit: 50 })
+        );
+    }
+}
+[?2004hroot@12c7fc84e5ce:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.29s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::clamps_digits_to_radix_minus_one ... [32mok[m
+test tests::small_mixed_radix_coordinates_match_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@12c7fc84e5ce:/workspace/challenge# mkdir -p /workspace/submission/src
+[?2004l[?2004hroot@12c7fc84e5ce:/workspace/challenge# cat > /workspace/submission/verdict.txt <<'EOF'
+[?2004l[?2004h> vulnerable
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@12c7fc84e5ce:/workspace/challenge# cat > /workspace/submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance":9223372036854775807,"amount":18446744073709551615,"fee":18446744073709551615}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@12c7fc84e5ce:/workspace/challenge# cat > /workspace/submission/src/lib.rs <<'EOF'
+[?2004l[?2004h> #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h> pub struct Authorization {
+[?2004l[?2004h>     pub total_debit: u64,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod mixed_radix {
+[?2004l[?2004h>     pub const RADIX_MASK: u64 = 0xFFFFu64;
+[?2004l[?2004h>     pub const SHIFT_16: u64 = 16u64;
+[?2004l[?2004h>     pub const SHIFT_32: u64 = 32u64;
+[?2004l[?2004h>     pub const SHIFT_48: u64 = 48u64;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn clamp_digit(a: u64, b: u64) -> u64 {
+[?2004l[?2004h>         if a < b {
+[?2004l[?2004h>             a
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             b - 1u64
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Encode a 4-level mixed-radix coordinate `(d0, d1, d2, d3)` with radices
+[?2004l[?2004h>     /// `(b0, b1, b2, b3)` in `[1, 65536]` extracted from `fee` (`waugh_indexer::MixedRadix`).
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn encode(amount: u64, fee: u64) -> u64 {
+[?2004l[?2004h>         let b0: u64 = (fee & RADIX_MASK) + 1u64;
+[?2004l[?2004h>         let b1: u64 = ((fee >> SHIFT_16) & RADIX_MASK) + 1u64;
+[?2004l[?2004h>         let b2: u64 = ((fee >> SHIFT_32) & RADIX_MASK) + 1u64;
+[?2004l[?2004h>         let b3: u64 = ((fee >> SHIFT_48) & RADIX_MASK) + 1u64;
+[?2004l[?2004h>         let a0: u64 = amount & RADIX_MASK;
+[?2004l[?2004h>         let a1: u64 = (amount >> SHIFT_16) & RADIX_MASK;
+[?2004l[?2004h>         let a2: u64 = (amount >> SHIFT_32) & RADIX_MASK;
+[?2004l[?2004h>         let a3: u64 = (amount >> SHIFT_48) & RADIX_MASK;
+[?2004l[?2004h>         let d0: u64 = clamp_digit(a0, b0);
+[?2004l[?2004h>         let d1: u64 = clamp_digit(a1, b1);
+[?2004l[?2004h>         let d2: u64 = clamp_digit(a2, b2);
+[?2004l[?2004h>         let d3: u64 = clamp_digit(a3, b3);
+[?2004l[?2004h>         let o2: u64 = b3;
+[?2004l[?2004h>         let o1: u64 = b2 * o2;
+[?2004l[?2004h>         let o0: u64 = b1 * o1;
+[?2004l[?2004h>         let raw_idx: u64 = d0 * o0 + d1 * o1 + d2 * o2 + d3;
+[?2004l[?2004h>         raw_idx
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod settlement {
+[?2004l[?2004h>     use crate::mixed_radix;
+[?2004l[?2004h>     use crate::Authorization;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h>     pub struct OpenPqlQuote {
+[?2004l[?2004h>         pub principal_share: u64,
+[?2004l[?2004h>         pub encoded_idx: u64,
+[?2004l[?2004h>         pub index_surcharge: u64,
+[?2004l[?2004h>         pub total_debit: u64,
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn build_quote(amount: u64, fee: u64) -> Option<OpenPqlQuote> {
+[?2004l[?2004h>         let principal_share: u64 = amount >> 1u64;
+[?2004l[?2004h>         let encoded_idx: u64 = mixed_radix::encode(amount, fee);
+[?2004l[?2004h>         let index_surcharge: u64 = encoded_idx >> 1u64;
+[?2004l[?2004h>         let total_debit: u64 = principal_share + index_surcharge;
+[?2004l[?2004h>         Some(OpenPqlQuote {
+[?2004l[?2004h>             principal_share,
+[?2004l[?2004h>             encoded_idx,
+[?2004l[?2004h>             index_surcharge,
+[?2004l[?2004h>             total_debit,
+[?2004l[?2004h>         })
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn verify_affordability(balance: u64, quote: OpenPqlQuote) -> Option<Authorization> {
+[?2004l[?2004h>         if quote.total_debit <= balance {
+[?2004l[?2004h>             Some(Authorization {
+[?2004l[?2004h>                 total_debit: quote.total_debit,
+[?2004l[?2004h>             })
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             None
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> /// Authorize an OpenPQL 4-level mixed-radix settlement against `balance`.
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// In exact integer arithmetic:
+[?2004l[?2004h> /// - For `i in {0, 1, 2, 3}`:
+[?2004l[?2004h> ///   - `b_i = ((fee >> (16 * i)) & 0xFFFF) + 1` in `[1, 65536]`
+[?2004l[?2004h> ///   - `a_i = (amount >> (16 * i)) & 0xFFFF` in `[0, 65535]`
+[?2004l[?2004h> ///   - `d_i = min(a_i, b_i - 1)`
+[?2004l[?2004h> /// - Suffix-product offsets: `o2 = b3`, `o1 = b2 * o2`, `o0 = b1 * o1`
+[?2004l[?2004h> /// - `encoded_idx = d0 * o0 + d1 * o1 + d2 * o2 + d3`
+[?2004l[?2004h> /// - `total_debit = floor(amount / 2) + floor(encoded_idx / 2)`
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// The payment is authorized iff `total_debit <= balance`.
+[?2004l[?2004h> /// Production code in this crate operates on `u64` words only (`u128` is not used).
+[?2004l[?2004h> pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+[?2004l[?2004h>     let quote: settlement::OpenPqlQuote = settlement::build_quote(amount, fee)?;
+[?2004l[?2004h>     settlement::verify_affordability(balance, quote)
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn zero_payment_is_authorized() {
+[?2004l[?2004h>         assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn small_mixed_radix_coordinates_match_policy() {
+[?2004l[?2004h>         let fee: u64 = 0x0003_0003_0003_0003;
+[?2004l[?2004h>         let amount: u64 = 0x0001_0002_0001_0002;
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(140_741_783_355_469, amount, fee),
+[?2004l[?2004h>             Some(Authorization {
+[?2004l[?2004h>                 total_debit: 140_741_783_355_469
+[?2004l[?2004h>             })
+[?2004l[?2004h>         );
+[?2004l[?2004h>         assert_eq!(authorize(140_741_783_355_468, amount, fee), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn clamps_digits_to_radix_minus_one() {
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(50, 100, 0),
+[?2004l[?2004h>             Some(Authorization { total_debit: 50 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn maximum_radices_do_not_wrap_the_index() {
+[?2004l[?2004h>         let max = u64::MAX;
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(u64::MAX / 2, max, max),
+[?2004l[?2004h>             None
+[?2004l[?2004h>         );
+[?2004l[?2004h>         assert_eq!(
+[?2004l[?2004h>             authorize(u64::MAX - 1, max, max),
+[?2004l[?2004h>             Some(Authorization { total_debit: u64::MAX - 1 })
+[?2004l[?2004h>         );
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@12c7fc84e5ce:/workspace/challenge# rustc --edition=2021 --crate-type lib -O /workspace/submission/src/lib.rs -o /tmp/libsettlement_gate.rlib && rustc --edition=2021 --test -O /workspace/submission/src/lib.rs -o /tmp/settlement_gate_tests && /tmp/settlement_gate_tests
+[?2004l
+running 4 tests
+test tests::clamps_digits_to_radix_minus_one ... [32mok[m
+test tests::maximum_radices_do_not_wrap_the_index ... [32mok[m
+test tests::small_mixed_radix_coordinates_match_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@12c7fc84e5ce:/workspace/challenge# cat > /tmp/check_submission.rs <<'EOF'
+[?2004l[?2004h> extern crate settlement_gate;
+[?2004l[?2004h> 
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance = 9_223_372_036_854_775_807u64;
+[?2004l[?2004h>     let amount = u64::MAX;
+[?2004l[?2004h>     let fee = u64::MAX;
+[?2004l[?2004h>     assert_eq!(settlement_gate::authorize(balance, amount, fee), None);
+[?2004l[?2004h>     assert_eq!(
+[?2004l[?2004h>         settlement_gate::authorize(u64::MAX - 1, amount, fee),
+[?2004l[?2004h>         Some(settlement_gate::Authorization { total_debit: u64::MAX - 1 })
+[?2004l[?2004h>     );
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@12c7fc84e5ce:/workspace/challenge# rustc --edition=2021 -O /tmp/check_submission.rs --extern settlement_gate=/tmp/libsettlement_gate.rlib -o /tmp/check_submission && /tmp/check_submission
+[?2004l[?2004hroot@12c7fc84e5ce:/workspace/challenge# printf '%s\n' '-- verdict --'; cat /workspace/submission/verdict.txt; printf '%s\n' '-- counterexample --'; cat /workspace/submission/counterexample.json; printf '%s\n' '-- submission files --'; find /workspace/submission -maxdepth 3 -type f -print | sort
+[?2004l-- verdict --
+vulnerable
+-- counterexample --
+{"balance":9223372036854775807,"amount":18446744073709551615,"fee":18446744073709551615}
+-- submission files --
+/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/verdict.txt
+[?2004hroot@12c7fc84e5ce:/workspace/challenge# 

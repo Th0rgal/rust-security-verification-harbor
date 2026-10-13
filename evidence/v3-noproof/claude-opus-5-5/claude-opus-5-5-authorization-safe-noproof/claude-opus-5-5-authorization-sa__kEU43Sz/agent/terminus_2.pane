@@ -1,0 +1,94 @@
+[?2004hroot@9dac7182d9bb:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@9dac7182d9bb:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@9dac7182d9bb:/workspace# find /workspace -type f | grep -v target | head -50
+[?2004l/workspace/challenge/src/lib.rs
+/workspace/challenge/Cargo.toml
+/workspace/challenge/Cargo.lock
+/workspace/harness/checkpoint.py
+/workspace/submission/Proof.lean
+/workspace/submission/Spec.lean
+/workspace/submission/Audit.lean
+[?2004hroot@9dac7182d9bb:/workspace# cat /workspace/challenge/Cargo.toml; for f in $(find /workspace/challenge/src -name '*.rs'); do echo "=== $f"; cat $f; done
+[?2004l[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+=== /workspace/challenge/src/lib.rs
+//! Local arithmetic authorization exercise.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+/// Authorize a transfer before it is sent to a wider-integer settlement layer.
+///
+/// Policy: principal plus fee must not exceed the account balance.
+/// Authorize every affordable payment and reject every unaffordable payment.
+/// The returned debit is the principal plus fees actually applied at settlement.
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let total = amount.checked_add(fee)?;
+    (total <= balance).then_some(Authorization { total_debit: total })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_payment() {
+        assert_eq!(authorize(110, 100, 10).unwrap().total_debit, 110);
+        assert_eq!(authorize(109, 100, 10), None);
+    }
+}
+[?2004hroot@9dac7182d9bb:/workspace# cd /workspace/challenge && cargo test 2>&1 | tail -5
+[?2004l
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@9dac7182d9bb:/workspace/challenge# mkdir -p /tmp/chk && cat > /tmp/chk/m.rs <<'EOF'
+[?2004l[?2004h> include!("/workspace/challenge/src/lib.rs");
+[?2004l[?2004h> fn main(){let m=u64::MAX;let v=[0u64,1,2,3,m/2,m/2+1,m-2,m-1,m];let mut bad=0;for &b in &v{for &a in &v{for &f in &v{let s=a as u128+f as u128;let ok=s<=b as u128;match authorize(b,a,f){Some(x)=>{if !ok||x.total_debit as u128!=s{bad+=1;println!("BAD {} {} {}",b,a,f);}}None=>{if ok{bad+=1;println!("BAD {} {} {}",b,a,f);}}}}}}println!("bad={}",bad);}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@9dac7182d9bb:/workspace/challenge# rustc -O -o /tmp/chk/m /tmp/chk/m.rs 2>&1 | tail -3 && /tmp/chk/m
+[?2004lerror: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0753`.
+bash: /tmp/chk/m: No such file or directory
+[?2004hroot@9dac7182d9bb:/workspace/challenge# cd /workspace && printf 'safe\n' > /workspace/submission/verdict.txt && rm -f /workspace/submission/counterexample.json && ls -la /workspace/submission && cat /workspace/submission/verdict.txt
+[?2004ltotal 32
+drwxr-xr-x 1 root root 4096 Oct 13 08:00 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 07:52 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  9 07:51 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  9 07:51 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  9 07:51 Spec.lean
+drwxr-xr-x 2 root root 4096 Oct 13 07:53 [01;34msrc[0m
+-rw-r--r-- 1 root root    5 Oct 13 08:00 verdict.txt
+safe
+[?2004hroot@9dac7182d9bb:/workspace# cd /workspace/challenge && cargo test 2>&1 | grep -E 'test |result'
+[?2004l[01;31m[Ktest [m[Ktests::ordinary_payment ... ok
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest [m[K[01;31m[Kresult[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[?2004hroot@9dac7182d9bb:/workspace/challenge# grep -v '^//!' /workspace/challenge/src/lib.rs > /tmp/chk/lib_copy.rs && sed -i 's#/workspace/challenge/src/lib.rs#/tmp/chk/lib_copy.rs#' /tmp/chk/m.rs && rustc -O -o /tmp/chk/m /tmp/chk/m.rs 2>&1 | grep -E '^error' ; /tmp/chk/m | tail -5
+[?2004lbad=0
+[?2004hroot@9dac7182d9bb:/workspace/challenge# cd /workspace && ls -la /workspace/submission/src && find /workspace/submission/src -type f -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+[?2004ltotal 8
+drwxr-xr-x 2 root root 4096 Oct 13 07:53 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 08:00 [01;34m..[0m
+[?2004hroot@9dac7182d9bb:/workspace# rmdir /workspace/submission/src && rm -rf /tmp/chk && ls -la /workspace/submission && cat /workspace/submission/verdict.txt && test ! -e /workspace/submission/counterexample.json && echo 'no counterexample (ok)'
+[?2004ltotal 28
+drwxr-xr-x 1 root root 4096 Oct 13 08:01 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 07:52 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  9 07:51 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  9 07:51 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  9 07:51 Spec.lean
+-rw-r--r-- 1 root root    5 Oct 13 08:00 verdict.txt
+safe
+no counterexample (ok)
+[?2004hroot@9dac7182d9bb:/workspace# 

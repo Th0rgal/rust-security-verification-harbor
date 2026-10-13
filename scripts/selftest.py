@@ -40,6 +40,8 @@ def main():
       'shadowing': patch('let total = amount.checked_add(fee)?; let amount = total; if amount <= balance {Some(Authorization {total_debit: amount})} else {None}'),
       'wide_from': patch('let total = u128::from(amount) + u128::from(fee); if total <= u128::from(balance) {Some(Authorization {total_debit: total as u64})} else {None}'),
       'guarded_wrapping': patch('if amount > u64::MAX - fee { return None; } let total = amount.wrapping_add(fee); (total <= balance).then_some(Authorization {total_debit: total})'),
+      'let_else': patch('let Some(mut total) = amount.checked_add(u64::MIN) else { return None; }; let Some(add_fee) = total.checked_add(fee) else { return None; }; total = add_fee; (total <= balance).then_some(Authorization {total_debit: total})'),
+      'opt_methods': patch('let opt = amount.checked_add(fee); if opt.is_none() { return None; } let mut total: u64 = u64::MIN; total += opt.unwrap_or(0u64); (total <= balance).then_some(Authorization {total_debit: total})'),
     }
     rejects = {
       'wrapping': patch('let total = amount.wrapping_add(fee); (total <= balance).then_some(Authorization {total_debit: total})'),
@@ -185,7 +187,7 @@ def main():
         raw_probs = os.environ.get('SELFTEST_PROBLEMS', 'authorization,settlement,zk-clearing')
         selftest_problems = spec.PROBLEMS if raw_probs == 'all' else tuple(p.strip() for p in raw_probs.split(',') if p.strip())
         for prob in selftest_problems:
-            subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem',prob,'--build-api'],check=True)
+            subprocess.run([sys.executable,str(ROOT/'scripts/make-family.py'),str(family),'--problem',prob,'--mode','both','--build-api'],check=True)
 
         # Settlement-specific Rust & Lean checks across isolation levels
         settlement_safe_rs=(ROOT/'problems/settlement/safe/lib.rs').read_text()
@@ -233,6 +235,7 @@ def main():
             expect(check(bad_div)['status']=='unsupported',bad_div)
 
         instructions=[]
+        noproof_instructions=[]
         for problem in selftest_problems:
             for variant in ('vulnerable','safe'):
                 task_name=problem+'-'+variant
@@ -302,7 +305,65 @@ def main():
                         symlink=workspace/'submission/counterexample.json'; symlink.unlink(); symlink.symlink_to(task/'solution/counterexample.json')
                         r=verify.grade(workspace,verifier); expect(r['checkpoints']['response']['checks']['counterexample']['status']=='fail',r)
                 print(task_name+': reference=1.00 skeleton=0.00; verdict/evidence and independent response checked')
-        expect(len(set(instructions))==1,'prompts differ')
+
+                # Now check the corresponding -noproof task
+                np_name=task_name+'-noproof'
+                np_task=family/np_name
+                noproof_instructions.append((np_task/'instruction.md').read_bytes())
+                np_verifier=np_task/'tests/verifier'
+                np_workspace=np_task/'environment/workspace'
+                expect(not (np_workspace/'lean').exists(), (np_name, 'lean directory must be absent in noproof'))
+                np_skeleton=verify.grade(np_workspace,np_verifier)
+                expect(np_skeleton['reward']==0 and np_skeleton['mode']=='noproof',(np_name,'skeleton',np_skeleton))
+                for rel in ('verdict.txt','counterexample.json','src/lib.rs'):
+                    if (np_task/'solution'/rel).is_file():
+                        (np_workspace/'submission'/rel).parent.mkdir(parents=True,exist_ok=True)
+                        shutil.copy(np_task/'solution'/rel,np_workspace/'submission'/rel)
+                if (np_task/'solution/src').is_dir():
+                    dest_dir = np_workspace/'submission/src'
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    for child in (np_task/'solution/src').iterdir():
+                        if child.is_file():
+                            shutil.copy(child, dest_dir/child.name)
+                np_ref=verify.grade(np_workspace,np_verifier)
+                expect(np_ref['reward']==1,(np_name,np_ref))
+                if variant=='safe':
+                    (np_workspace/'submission/verdict.txt').write_text('vulnerable\n')
+                    r=verify.grade(np_workspace,np_verifier)
+                    expect(r['reward']==0, (np_name, 'wrong verdict on safe', r))
+                    (np_workspace/'submission/verdict.txt').write_text('safe\n')
+                    (np_workspace/'submission/counterexample.json').write_text(witness)
+                    r=verify.grade(np_workspace,np_verifier)
+                    expect(r['reward']==0, (np_name, 'spurious counterexample on safe', r))
+                    (np_workspace/'submission/counterexample.json').unlink()
+                else:
+                    # Test in-place fallback in challenge/src when submission/src is empty
+                    shutil.rmtree(np_workspace/'submission/src')
+                    for child in (np_task/'solution/src').iterdir():
+                        if child.is_file():
+                            shutil.copy(child, np_workspace/'challenge/src'/child.name)
+                    # Also append a dummy #[test] to challenge/src/lib.rs to ensure test edits do not break protected module checks
+                    lib_rs_path = np_workspace/'challenge/src/lib.rs'
+                    orig_lib_rs = lib_rs_path.read_text()
+                    if '#[cfg(test)]' in orig_lib_rs:
+                        lib_rs_path.write_text(orig_lib_rs.rstrip().rstrip('}') + '\n    #[test] fn agent_added_test() { assert_eq!(1, 1); }\n}\n')
+                    r_inplace=verify.grade(np_workspace,np_verifier)
+                    expect(r_inplace['reward']==1, (np_name, 'in-place challenge/src fallback', r_inplace))
+                    lib_rs_path.write_text(orig_lib_rs)
+                    # Test counterexample-only partial credit (0.20 verdict + 0.30 counterexample = 0.50)
+                    for child in (np_task/'solution/src').iterdir():
+                        if child.is_file():
+                            pristine_f = (np_verifier/'pristine/src'/child.name) if (np_verifier/'pristine/src').is_dir() else (np_verifier/'pristine/lib.rs')
+                            shutil.copy(pristine_f, np_workspace/'challenge/src'/child.name)
+                    r_cex_only=verify.grade(np_workspace,np_verifier)
+                    expect(r_cex_only['reward']==0.5, (np_name, 'counterexample-only partial score', r_cex_only))
+                    # Test bare vulnerable verdict without counterexample or patch -> 0.00
+                    (np_workspace/'submission/counterexample.json').write_text('{"balance":10,"amount":1,"fee":1}')
+                    r_bare=verify.grade(np_workspace,np_verifier)
+                    expect(r_bare['reward']==0, (np_name, 'unjustified vulnerable verdict', r_bare))
+                print(np_name+': reference=1.00 skeleton=0.00; in-place fallback and partial/unjustified checks passed')
+        expect(len(set(instructions))==1,'proof prompts differ')
+        expect(len(set(noproof_instructions))==1,'noproof prompts differ')
     print('selftest v3: PASS')
 
 if __name__=='__main__':main()

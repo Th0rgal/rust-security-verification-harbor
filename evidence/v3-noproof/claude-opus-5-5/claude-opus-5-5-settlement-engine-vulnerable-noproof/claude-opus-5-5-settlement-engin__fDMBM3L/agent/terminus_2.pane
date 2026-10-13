@@ -1,0 +1,719 @@
+[?2004hroot@3f692616899e:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@3f692616899e:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@3f692616899e:/workspace# cd /workspace/challenge && find . -type f -not -path './target/*' | head -50 && cat Cargo.toml
+[?2004l./src/lib.rs
+./Cargo.toml
+./Cargo.lock
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@3f692616899e:/workspace/challenge# for f in $(find src -name '*.rs'); do echo "=== $f"; cat -n $f; done
+[?2004l=== src/lib.rs
+     1	//! Multi-module concentrated-liquidity and flash-settlement engine.
+     2	//!
+     3	//! All production paths operate strictly in 64-bit word arithmetic (`u64`)
+     4	//! without `u128` promotion so that settlement authorization executes natively
+     5	//! on 64-bit VM word registers.
+     6	
+     7	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     8	pub struct Authorization {
+     9	    pub total_debit: u64,
+    10	}
+    11	
+    12	pub mod constants {
+    13	    /// Standard basis-point denominator (100% = 10_000 bps).
+    14	    pub const BPS_DENOM: u64 = 10_000;
+    15	    /// Maximum non-zero remainder modulo `BPS_DENOM` (`BPS_DENOM - 1`).
+    16	    pub const BPS_MAX_REM: u64 = 9_999;
+    17	    /// Floor quotient of `2^64` by `BPS_DENOM`: `floor(2^64 / 10_000)`.
+    18	    pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+    19	    /// Exact remainder of `2^64` modulo `BPS_DENOM`: `2^64 % 10_000 = 1_616`.
+    20	    pub const U64_MOD_BPS_REM: u64 = 1_616;
+    21	    /// Tier rebate divisor (10% rebate on gross settlement fee, rounded down).
+    22	    pub const REBATE_DIVISOR: u64 = 10;
+    23	    /// Maker rebate cap divisor (20% cap on maker rebates in order-book mode).
+    24	    pub const MAKER_REBATE_CAP_DIVISOR: u64 = 5;
+    25	    /// Protocol reserve cut divisor (25% of net pool fee retained by treasury).
+    26	    pub const TREASURY_CUT_DIVISOR: u64 = 4;
+    27	    /// Flash-loan surcharge denominator (5_000 = 2 bps per unit).
+    28	    pub const FLASH_DENOM: u64 = 5_000;
+    29	    /// Ceiling bias for `FLASH_DENOM` (`FLASH_DENOM - 1`).
+    30	    pub const FLASH_MAX_REM: u64 = 4_999;
+    31	    /// Floor quotient `floor(2^64 / 5_000)`.
+    32	    pub const U64_MOD_FLASH_QUOT: u64 = 3_689_348_814_741_910;
+    33	    /// Exact remainder `2^64 % 5_000 = 1_616`.
+    34	    pub const U64_MOD_FLASH_REM: u64 = 1_616;
+    35	    /// Institutional notional band threshold for diagnostic classification.
+    36	    pub const INSTITUTIONAL_BAND_MIN: u64 = 10_000_000_000_000;
+    37	}
+    38	
+    39	pub mod word_math {
+    40	    use crate::constants::*;
+    41	
+    42	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    43	    pub struct WordSum {
+    44	        pub low_word: u64,
+    45	        pub high_carry: bool,
+    46	    }
+    47	
+    48	    /// Adds two `u64` words and captures the 64-bit wrap carry flag.
+    49	    #[inline]
+    50	    pub fn add_u64_with_carry(lhs: u64, rhs: u64) -> WordSum {
+    51	        let low_word = lhs.wrapping_add(rhs);
+    52	        let high_carry = low_word < lhs;
+    53	        WordSum { low_word, high_carry }
+    54	    }
+    55	
+    56	    /// Checks whether a combined notional exceeds the institutional liquidity band.
+    57	    #[inline]
+    58	    pub fn is_institutional_notional(sum: WordSum) -> bool {
+    59	        if sum.high_carry {
+    60	            true
+    61	        } else {
+    62	            sum.low_word >= INSTITUTIONAL_BAND_MIN
+    63	        }
+    64	    }
+    65	
+    66	    /// Exact floor division `floor((lhs + rhs) / 10_000)` in pure `u64` arithmetic.
+    67	    #[inline]
+    68	    pub fn floor_div_bps_u64(sum: WordSum) -> u64 {
+    69	        if sum.high_carry {
+    70	            let folded_rem = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+    71	            U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + (folded_rem / BPS_DENOM)
+    72	        } else {
+    73	            sum.low_word / BPS_DENOM
+    74	        }
+    75	    }
+    76	
+    77	    /// Ceiling division `ceil((lhs + rhs) / 10_000)` in pure `u64` arithmetic.
+    78	    #[inline]
+    79	    pub fn ceil_div_bps_u64(sum: WordSum) -> u64 {
+    80	        if sum.high_carry {
+    81	            let folded_rem = (sum.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+    82	            U64_MOD_BPS_QUOT + (sum.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+    83	        } else {
+    84	            let biased = sum.low_word.wrapping_add(BPS_MAX_REM);
+    85	            if biased < sum.low_word {
+    86	                (sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+    87	            } else {
+    88	                biased / BPS_DENOM
+    89	            }
+    90	        }
+    91	    }
+    92	}
+    93	
+    94	pub mod fee_tiers {
+    95	    use crate::constants::*;
+    96	    use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64};
+    97	
+    98	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    99	    pub struct FeeSchedule {
+   100	        pub bps_denom: u64,
+   101	        pub rebate_divisor: u64,
+   102	        pub maker_cap_divisor: u64,
+   103	    }
+   104	
+   105	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   106	    pub struct FeeQuote {
+   107	        pub gross_fee: u64,
+   108	        pub rebate: u64,
+   109	        pub net_fee: u64,
+   110	    }
+   111	
+   112	    /// Returns the default protocol fee schedule parameters.
+   113	    #[inline]
+   114	    pub fn default_schedule() -> FeeSchedule {
+   115	        FeeSchedule {
+   116	            bps_denom: BPS_DENOM,
+   117	            rebate_divisor: REBATE_DIVISOR,
+   118	            maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+   119	        }
+   120	    }
+   121	
+   122	    /// Computes the floor 10% tier rebate `floor(gross_fee / 10)`.
+   123	    #[inline]
+   124	    pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+   125	        gross_fee / REBATE_DIVISOR
+   126	    }
+   127	
+   128	    /// Computes a capped maker rebate `min(floor(gross_fee / 10), floor(limit / 5))`
+   129	    /// used by passive order-book quotes.
+   130	    #[inline]
+   131	    pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+   132	        let base_rebate = gross_fee / REBATE_DIVISOR;
+   133	        let max_rebate = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+   134	        if base_rebate <= max_rebate {
+   135	            base_rebate
+   136	        } else {
+   137	            max_rebate
+   138	        }
+   139	    }
+   140	
+   141	    /// Evaluates the two-stage settlement fee quote (`gross_fee`, `rebate`, `net_fee`)
+   142	    /// from a folded 64-bit notional sum.
+   143	    #[inline]
+   144	    pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+   145	        let gross_fee = ceil_div_bps_u64(sum);
+   146	        let rebate = compute_tier_rebate(gross_fee);
+   147	        let net_fee = gross_fee - rebate;
+   148	        FeeQuote {
+   149	            gross_fee,
+   150	            rebate,
+   151	            net_fee,
+   152	        }
+   153	    }
+   154	
+   155	    /// Evaluates a passive liquidity floor fee quote (used by pool analytics).
+   156	    #[inline]
+   157	    pub fn evaluate_passive_floor_fee(sum: WordSum) -> FeeQuote {
+   158	        let gross_fee = floor_div_bps_u64(sum);
+   159	        let rebate = compute_tier_rebate(gross_fee);
+   160	        let net_fee = gross_fee - rebate;
+   161	        FeeQuote {
+   162	            gross_fee,
+   163	            rebate,
+   164	            net_fee,
+   165	        }
+   166	    }
+   167	}
+   168	
+   169	pub mod liquidity_pool {
+   170	    use crate::constants::*;
+   171	    use crate::fee_tiers::FeeQuote;
+   172	
+   173	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   174	    pub struct PoolReserveQuote {
+   175	        pub treasury_cut: u64,
+   176	        pub lp_retention: u64,
+   177	    }
+   178	
+   179	    /// Splits a net fee between the protocol treasury (`floor(net_fee / 4)`)
+   180	    /// and liquidity providers (`net_fee - treasury_cut`).
+   181	    #[inline]
+   182	    pub fn split_pool_reserve(quote: FeeQuote) -> PoolReserveQuote {
+   183	        let treasury_cut = quote.net_fee / TREASURY_CUT_DIVISOR;
+   184	        let lp_retention = quote.net_fee - treasury_cut;
+   185	        PoolReserveQuote {
+   186	            treasury_cut,
+   187	            lp_retention,
+   188	        }
+   189	    }
+   190	
+   191	    /// Computes the LP retention share after protocol cut for reserve accounting.
+   192	    #[inline]
+   193	    pub fn quote_lp_retention(quote: FeeQuote) -> u64 {
+   194	        let split = split_pool_reserve(quote);
+   195	        split.lp_retention
+   196	    }
+   197	}
+   198	
+   199	pub mod flash_loan {
+   200	    use crate::constants::*;
+   201	    use crate::word_math::add_u64_with_carry;
+   202	
+   203	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   204	    pub struct FlashLoanReceipt {
+   205	        pub principal: u64,
+   206	        pub flash_levy: u64,
+   207	        pub total_repayment: u64,
+   208	    }
+   209	
+   210	    /// Computes the ceiling flash-loan levy `ceil((principal + surcharge) / 5_000)`
+   211	    /// in pure `u64` arithmetic.
+   212	    #[inline]
+   213	    pub fn assess_flash_fee_ceil(principal: u64, surcharge: u64) -> u64 {
+   214	        let sum = add_u64_with_carry(principal, surcharge);
+   215	        if sum.high_carry {
+   216	            let folded_rem = (sum.low_word % FLASH_DENOM) + U64_MOD_FLASH_REM;
+   217	            U64_MOD_FLASH_QUOT + (sum.low_word / FLASH_DENOM) + ((folded_rem + FLASH_MAX_REM) / FLASH_DENOM)
+   218	        } else {
+   219	            let biased = sum.low_word.wrapping_add(FLASH_MAX_REM);
+   220	            if biased < sum.low_word {
+   221	                (sum.low_word / FLASH_DENOM) + (((sum.low_word % FLASH_DENOM) + FLASH_MAX_REM) / FLASH_DENOM)
+   222	            } else {
+   223	                biased / FLASH_DENOM
+   224	            }
+   225	        }
+   226	    }
+   227	
+   228	    /// Builds a flash-loan repayment receipt if `principal + flash_levy` fits in `u64`.
+   229	    #[inline]
+   230	    pub fn quote_flash_repayment(principal: u64, surcharge: u64) -> Option<FlashLoanReceipt> {
+   231	        let flash_levy = assess_flash_fee_ceil(principal, surcharge);
+   232	        let total_repayment = principal.checked_add(flash_levy)?;
+   233	        Some(FlashLoanReceipt {
+   234	            principal,
+   235	            flash_levy,
+   236	            total_repayment,
+   237	        })
+   238	    }
+   239	}
+   240	
+   241	pub mod settlement_engine {
+   242	    use crate::Authorization;
+   243	    use crate::fee_tiers::{FeeQuote, evaluate_settlement_fee};
+   244	    use crate::word_math::add_u64_with_carry;
+   245	
+   246	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   247	    pub struct SettlementTicket {
+   248	        pub principal: u64,
+   249	        pub gross_fee: u64,
+   250	        pub rebate: u64,
+   251	        pub net_fee: u64,
+   252	        pub total_debit: u64,
+   253	    }
+   254	
+   255	    /// Assembles a complete settlement ticket from `amount` and `fee_quote`,
+   256	    /// returning `None` if `amount + fee_quote.net_fee` overflows `u64`.
+   257	    #[inline]
+   258	    pub fn assemble_ticket(amount: u64, fee_quote: FeeQuote) -> Option<SettlementTicket> {
+   259	        let total_debit = amount.checked_add(fee_quote.net_fee)?;
+   260	        Some(SettlementTicket {
+   261	            principal: amount,
+   262	            gross_fee: fee_quote.gross_fee,
+   263	            rebate: fee_quote.rebate,
+   264	            net_fee: fee_quote.net_fee,
+   265	            total_debit,
+   266	        })
+   267	    }
+   268	
+   269	    /// Quotes the settlement ticket for `(amount, fee)` using the two-stage
+   270	    /// basis-point ceiling levy and floor tier rebate schedule.
+   271	    #[inline]
+   272	    pub fn quote_settlement_ticket(amount: u64, fee: u64) -> Option<SettlementTicket> {
+   273	        let notional_sum = add_u64_with_carry(amount, fee);
+   274	        let fee_quote = evaluate_settlement_fee(notional_sum);
+   275	        assemble_ticket(amount, fee_quote)
+   276	    }
+   277	
+   278	    /// Commits a settlement ticket against `balance`, authorizing iff
+   279	    /// `ticket.total_debit <= balance`.
+   280	    #[inline]
+   281	    pub fn commit_ticket(balance: u64, ticket: SettlementTicket) -> Option<Authorization> {
+   282	        if ticket.total_debit <= balance {
+   283	            Some(Authorization {
+   284	                total_debit: ticket.total_debit,
+   285	            })
+   286	        } else {
+   287	            None
+   288	        }
+   289	    }
+   290	
+   291	    /// Previews the net outflow difference between balance and ticket debit
+   292	    /// when affordable, saturating at zero for telemetry.
+   293	    #[inline]
+   294	    pub fn preview_remaining_balance(balance: u64, ticket: SettlementTicket) -> u64 {
+   295	        balance.saturating_sub(ticket.total_debit)
+   296	    }
+   297	}
+   298	
+   299	/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+   300	///
+   301	/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+   302	/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+   303	///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+   304	/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+   305	///    rounded down (`floor(gross_fee / 10)`).
+   306	/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+   307	///
+   308	/// Authorize every affordable transfer (`total_debit <= balance`) and return
+   309	/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+   310	/// Target word constraint: production code must use `u64` only (no `u128`).
+   311	pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+   312	    let ticket = settlement_engine::quote_settlement_ticket(amount, fee)?;
+   313	    settlement_engine::commit_ticket(balance, ticket)
+   314	}
+   315	
+   316	#[cfg(test)]
+   317	mod tests {
+   318	    use super::*;
+   319	
+   320	    #[test]
+   321	    fn ordinary_settlement() {
+   322	        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+   323	        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+   324	    }
+   325	
+   326	    #[test]
+   327	    fn ceiling_rounding_and_rebate() {
+   328	        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+   329	        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+   330	        assert_eq!(authorize(8, 0, 99_991), None);
+   331	    }
+   332	
+   333	    #[test]
+   334	    fn wide_basis_carry_folding() {
+   335	        let expected = 1_660_206_966_643_862;
+   336	        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+   337	        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+   338	    }
+   339	
+   340	    #[test]
+   341	    fn ceiling_bias_wrap_at_u64_max() {
+   342	        let expected = 1_660_206_966_633_861;
+   343	        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+   344	        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+   345	    }
+   346	
+   347	    #[test]
+   348	    fn total_debit_overflow_rejected() {
+   349	        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+   350	        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+   351	    }
+   352	
+   353	    #[test]
+   354	    fn flash_loan_ceil_levy_across_all_boundaries() {
+   355	        // Check flash loan helper inside the near-u64::MAX bias pocket
+   356	        let fee_at_pocket = flash_loan::assess_flash_fee_ceil(0, u64::MAX - 2_500);
+   357	        assert_eq!(fee_at_pocket, 3_689_348_814_741_910);
+   358	        let receipt = flash_loan::quote_flash_repayment(100_000, 1).unwrap();
+   359	        assert_eq!(receipt.flash_levy, 21);
+   360	        assert_eq!(receipt.total_repayment, 100_021);
+   361	    }
+   362	
+   363	    #[test]
+   364	    fn pool_reserve_split_and_maker_rebate_cap() {
+   365	        let sum = word_math::add_u64_with_carry(500_000, 50_000);
+   366	        let quote = fee_tiers::evaluate_passive_floor_fee(sum);
+   367	        assert_eq!(quote.gross_fee, 55);
+   368	        assert_eq!(quote.rebate, 5);
+   369	        assert_eq!(quote.net_fee, 50);
+   370	        let split = liquidity_pool::split_pool_reserve(quote);
+   371	        assert_eq!(split.treasury_cut, 12);
+   372	        assert_eq!(split.lp_retention, 38);
+   373	        assert_eq!(fee_tiers::compute_capped_maker_rebate(55, 15), 3);
+   374	    }
+   375	}
+[?2004hroot@3f692616899e:/workspace/challenge# clear; sed -n '94,185p' src/lib.rs | cat -n
+[?2004l[H[J[3J     1	pub mod fee_tiers {
+     2	    use crate::constants::*;
+     3	    use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64};
+     4	
+     5	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     6	    pub struct FeeSchedule {
+     7	        pub bps_denom: u64,
+     8	        pub rebate_divisor: u64,
+     9	        pub maker_cap_divisor: u64,
+    10	    }
+    11	
+    12	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    13	    pub struct FeeQuote {
+    14	        pub gross_fee: u64,
+    15	        pub rebate: u64,
+    16	        pub net_fee: u64,
+    17	    }
+    18	
+    19	    /// Returns the default protocol fee schedule parameters.
+    20	    #[inline]
+    21	    pub fn default_schedule() -> FeeSchedule {
+    22	        FeeSchedule {
+    23	            bps_denom: BPS_DENOM,
+    24	            rebate_divisor: REBATE_DIVISOR,
+    25	            maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+    26	        }
+    27	    }
+    28	
+    29	    /// Computes the floor 10% tier rebate `floor(gross_fee / 10)`.
+    30	    #[inline]
+    31	    pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+    32	        gross_fee / REBATE_DIVISOR
+    33	    }
+    34	
+    35	    /// Computes a capped maker rebate `min(floor(gross_fee / 10), floor(limit / 5))`
+    36	    /// used by passive order-book quotes.
+    37	    #[inline]
+    38	    pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+    39	        let base_rebate = gross_fee / REBATE_DIVISOR;
+    40	        let max_rebate = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+    41	        if base_rebate <= max_rebate {
+    42	            base_rebate
+    43	        } else {
+    44	            max_rebate
+    45	        }
+    46	    }
+    47	
+    48	    /// Evaluates the two-stage settlement fee quote (`gross_fee`, `rebate`, `net_fee`)
+    49	    /// from a folded 64-bit notional sum.
+    50	    #[inline]
+    51	    pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+    52	        let gross_fee = ceil_div_bps_u64(sum);
+    53	        let rebate = compute_tier_rebate(gross_fee);
+    54	        let net_fee = gross_fee - rebate;
+    55	        FeeQuote {
+    56	            gross_fee,
+    57	            rebate,
+    58	            net_fee,
+    59	        }
+    60	    }
+    61	
+    62	    /// Evaluates a passive liquidity floor fee quote (used by pool analytics).
+    63	    #[inline]
+    64	    pub fn evaluate_passive_floor_fee(sum: WordSum) -> FeeQuote {
+    65	        let gross_fee = floor_div_bps_u64(sum);
+    66	        let rebate = compute_tier_rebate(gross_fee);
+    67	        let net_fee = gross_fee - rebate;
+    68	        FeeQuote {
+    69	            gross_fee,
+    70	            rebate,
+    71	            net_fee,
+    72	        }
+    73	    }
+    74	}
+    75	
+    76	pub mod liquidity_pool {
+    77	    use crate::constants::*;
+    78	    use crate::fee_tiers::FeeQuote;
+    79	
+    80	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    81	    pub struct PoolReserveQuote {
+    82	        pub treasury_cut: u64,
+    83	        pub lp_retention: u64,
+    84	    }
+    85	
+    86	    /// Splits a net fee between the protocol treasury (`floor(net_fee / 4)`)
+    87	    /// and liquidity providers (`net_fee - treasury_cut`).
+    88	    #[inline]
+    89	    pub fn split_pool_reserve(quote: FeeQuote) -> PoolReserveQuote {
+    90	        let treasury_cut = quote.net_fee / TREASURY_CUT_DIVISOR;
+    91	        let lp_retention = quote.net_fee - treasury_cut;
+    92	        PoolReserveQuote {
+[?2004hroot@3f692616899e:/workspace/challenge# clear; sed -n '94,146p' src/lib.rs
+[?2004l[H[J[3Jpub mod fee_tiers {
+    use crate::constants::*;
+    use crate::word_math::{WordSum, ceil_div_bps_u64, floor_div_bps_u64};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FeeSchedule {
+        pub bps_denom: u64,
+        pub rebate_divisor: u64,
+        pub maker_cap_divisor: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FeeQuote {
+        pub gross_fee: u64,
+        pub rebate: u64,
+        pub net_fee: u64,
+    }
+
+    /// Returns the default protocol fee schedule parameters.
+    #[inline]
+    pub fn default_schedule() -> FeeSchedule {
+        FeeSchedule {
+            bps_denom: BPS_DENOM,
+            rebate_divisor: REBATE_DIVISOR,
+            maker_cap_divisor: MAKER_REBATE_CAP_DIVISOR,
+        }
+    }
+
+    /// Computes the floor 10% tier rebate `floor(gross_fee / 10)`.
+    #[inline]
+    pub fn compute_tier_rebate(gross_fee: u64) -> u64 {
+        gross_fee / REBATE_DIVISOR
+    }
+
+    /// Computes a capped maker rebate `min(floor(gross_fee / 10), floor(limit / 5))`
+    /// used by passive order-book quotes.
+    #[inline]
+    pub fn compute_capped_maker_rebate(gross_fee: u64, cap_basis: u64) -> u64 {
+        let base_rebate = gross_fee / REBATE_DIVISOR;
+        let max_rebate = cap_basis / MAKER_REBATE_CAP_DIVISOR;
+        if base_rebate <= max_rebate {
+            base_rebate
+        } else {
+            max_rebate
+        }
+    }
+
+    /// Evaluates the two-stage settlement fee quote (`gross_fee`, `rebate`, `net_fee`)
+    /// from a folded 64-bit notional sum.
+    #[inline]
+    pub fn evaluate_settlement_fee(sum: WordSum) -> FeeQuote {
+        let gross_fee = ceil_div_bps_u64(sum);
+        let rebate = compute_tier_rebate(gross_fee);
+[?2004hroot@3f692616899e:/workspace/challenge# clear; sed -n '186,230p' src/lib.rs
+[?2004l[H[J[3J            treasury_cut,
+            lp_retention,
+        }
+    }
+
+    /// Computes the LP retention share after protocol cut for reserve accounting.
+    #[inline]
+    pub fn quote_lp_retention(quote: FeeQuote) -> u64 {
+        let split = split_pool_reserve(quote);
+        split.lp_retention
+    }
+}
+
+pub mod flash_loan {
+    use crate::constants::*;
+    use crate::word_math::add_u64_with_carry;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FlashLoanReceipt {
+        pub principal: u64,
+        pub flash_levy: u64,
+        pub total_repayment: u64,
+    }
+
+    /// Computes the ceiling flash-loan levy `ceil((principal + surcharge) / 5_000)`
+    /// in pure `u64` arithmetic.
+    #[inline]
+    pub fn assess_flash_fee_ceil(principal: u64, surcharge: u64) -> u64 {
+        let sum = add_u64_with_carry(principal, surcharge);
+        if sum.high_carry {
+            let folded_rem = (sum.low_word % FLASH_DENOM) + U64_MOD_FLASH_REM;
+            U64_MOD_FLASH_QUOT + (sum.low_word / FLASH_DENOM) + ((folded_rem + FLASH_MAX_REM) / FLASH_DENOM)
+        } else {
+            let biased = sum.low_word.wrapping_add(FLASH_MAX_REM);
+            if biased < sum.low_word {
+                (sum.low_word / FLASH_DENOM) + (((sum.low_word % FLASH_DENOM) + FLASH_MAX_REM) / FLASH_DENOM)
+            } else {
+                biased / FLASH_DENOM
+            }
+        }
+    }
+
+    /// Builds a flash-loan repayment receipt if `principal + flash_levy` fits in `u64`.
+    #[inline]
+    pub fn quote_flash_repayment(principal: u64, surcharge: u64) -> Option<FlashLoanReceipt> {
+[?2004hroot@3f692616899e:/workspace/challenge# clear; sed -n '231,275p' src/lib.rs
+[?2004l[H[J[3J        let flash_levy = assess_flash_fee_ceil(principal, surcharge);
+        let total_repayment = principal.checked_add(flash_levy)?;
+        Some(FlashLoanReceipt {
+            principal,
+            flash_levy,
+            total_repayment,
+        })
+    }
+}
+
+pub mod settlement_engine {
+    use crate::Authorization;
+    use crate::fee_tiers::{FeeQuote, evaluate_settlement_fee};
+    use crate::word_math::add_u64_with_carry;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SettlementTicket {
+        pub principal: u64,
+        pub gross_fee: u64,
+        pub rebate: u64,
+        pub net_fee: u64,
+        pub total_debit: u64,
+    }
+
+    /// Assembles a complete settlement ticket from `amount` and `fee_quote`,
+    /// returning `None` if `amount + fee_quote.net_fee` overflows `u64`.
+    #[inline]
+    pub fn assemble_ticket(amount: u64, fee_quote: FeeQuote) -> Option<SettlementTicket> {
+        let total_debit = amount.checked_add(fee_quote.net_fee)?;
+        Some(SettlementTicket {
+            principal: amount,
+            gross_fee: fee_quote.gross_fee,
+            rebate: fee_quote.rebate,
+            net_fee: fee_quote.net_fee,
+            total_debit,
+        })
+    }
+
+    /// Quotes the settlement ticket for `(amount, fee)` using the two-stage
+    /// basis-point ceiling levy and floor tier rebate schedule.
+    #[inline]
+    pub fn quote_settlement_ticket(amount: u64, fee: u64) -> Option<SettlementTicket> {
+        let notional_sum = add_u64_with_carry(amount, fee);
+        let fee_quote = evaluate_settlement_fee(notional_sum);
+        assemble_ticket(amount, fee_quote)
+[?2004hroot@3f692616899e:/workspace/challenge# clear; mkdir -p /workspace/submission/src && cd /workspace/submission && echo vulnerable > verdict.txt && printf '{"balance": 1660206966633859, "amount": 0, "fee": 18446744073709549999}\n' > counterexample.json && cp /workspace/challenge/src/lib.rs src/lib.rs
+[?2004l[H[J[3J[?2004hroot@3f692616899e:/workspace/submission# python3 - <<'EOF'
+[?2004l[?2004h> p='/workspace/submission/src/lib.rs'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> old='(sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)'
+[?2004l[?2004h> assert s.count(old)==1
+[?2004l[?2004h> s=s.replace(old,'(sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3f692616899e:/workspace/submission# diff /workspace/challenge/src/lib.rs src/lib.rs; cat verdict.txt counterexample.json
+[?2004l86c86
+<                 (sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+---
+>                 (sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+vulnerable
+{"balance": 1660206966633859, "amount": 0, "fee": 18446744073709549999}
+[?2004hroot@3f692616899e:/workspace/submission# rm -rf /tmp/orig /tmp/fixed && cp -r /workspace/challenge /tmp/orig && cp -r /workspace/challenge /tmp/fixed && cp src/lib.rs /tmp/fixed/src/lib.rs && mkdir -p /tmp/orig/tests /tmp/fixed/tests
+[?2004l[?2004hroot@3f692616899e:/workspace/submission# cat > /tmp/fixed/tests/ref.rs <<'EOF'
+[?2004l[?2004h> use settlement_gate::*;
+[?2004l[?2004h> fn reference(b: u64, a: u64, f: u64) -> Option<u64> {
+[?2004l[?2004h>     let s = a as u128 + f as u128;
+[?2004l[?2004h>     let g = (s + 9999) / 10000;
+[?2004l[?2004h>     let net = g - g / 10;
+[?2004l[?2004h>     let t = a as u128 + net;
+[?2004l[?2004h>     if t <= b as u128 { Some(t as u64) } else { None }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn check(a: u64, f: u64) {
+[?2004l[?2004h>     let s = a as u128 + f as u128;
+[?2004l[?2004h>     let g = (s + 9999) / 10000;
+[?2004l[?2004h>     let t = a as u128 + g - g / 10;
+[?2004l[?2004h>     let mut bs = vec![0u64, 1, u64::MAX, u64::MAX - 1];
+[?2004l[?2004h>     if t <= u64::MAX as u128 { let t = t as u64; bs.push(t); if t > 0 { bs.push(t - 1); } if t < u64::MAX { bs.push(t + 1); } }
+[?2004l[?2004h>     for b in bs { assert_eq!(authorize(b, a, f).map(|x| x.total_debit), reference(b, a, f), "b={} a={} f={}", b, a, f); }
+[?2004l[?2004h> }
+[?2004l[?2004h> #[test]
+[?2004l[?2004h> fn universal_sample() {
+[?2004l[?2004h>     let mut vals: Vec<u64> = vec![];
+[?2004l[?2004h>     for k in 0..20001u64 { vals.push(u64::MAX - k); vals.push(k); }
+[?2004l[?2004h>     for k in 0..200u64 { vals.push((1u64 << 63).wrapping_add(k)); vals.push((1u64 << 63).wrapping_sub(k)); }
+[?2004l[?2004h>     for &x in &vals { check(0, x); check(x, 0); check(x, 1); check(1, x); check(10000, x); check(x, u64::MAX); check(u64::MAX, x); }
+[?2004l[?2004h>     let mut st: u64 = 0x1234567;
+[?2004l[?2004h>     for _ in 0..3_000_000 { st ^= st << 13; st ^= st >> 7; st ^= st << 17; let a = st; st ^= st << 13; st ^= st >> 7; st ^= st << 17; let f = st;
+[?2004l[?2004h>         check(a, f); check(a >> (a % 64), f); check(a, u64::MAX - (f % 30000)); check(u64::MAX - (a % 30000), f % 30000); }
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3f692616899e:/workspace/submission# cd /tmp/fixed && cargo test --release 2>&1 | tail -20
+[?2004ltest tests::ordinary_settlement ... ok
+test tests::pool_reserve_split_and_maker_rebate_cap ... ok
+test tests::total_debit_overflow_rejected ... ok
+test tests::wide_basis_carry_folding ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ref.rs (target/release/deps/ref-3e4e3a1fa978a1b0)
+
+running 1 test
+test universal_sample ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.49s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@3f692616899e:/tmp/fixed# printf 'use settlement_gate::*;\n#[test]\nfn ce(){ println!("ORIG: {:?}", authorize(1660206966633859, 0, 18446744073709549999)); }\n' > /tmp/orig/tests/ce.rs && cd /tmp/orig && cargo test --release --test ce -- --nocapture 2>&1 | grep -E 'ORIG|test result'
+[?2004l[01;31m[KORIG[m[K: Some(Authorization { total_debit: 1660206966633859 })
+[01;31m[Ktest result[m[K: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[?2004hroot@3f692616899e:/tmp/orig# clear; cd /workspace/submission && diff /workspace/challenge/src/lib.rs src/lib.rs; ls -R; cat verdict.txt counterexample.json
+[?2004l[H[J[3J86c86
+<                 (sum.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+---
+>                 (sum.low_word / BPS_DENOM) + (((sum.low_word % BPS_DENOM) + BPS_MAX_REM) / BPS_DENOM)
+.:
+counterexample.json  [0m[01;34msrc[0m  verdict.txt
+
+./src:
+lib.rs
+vulnerable
+{"balance": 1660206966633859, "amount": 0, "fee": 18446744073709549999}
+[?2004hroot@3f692616899e:/workspace/submission# 

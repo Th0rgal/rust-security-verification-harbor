@@ -1,0 +1,220 @@
+[?2004hroot@148045982f45:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@148045982f45:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@148045982f45:/workspace# cd /workspace/challenge && find . -type f -not -path './target/*' | head -50 && cat Cargo.toml
+[?2004l./src/lib.rs
+./Cargo.toml
+./Cargo.lock
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@148045982f45:/workspace/challenge# for f in $(find src -name '*.rs'); do echo "=== $f"; cat -n $f; done
+[?2004l=== src/lib.rs
+     1	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     2	pub struct Authorization {
+     3	    pub total_debit: u64,
+     4	}
+     5	
+     6	pub mod mg10 {
+     7	    pub const MG10_DIVISOR: u64 = 0x8003u64;
+     8	    pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+     9	    pub const LIMB_MASK: u64 = 0xFFFFu64;
+    10	    pub const SUB_BIAS: u64 = 0xC000_0000u64;
+    11	
+    12	    /// Möller-Granlund 2-by-1 normalized division (`alloy-rs/ruint` `src/algorithms/div/small.rs`)
+    13	    /// for fixed normalized divisor `D = 0x8003 = 32771` and reciprocal
+    14	    /// `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65524`.
+    15	    /// Given `u1 < D` and `u0 < 2^16`, returns `floor((u1 * 2^16 + u0) / D)`.
+    16	    #[inline]
+    17	    pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+    18	        let q_full: u64 = (u1 * MG10_RECIPROCAL) + (u1 << 16u64) + u0 + (1u64 << 16u64);
+    19	
+    20	        let q1: u64 = q_full >> 16u64;
+    21	        let q0: u64 = q_full & LIMB_MASK;
+    22	        let r: u64 = (SUB_BIAS + u0 - q1 * MG10_DIVISOR) & LIMB_MASK;
+    23	
+    24	        if q0 < r {
+    25	            q1 - 1u64
+    26	        } else {
+    27	            q1
+    28	        }
+    29	    }
+    30	}
+    31	
+    32	pub mod settlement {
+    33	    use crate::Authorization;
+    34	    use crate::mg10;
+    35	
+    36	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    37	    pub struct RuintQuote {
+    38	        pub u1: u64,
+    39	        pub u0: u64,
+    40	        pub quotient: u64,
+    41	        pub total_debit: u64,
+    42	    }
+    43	
+    44	    #[inline]
+    45	    pub fn build_quote(amount: u64, fee: u64) -> Option<RuintQuote> {
+    46	        let u1: u64 = fee % mg10::MG10_DIVISOR;
+    47	        let u0: u64 = amount & mg10::LIMB_MASK;
+    48	        let quotient: u64 = mg10::div_2x1_mg10(u1, u0);
+    49	        let total_debit: u64 = (amount >> 1u64) + quotient;
+    50	        Some(RuintQuote {
+    51	            u1,
+    52	            u0,
+    53	            quotient,
+    54	            total_debit,
+    55	        })
+    56	    }
+    57	
+    58	    #[inline]
+    59	    pub fn verify_affordability(balance: u64, quote: RuintQuote) -> Option<Authorization> {
+    60	        if quote.total_debit <= balance {
+    61	            Some(Authorization {
+    62	                total_debit: quote.total_debit,
+    63	            })
+    64	        } else {
+    65	            None
+    66	        }
+    67	    }
+    68	}
+    69	
+    70	/// Authorize a Ruint Möller-Granlund 2-by-1 normalized division settlement against `balance`.
+    71	///
+    72	/// In exact integer arithmetic:
+    73	/// - `D = 32771` (`0x8003`), `B = 2^16 = 65536`
+    74	/// - `u1 = fee mod D`, `u0 = amount mod B`
+    75	/// - `quotient = floor((u1 * B + u0) / D)`
+    76	/// - `total_debit = floor(amount / 2) + quotient`
+    77	///
+    78	/// The payment is authorized iff `total_debit <= balance`.
+    79	/// Production code in this crate operates on `u64` words only (`u128` is not used).
+    80	pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    81	    let quote: settlement::RuintQuote = settlement::build_quote(amount, fee)?;
+    82	    settlement::verify_affordability(balance, quote)
+    83	}
+    84	
+    85	#[cfg(test)]
+    86	mod tests {
+    87	    use super::*;
+    88	
+    89	    #[test]
+    90	    fn zero_payment_is_authorized() {
+    91	        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    92	    }
+    93	
+    94	    #[test]
+    95	    fn exact_multiple_of_divisor() {
+    96	        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+    97	        assert_eq!(authorize(0, 0, 1), None);
+    98	    }
+    99	
+   100	    #[test]
+   101	    fn two_limb_dividend_matches_policy() {
+   102	        assert_eq!(
+   103	            authorize(16_405, 32_771, 10),
+   104	            Some(Authorization {
+   105	                total_debit: 16_405
+   106	            })
+   107	        );
+   108	    }
+   109	}
+[?2004hroot@148045982f45:/workspace/challenge# mkdir -p /tmp/bf && cat > /tmp/bf/main.rs <<'EOF'
+[?2004l[?2004h> const D: u64 = 0x8003; const V: u64 = 0xFFF4; const M: u64 = 0xFFFF; const SB: u64 = 0xC000_0000;
+[?2004l[?2004h> fn mg(u1: u64, u0: u64) -> u64 {
+[?2004l[?2004h>     let q_full = (u1.wrapping_mul(V)).wrapping_add(u1 << 16).wrapping_add(u0).wrapping_add(1 << 16);
+[?2004l[?2004h>     let q1 = q_full >> 16; let q0 = q_full & M;
+[?2004l[?2004h>     let r = (SB.wrapping_add(u0).wrapping_sub(q1.wrapping_mul(D))) & M;
+[?2004l[?2004h>     if q0 < r { q1.wrapping_sub(1) } else { q1 }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let mut cnt: u64 = 0;
+[?2004l[?2004h>     for u1 in 0..D { for u0 in 0..65536u64 {
+[?2004l[?2004h>         let e = ((u1 << 16) + u0) / D; let g = mg(u1, u0);
+[?2004l[?2004h>         if e != g { cnt += 1; if cnt < 6 { println!("u1={} u0={} exact={} got={}", u1, u0, e, g); } }
+[?2004l[?2004h>     }}
+[?2004l[?2004h>     println!("mismatches={}", cnt);
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@148045982f45:/workspace/challenge# cd /tmp/bf && rustc -O -C overflow-checks=off main.rs -o bf && time ./bf
+[?2004lu1=16384 u0=65533 exact=32767 got=32766
+u1=16384 u0=65534 exact=32767 got=32766
+u1=16384 u0=65535 exact=32767 got=32766
+u1=21845 u0=65528 exact=43688 got=43687
+u1=21845 u0=65529 exact=43688 got=43687
+mismatches=70
+
+real	0m5.574s
+user	0m5.205s
+sys	0m0.010s
+[?2004hroot@148045982f45:/tmp/bf# mkdir -p /workspace/submission/src && cd /workspace/submission && printf 'vulnerable\n' > verdict.txt && printf '{"balance": 65532, "amount": 65533, "fee": 16384}\n' > counterexample.json && cat verdict.txt counterexample.json
+[?2004lvulnerable
+{"balance": 65532, "amount": 65533, "fee": 16384}
+[?2004hroot@148045982f45:/workspace/submission# python3 - <<'EOF'
+[?2004l[?2004h> src = open('/workspace/challenge/src/lib.rs').read()
+[?2004l[?2004h> start = src.index('        let q_full: u64')
+[?2004l[?2004h> end = src.index('    }\n}\n\npub mod settlement')
+[?2004l[?2004h> new_body = '        let n: u64 = (u1 << 16u64) + u0;\n        n / MG10_DIVISOR\n'
+[?2004l[?2004h> src = src[:start] + new_body + src[end:]
+[?2004l[?2004h> open('/workspace/submission/src/lib.rs', 'w').write(src)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@148045982f45:/workspace/submission# sed -n 1,25p /workspace/submission/src/lib.rs
+[?2004l#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod mg10 {
+    pub const MG10_DIVISOR: u64 = 0x8003u64;
+    pub const MG10_RECIPROCAL: u64 = 0xFFF4u64;
+    pub const LIMB_MASK: u64 = 0xFFFFu64;
+    pub const SUB_BIAS: u64 = 0xC000_0000u64;
+
+    /// Möller-Granlund 2-by-1 normalized division (`alloy-rs/ruint` `src/algorithms/div/small.rs`)
+    /// for fixed normalized divisor `D = 0x8003 = 32771` and reciprocal
+    /// `V = floor((2^32 - 1) / D) - 2^16 = 0xFFF4 = 65524`.
+    /// Given `u1 < D` and `u0 < 2^16`, returns `floor((u1 * 2^16 + u0) / D)`.
+    #[inline]
+    pub fn div_2x1_mg10(u1: u64, u0: u64) -> u64 {
+        let n: u64 = (u1 << 16u64) + u0;
+        n / MG10_DIVISOR
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::mg10;
+[?2004hroot@148045982f45:/workspace/submission# rm -rf /tmp/chk && cp -r /workspace/challenge /tmp/chk && rm -rf /tmp/chk/target && cat >> /tmp/chk/src/lib.rs <<'EOF'
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod cex { use super::*; #[test] fn cex() { println!("ORIG={:?}", authorize(65532, 65533, 16384)); } }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@148045982f45:/workspace/submission# cd /tmp/chk && cargo test --release cex -- --nocapture 2>&1 | grep -E 'ORIG|test result'
+[?2004l[01;31m[KORIG[m[K=Some(Authorization { total_debit: 65532 })
+[01;31m[Ktest result[m[K: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+[?2004hroot@148045982f45:/tmp/chk# rm -rf /tmp/fix && cp -r /workspace/challenge /tmp/fix && rm -rf /tmp/fix/target && cp /workspace/submission/src/lib.rs /tmp/fix/src/lib.rs && cat >> /tmp/fix/src/lib.rs <<'EOF'
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod exh { use super::*; #[test] fn exh() { let d=0x8003u64; let mut bad=0u64; for u1 in 0..d { for u0 in 0..65536u64 { if mg10::div_2x1_mg10(u1,u0) != ((u1<<16)+u0)/d { bad+=1; } } } println!("BAD={}", bad); println!("FIX={:?}", authorize(65532, 65533, 16384)); assert_eq!(bad,0); } }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@148045982f45:/tmp/chk# cd /tmp/fix && cargo test --release 2>&1 | grep -E 'BAD|FIX|test result|error|warning'; cargo test --release exh -- --nocapture 2>&1 | grep -E 'BAD|FIX'
+[?2004l[01;31m[Ktest result[m[K: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[Ktest result[m[K: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[01;31m[KBAD[m[K=0
+[01;31m[KFIX[m[K=None
+[?2004hroot@148045982f45:/tmp/fix# find /workspace/submission -type f | xargs ls -la && cat /workspace/submission/verdict.txt /workspace/submission/counterexample.json M[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Kn
+[?2004l-rw-r--r-- 1 root root   50 Oct 13 09:27 /workspace/submission/counterexample.json
+-rw-r--r-- 1 root root 2995 Oct 13 09:27 /workspace/submission/src/lib.rs
+-rw-r--r-- 1 root root   11 Oct 13 09:27 /workspace/submission/verdict.txt
+vulnerable
+{"balance": 65532, "amount": 65533, "fee": 16384}
+[?2004hroot@148045982f45:/tmp/fix# 

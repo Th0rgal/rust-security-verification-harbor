@@ -1,0 +1,384 @@
+[?2004hroot@9b38ee7b9238:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@9b38ee7b9238:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@9b38ee7b9238:/workspace# pwd; find /workspace/challenge -maxdepth 4 -type f -print | sort
+[?2004l/workspace
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@9b38ee7b9238:/workspace# find /workspace/challenge/src -type f -name '*.rs' -print -exec sh -c 'echo "===== $1 ====="; sed -n "1,240p" "$1"' _ {} \;
+[?2004l/workspace/challenge/src/lib.rs
+===== /workspace/challenge/src/lib.rs =====
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod monty31 {
+    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+
+    #[inline]
+    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+        let low: u64 = amount & LIMB_MASK;
+        let high: u64 = fee % BABY_BEAR_P;
+        low + high * LIMB_BASE
+    }
+
+    #[inline]
+    pub fn monty_quotient(x: u64) -> u64 {
+        let x_lo: u64 = x & LIMB_MASK;
+        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    }
+
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            if hi == LIMB_MASK {
+                0u64
+            } else {
+                hi + BABY_BEAR_P - LIMB_BASE
+            }
+        } else {
+            hi
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::monty31;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PlonkyQuote {
+        pub principal: u64,
+        pub monty_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+        let transcript: u64 = monty31::pack_transcript(amount, fee);
+        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+        Some(PlonkyQuote {
+            principal: amount,
+            monty_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Plonky3 BabyBear Montgomery settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2013265921` (BabyBear prime), `R = 2^32 = 4294967296`, `R_INV = 943718400` (`R * R_INV == 1 mod P`)
+/// - `transcript = (amount mod 2^32) + (fee mod P) * 2^32`
+/// - `monty_surcharge = (transcript * R_INV) mod P`
+/// - `total_debit = amount + monty_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::PlonkyQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn montgomery_identity_element() {
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        assert_eq!(
+            authorize(4_294_967_301, 4_294_967_296, 5),
+            Some(Authorization {
+                total_debit: 4_294_967_301
+            })
+        );
+    }
+}
+[?2004hroot@9b38ee7b9238:/workspace# if [ -f /workspace/challenge/Cargo.toml ]; then echo '===== Cargo.toml ====='; cat /workspace/challenge/Cargo.toml; fi; if [ -d /workspace/challenge/tests ]; then find /workspace/challenge/tests -type f -maxdepth 2 -print -exec sh -c 'echo "===== $1 ====="; sed -n "1,260p" "$1"' _ {} \;; fi
+[?2004l===== Cargo.toml =====
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@9b38ee7b9238:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.28s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::montgomery_identity_element ... [32mok[m
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@9b38ee7b9238:/workspace/challenge# cd /workspace/challenge && cargo build --release && cat >/tmp/check_original.rs <<'EOF'
+[?2004l[?2004h> extern crate settlement_gate;
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance: u64 = 1_744_830_467;
+[?2004l[?2004h>     let amount: u64 = 1_744_830_467;
+[?2004l[?2004h>     let fee: u64 = 0;
+[?2004l[?2004h>     println!("{:?}", settlement_gate::authorize(balance, amount, fee));
+[?2004l[?2004h>     let q = settlement_gate::settlement::build_quote(amount, fee).unwrap();
+[?2004l[?2004h>     println!("{} {}", q.monty_surcharge, q.total_debit);
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[?2004hroot@9b38ee7b9238:/workspace/challenge# rustc --edition=2021 /tmp/check_original.rs --extern settlement_gate=target/release/libsettlement_gate.rlib -o /tmp/check_original && /tmp/check_original
+[?2004lSome(Authorization { total_debit: 1744830467 })
+0 1744830467
+[?2004hroot@9b38ee7b9238:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission/src
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/challenge# printf 'vulnerable\n' > /workspace/submission/verdict.txt
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/challenge# cat > /workspace/submission/counterexample.json <<'EOF'
+[?2004l[?2004h> {"balance":1744830467,"amount":1744830467,"fee":0}
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/challenge# cp /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/workspace/submission/src/lib.rs')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> old = '''        if borrow {
+[?2004l[?2004h>             if hi == LIMB_MASK {
+[?2004l[?2004h>                 0u64
+[?2004l[?2004h>             } else {
+[?2004l[?2004h>                 hi + BABY_BEAR_P - LIMB_BASE
+[?2004l[?2004h>             }
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             hi
+[?2004l[?2004h>         }'''
+[?2004l[?2004h> new = '''        if borrow {
+[?2004l[?2004h>             hi + BABY_BEAR_P - LIMB_BASE
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             hi
+[?2004l[?2004h>         }'''
+[?2004l[?2004h> if s.count(old) != 1:
+[?2004l[?2004h>     raise SystemExit('expected exactly one defective branch')
+[?2004l[?2004h> p.write_text(s.replace(old, new))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/challenge# cd /workspace/submission && cargo test --release
+[?2004l[1m[31merror[0m[1m:[0m could not find `Cargo.toml` in `/workspace/submission` or any parent directory
+[?2004hroot@9b38ee7b9238:/workspace/submission# cd /workspace/submission && cargo build --release && cat >/tmp/check_repaired.rs <<'EOF'
+[?2004l[?2004h> extern crate settlement_gate;
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance: u64 = 1_744_830_467;
+[?2004l[?2004h>     let amount: u64 = 1_744_830_467;
+[?2004l[?2004h>     let fee: u64 = 0;
+[?2004l[?2004h>     println!("{:?}", settlement_gate::authorize(balance, amount, fee));
+[?2004l[?2004h>     let q = settlement_gate::settlement::build_quote(amount, fee).unwrap();
+[?2004l[?2004h>     println!("{} {}", q.monty_surcharge, q.total_debit);
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[1m[31merror[0m[1m:[0m could not find `Cargo.toml` in `/workspace/submission` or any parent directory
+[?2004hroot@9b38ee7b9238:/workspace/submission# rustc --edition=2021 /tmp/check_repaired.rs --extern settlement_gate=target/release/libsettlement_gate.rlib -o /tmp/check_repaired && /tmp/check_repaired
+[?2004l[0m[1m[38;5;9merror[0m[0m[1m: couldn't read /tmp/check_repaired.rs: No such file or directory (os error 2)[0m
+
+[0m[1m[38;5;9merror[0m[0m[1m: aborting due to 1 previous error[0m
+
+[?2004hroot@9b38ee7b9238:/workspace/submission# printf '%s\n' '===== submission files ====='
+[?2004l===== submission files =====
+[?2004hroot@9b38ee7b9238:/workspace/submission# find /workspace/submission -type f -maxdepth 3 -print | sort
+[?2004lfind: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/verdict.txt
+[?2004hroot@9b38ee7b9238:/workspace/submission# printf '%s\n' '===== repair diff ====='
+[?2004l===== repair diff =====
+[?2004hroot@9b38ee7b9238:/workspace/submission# diff -u /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs || true
+[?2004l--- /workspace/challenge/src/lib.rs	2026-10-13 08:49:24.000000000 +0000
++++ /workspace/submission/src/lib.rs	2026-10-13 09:49:27.131322166 +0000
+@@ -31,11 +31,7 @@
+         let (diff, borrow) = x.overflowing_sub(u);
+         let hi: u64 = diff >> 32u64;
+         if borrow {
+-            if hi == LIMB_MASK {
+-                0u64
+-            } else {
+-                hi + BABY_BEAR_P - LIMB_BASE
+-            }
++            hi + BABY_BEAR_P - LIMB_BASE
+         } else {
+             hi
+         }
+[?2004hroot@9b38ee7b9238:/workspace/submission# set -e
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# rustc --edition=2021 --crate-name settlement_gate --crate-type lib -O /workspace/submission/src/lib.rs -o /tmp/libsettlement_gate_repaired.rlib
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# cat >/tmp/check_repaired.rs <<'EOF'
+[?2004l[?2004h> extern crate settlement_gate;
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance: u64 = 1_744_830_467;
+[?2004l[?2004h>     let amount: u64 = 1_744_830_467;
+[?2004l[?2004h>     let fee: u64 = 0;
+[?2004l[?2004h>     let quote = settlement_gate::settlement::build_quote(amount, fee).unwrap();
+[?2004l[?2004h>     assert_eq!(quote.monty_surcharge, 2_013_265_920);
+[?2004l[?2004h>     assert_eq!(quote.total_debit, 3_758_096_387);
+[?2004l[?2004h>     assert_eq!(settlement_gate::authorize(balance, amount, fee), None);
+[?2004l[?2004h>     assert_eq!(settlement_gate::authorize(3_758_096_387, amount, fee), Some(settlement_gate::Authorization { total_debit: 3_758_096_387 }));
+[?2004l[?2004h>     println!("repaired witness and affordability boundary verified");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# rustc --edition=2021 /tmp/check_repaired.rs --extern settlement_gate=/tmp/libsettlement_gate_repaired.rlib -o /tmp/check_repaired
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# /tmp/check_repaired
+[?2004lrepaired witness and affordability boundary verified
+[?2004hroot@9b38ee7b9238:/workspace/submission# set -e
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# rm -rf /tmp/repaired-crate
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# mkdir -p /tmp/repaired-crate/src
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# cp /workspace/challenge/Cargo.toml /tmp/repaired-crate/Cargo.toml
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# cp /workspace/submission/src/lib.rs /tmp/repaired-crate/src/lib.rs
+[?2004l[?2004hroot@9b38ee7b9238:/workspace/submission# cd /tmp/repaired-crate
+[?2004l[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/repaired-crate)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate                                                                                             [1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.22s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::montgomery_identity_element ... [32mok[m
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# set -e
+[?2004l[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# printf '%s\n' '===== verdict ====='; cat /workspace/submission/verdict.txt
+[?2004l===== verdict =====
+vulnerable
+[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# printf '%s\n' '===== counterexample ====='; cat /workspace/submission/counterexample.json
+[?2004l===== counterexample =====
+{"balance":1744830467,"amount":1744830467,"fee":0}
+[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# printf '%s\n' '===== submission files ====='; find /workspace/submission -maxdepth 3 -type f -print | sort
+[?2004l===== submission files =====
+/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/verdict.txt
+[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# printf '%s\n' '===== repaired arithmetic ====='; sed -n '1,75p' /workspace/submission/src/lib.rs
+[?2004l===== repaired arithmetic =====
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod monty31 {
+    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+
+    #[inline]
+    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+        let low: u64 = amount & LIMB_MASK;
+        let high: u64 = fee % BABY_BEAR_P;
+        low + high * LIMB_BASE
+    }
+
+    #[inline]
+    pub fn monty_quotient(x: u64) -> u64 {
+        let x_lo: u64 = x & LIMB_MASK;
+        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    }
+
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            hi + BABY_BEAR_P - LIMB_BASE
+        } else {
+            hi
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::monty31;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PlonkyQuote {
+        pub principal: u64,
+        pub monty_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+        let transcript: u64 = monty31::pack_transcript(amount, fee);
+        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+        Some(PlonkyQuote {
+            principal: amount,
+            monty_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+[?2004hroot@9b38ee7b9238:/tmp/repaired-crate# 

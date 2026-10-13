@@ -1,0 +1,135 @@
+[?2004hroot@b1c13f92e437:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@b1c13f92e437:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@b1c13f92e437:/workspace# find /workspace/challenge -type f | grep -v target | head -50
+[?2004l/workspace/challenge/src/lib.rs
+/workspace/challenge/Cargo.toml
+/workspace/challenge/Cargo.lock
+[?2004hroot@b1c13f92e437:/workspace# cat /workspace/challenge/Cargo.toml; for f in $(find /workspace/challenge/src -name '*.rs'); do echo "=== $f"; cat -n $f; done
+[?2004l[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+=== /workspace/challenge/src/lib.rs
+     1	//! Local arithmetic authorization exercise.
+     2	
+     3	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     4	pub struct Authorization {
+     5	    pub total_debit: u64,
+     6	}
+     7	
+     8	/// Authorize a transfer before it is sent to a wider-integer settlement layer.
+     9	///
+    10	/// Policy: principal plus fee must not exceed the account balance.
+    11	/// Authorize every affordable payment and reject every unaffordable payment.
+    12	/// The returned debit is the principal plus fees actually applied at settlement.
+    13	pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    14	    let total = amount.wrapping_add(fee);
+    15	    (total <= balance).then_some(Authorization { total_debit: total })
+    16	}
+    17	
+    18	#[cfg(test)]
+    19	mod tests {
+    20	    use super::*;
+    21	
+    22	    #[test]
+    23	    fn ordinary_payment() {
+    24	        assert_eq!(authorize(110, 100, 10).unwrap().total_debit, 110);
+    25	        assert_eq!(authorize(109, 100, 10), None);
+    26	    }
+    27	}
+[?2004hroot@b1c13f92e437:/workspace# mkdir -p /workspace/submission/src && cd /workspace/submission && printf 'vulnerable\n' > verdict.txt && printf '{"balance": 0, "amount": 18446744073709551615, "fee": 1}\n' > counterexample.json
+[?2004l[?2004hroot@b1c13f92e437:/workspace/submission# cat > /workspace/submission/src/lib.rs <<'EOF'
+[?2004l[?2004h> //! Local arithmetic authorization exercise.
+[?2004l[?2004h> 
+[?2004l[?2004h> #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h> pub struct Authorization {
+[?2004l[?2004h>     pub total_debit: u64,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> /// Authorize a transfer before it is sent to a wider-integer settlement layer.
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// Policy: principal plus fee must not exceed the account balance.
+[?2004l[?2004h> /// Authorize every affordable payment and reject every unaffordable payment.
+[?2004l[?2004h> /// The returned debit is the principal plus fees actually applied at settlement.
+[?2004l[?2004h> pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+[?2004l[?2004h>     // Overflow means the mathematical sum exceeds u64::MAX >= balance: reject.
+[?2004l[?2004h>     let total = amount.checked_add(fee)?;
+[?2004l[?2004h>     (total <= balance).then_some(Authorization { total_debit: total })
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn ordinary_payment() {
+[?2004l[?2004h>         assert_eq!(authorize(110, 100, 10).unwrap().total_debit, 110);
+[?2004l[?2004h>         assert_eq!(authorize(109, 100, 10), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn overflow_rejected() {
+[?2004l[?2004h>         assert_eq!(authorize(0, u64::MAX, 1), None);
+[?2004l[?2004h>         assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+[?2004l[?2004h>         assert_eq!(authorize(u64::MAX, u64::MAX, 0).unwrap().total_debit, u64::MAX);
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b1c13f92e437:/workspace/submission# rm -rf /tmp/chk && cp -r /workspace/challenge /tmp/chk && cp /workspace/submission/src/lib.rs /tmp/chk/src/lib.rs && cd /tmp/chk && cargo test --offline 2>&1 | tail -15; cd /workspace; ls -R /workspace/submission; cat /workspace/submission/verdict.txt /workspace/submission/counterexample.json
+[?2004l    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running unittests src/lib.rs (target/debug/deps/settlement_gate-66f23bc290c8a00c)
+
+running 2 tests
+test tests::ordinary_payment ... ok
+test tests::overflow_rejected ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+/workspace/submission:
+Audit.lean  Proof.lean  Spec.lean  counterexample.json  [0m[01;34msrc[0m  verdict.txt
+
+/workspace/submission/src:
+lib.rs
+vulnerable
+{"balance": 0, "amount": 18446744073709551615, "fee": 1}
+[?2004hroot@b1c13f92e437:/workspace# rm -rf /tmp/orig && cp -r /workspace/challenge /tmp/orig && cd /tmp/orig && mkdir -p tests && printf 'use settlement_gate::*;\n#[test]\nfn cex(){ let r = authorize(0, u64::MAX, 1); println!("{:?}", r); assert!(r.is_some()); }\n' > tests/cex.rs && cargo test --offline --test cex -- --nocapture 2>&1 | grep -E 'Some|None|test result|error'; cd /workspace
+[?2004l[01;31m[KSome[m[K(Authorization { total_debit: 0 })
+[01;31m[Ktest result[m[K: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[?2004hroot@b1c13f92e437:/workspace# ls -la /workspace/submission; head -30 /workspace/submission/*.lean
+[?2004ltotal 40
+drwxr-xr-x 1 root root 4096 Oct 13 07:59 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 07:52 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  9 07:51 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  9 07:51 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  9 07:51 Spec.lean
+-rw-r--r-- 1 root root   57 Oct 13 07:59 counterexample.json
+drwxr-xr-x 1 root root 4096 Oct 13 07:59 [01;34msrc[0m
+-rw-r--r-- 1 root root   11 Oct 13 07:59 verdict.txt
+==> /workspace/submission/Audit.lean <==
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+
+==> /workspace/submission/Proof.lean <==
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+
+==> /workspace/submission/Spec.lean <==
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+[?2004hroot@b1c13f92e437:/workspace# 

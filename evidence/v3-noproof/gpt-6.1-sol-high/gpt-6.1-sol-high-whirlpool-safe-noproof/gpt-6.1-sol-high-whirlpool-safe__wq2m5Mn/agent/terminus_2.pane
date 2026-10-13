@@ -1,0 +1,361 @@
+[?2004hroot@9ed9c222c234:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@9ed9c222c234:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@9ed9c222c234:/workspace# pwd; printf '\n--- workspace ---\n'; find /workspace -maxdepth 3 -type f -o -type d | sort
+[?2004l/workspace
+
+--- workspace ---
+/workspace
+/workspace/challenge
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src
+/workspace/challenge/src/lib.rs
+/workspace/submission
+/workspace/submission/src
+[?2004hroot@9ed9c222c234:/workspace# printf '\n--- source files ---\n'; find /workspace/challenge/src -type f -maxdepth 5 -print -exec sh -c 'echo "--- $1"; sed -n "1,240p" "$1"' sh {} \;
+[?2004l
+--- source files ---
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod u128_math {
+    pub const LIMB_BASE: u64 = 0x1_0000_0000u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+    pub const FEE_RATE_MUL_VALUE: u64 = 1_000_000u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct U128Words {
+        pub w0: u64,
+        pub w1: u64,
+        pub w2: u64,
+        pub w3: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivStep {
+        pub quot: u64,
+        pub rem: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivResult {
+        pub q0: u64,
+        pub q1: u64,
+        pub q2: u64,
+        pub q3: u64,
+        pub rem: u64,
+    }
+
+    #[inline]
+    pub fn split_u128(amount: u64, fee: u64) -> U128Words {
+        U128Words {
+            w0: amount & LIMB_MASK,
+            w1: amount >> LIMB_SHIFT,
+            w2: fee & LIMB_MASK,
+            w3: fee >> LIMB_SHIFT,
+        }
+    }
+
+    #[inline]
+    pub fn div_step(rem: u64, word: u64) -> DivStep {
+        let num: u64 = rem * LIMB_BASE + word;
+        DivStep {
+            quot: num / FEE_RATE_MUL_VALUE,
+            rem: num % FEE_RATE_MUL_VALUE,
+        }
+    }
+
+    #[inline]
+    pub fn div_word_chain(words: U128Words) -> DivResult {
+        let step3: DivStep = div_step(0u64, words.w3);
+        let step2: DivStep = div_step(step3.rem, words.w2);
+        let step1: DivStep = div_step(step2.rem, words.w1);
+        let step0: DivStep = div_step(step1.rem, words.w0);
+        DivResult {
+            q0: step0.quot,
+            q1: step1.quot,
+            q2: step2.quot,
+            q3: step3.quot,
+            rem: step0.rem,
+        }
+    }
+
+    #[inline]
+    pub fn round_up_quotient(div: DivResult) -> U128Words {
+        let inc: u64 = if div.rem > 0u64 { 1u64 } else { 0u64 };
+        let s0: u64 = div.q0 + inc;
+        let r0: u64 = s0 & LIMB_MASK;
+        let c0: u64 = s0 >> LIMB_SHIFT;
+        let s1: u64 = div.q1 + c0;
+        let r1: u64 = s1 & LIMB_MASK;
+        let c1: u64 = s1 >> LIMB_SHIFT;
+        let s2: u64 = div.q2 + c1;
+        let r2: u64 = s2 & LIMB_MASK;
+        let c2: u64 = s2 >> LIMB_SHIFT;
+        let r3: u64 = div.q3 + c2;
+        U128Words {
+            w0: r0,
+            w1: r1,
+            w2: r2,
+            w3: r3,
+        }
+    }
+
+    #[inline]
+    pub fn try_into_u64(words: U128Words) -> Option<u64> {
+        if words.w2 != 0u64 || words.w3 != 0u64 {
+            None
+        } else {
+            Some(words.w1 * LIMB_BASE + words.w0)
+        }
+    }
+
+    #[inline]
+    pub fn div_round_up_fee(amount: u64, fee: u64) -> Option<u64> {
+        let words: U128Words = split_u128(amount, fee);
+        let div: DivResult = div_word_chain(words);
+        let rounded: U128Words = round_up_quotient(div);
+        try_into_u64(rounded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::u128_math;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WhirlpoolQuote {
+        pub principal_share: u64,
+        pub gross_fee: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<WhirlpoolQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let gross_fee: u64 = u128_math::div_round_up_fee(amount, fee)?;
+        let total_debit: u64 = principal_share.checked_add(gross_fee)?;
+        Some(WhirlpoolQuote {
+            principal_share,
+            gross_fee,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: WhirlpoolQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a concentrated-liquidity Whirlpool swap debit against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `principal_share = floor(amount / 2)`
+/// - `gross_fee = ceil((amount + fee * 2^64) / 1_000_000)`
+/// - `total_debit = principal_share + gross_fee`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::WhirlpoolQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn rounds_up_fractional_fee() {
+        // amount = 100, fee = 0:
+        // principal_share = 50, gross_fee = ceil(100 / 1_000_000) = 1 -> total = 51
+        assert_eq!(authorize(51, 100, 0), Some(Authorization { total_debit: 51 }));
+        assert_eq!(authorize(50, 100, 0), None);
+    }
+
+    #[test]
+    fn multi_word_carry_across_q0_boundary() {
+        // Choose X = 1_000_000 * 0xFFFF_FFFF + 1 = 4_294_967_295_000_001 (fee = 0):
+        // gross_fee = 0x1_0000_0000 = 4_294_967_296
+        // principal_share = 2_147_483_647_500_000
+        let amount: u64 = 4_294_967_295_000_001u64;
+        let expected: u64 = (amount / 2) + 4_294_967_296u64;
+        assert_eq!(
+            authorize(expected, amount, 0),
+            Some(Authorization {
+                total_debit: expected
+            })
+        );
+    }
+}
+[?2004hroot@9ed9c222c234:/workspace# printf '\n--- Cargo files ---\n'; find /workspace/challenge -maxdepth 2 -type f \( -name Cargo.toml -o -name Cargo.lock \) -print -exec sed -n '1,240p' {} \;
+[?2004l
+--- Cargo files ---
+/workspace/challenge/Cargo.toml
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+/workspace/challenge/Cargo.lock
+# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "settlement-gate"
+version = "0.1.0"
+[?2004hroot@9ed9c222c234:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.32s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::multi_word_carry_across_q0_boundary ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+test tests::rounds_up_fractional_fee ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@9ed9c222c234:/workspace/challenge# cat > /tmp/check_authorization.rs <<'RS'
+[?2004l[?2004h> include!("/workspace/challenge/src/lib.rs");
+[?2004l[?2004h> 
+[?2004l[?2004h> fn exact_debit(amount: u64, fee: u64) -> u128 {
+[?2004l[?2004h>     let numerator = (amount as u128) + ((fee as u128) << 64);
+[?2004l[?2004h>     let gross_fee = numerator / 1_000_000 + if numerator % 1_000_000 != 0 { 1 } else { 0 };
+[?2004l[?2004h>     (amount / 2) as u128 + gross_fee
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn check(balance: u64, amount: u64, fee: u64) {
+[?2004l[?2004h>     let debit = exact_debit(amount, fee);
+[?2004l[?2004h>     let expected = if debit <= balance as u128 {
+[?2004l[?2004h>         Some(Authorization { total_debit: debit as u64 })
+[?2004l[?2004h>     } else {
+[?2004l[?2004h>         None
+[?2004l[?2004h>     };
+[?2004l[?2004h>     assert_eq!(authorize(balance, amount, fee), expected,
+[?2004l[?2004h>         "balance={balance}, amount={amount}, fee={fee}, exact={debit}");
+[?2004l[?2004h>     let gross = debit - (amount / 2) as u128;
+[?2004l[?2004h>     let expected_fee = if gross <= u64::MAX as u128 { Some(gross as u64) } else { None };
+[?2004l[?2004h>     assert_eq!(u128_math::div_round_up_fee(amount, fee), expected_fee);
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn random(state: &mut u64) -> u64 {
+[?2004l[?2004h>     *state ^= *state << 13;
+[?2004l[?2004h>     *state ^= *state >> 7;
+[?2004l[?2004h>     *state ^= *state << 17;
+[?2004l[?2004h>     *state
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let values = [0, 1, 2, 3, 999_999, 1_000_000, 1_000_001,
+[?2004l[?2004h>         (1u64 << 32) - 1, 1u64 << 32, (1u64 << 32) + 1,
+[?2004l[?2004h>         4_294_967_295_000_000, 4_294_967_295_000_001,
+[?2004l[?2004h>         u64::MAX / 2, u64::MAX - 1, u64::MAX];
+[?2004l[?2004h>     let mut checks = 0;
+[?2004l[?2004h>     for amount in values {
+[?2004l[?2004h>         for fee in values {
+[?2004l[?2004h>             for balance in values {
+[?2004l[?2004h>                 check(balance, amount, fee);
+[?2004l[?2004h>                 checks += 1;
+[?2004l[?2004h>             }
+[?2004l[?2004h>             let debit = exact_debit(amount, fee);
+[?2004l[?2004h>             if debit <= u64::MAX as u128 {
+[?2004l[?2004h>                 let debit = debit as u64;
+[?2004l[?2004h>                 check(debit, amount, fee);
+[?2004l[?2004h>                 if debit > 0 { check(debit - 1, amount, fee); }
+[?2004l[?2004h>                 if debit < u64::MAX { check(debit + 1, amount, fee); }
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     let mut state = 0x7dca_519b_efa3_6021;
+[?2004l[?2004h>     for i in 0..1_000_000 {
+[?2004l[?2004h>         let amount = random(&mut state);
+[?2004l[?2004h>         let fee_sample = random(&mut state);
+[?2004l[?2004h>         let fee = if i % 2 == 0 { fee_sample % 1_000_001 } else { fee_sample };
+[?2004l[?2004h>         let balance = random(&mut state);
+[?2004l[?2004h>         check(balance, amount, fee);
+[?2004l[?2004h>         let debit = exact_debit(amount, fee);
+[?2004l[?2004h>         if debit <= u64::MAX as u128 {
+[?2004l[?2004h>             let debit = debit as u64;
+[?2004l[?2004h>             check(debit, amount, fee);
+[?2004l[?2004h>             if debit > 0 { check(debit - 1, amount, fee); }
+[?2004l[?2004h>         }
+[?2004l[?2004h>         checks += 1;
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("Passed {checks} boundary/random cases plus exact-affordability boundary checks.");
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@9ed9c222c234:/workspace/challenge# rustc --edition=2021 -O -C overflow-checks=off /tmp/check_authorization.rs -o /tmp/check_authorization && /tmp/check_authorization
+[?2004lPassed 1003375 boundary/random cases plus exact-affordability boundary checks.
+[?2004hroot@9ed9c222c234:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> B = 2**32
+[?2004l[?2004h> D = 1_000_000
+[?2004l[?2004h> M = 2**64 - 1
+[?2004l[?2004h> print('Maximum div_step numerator:', D*B-1, '<=', M)
+[?2004l[?2004h> assert D*B-1 <= M
+[?2004l[?2004h> assert (D*B-1)//D == B-1
+[?2004l[?2004h> print('Maximum lower-limb rounding sum:', B, '<=', M)
+[?2004l[?2004h> assert B <= M
+[?2004l[?2004h> print('Maximum highest quotient limb:', (B-1)//D)
+[?2004l[?2004h> assert (B-1)//D + 1 < B
+[?2004l[?2004h> print('Maximum converted u64:', (B-1)*B+(B-1))
+[?2004l[?2004h> assert (B-1)*B+(B-1) == M
+[?2004l[?2004h> print('All required no-overflow bounds verified.')
+[?2004l[?2004h> PY
+[?2004lMaximum div_step numerator: 4294967295999999 <= 18446744073709551615
+Maximum lower-limb rounding sum: 4294967296 <= 18446744073709551615
+Maximum highest quotient limb: 4294
+Maximum converted u64: 18446744073709551615
+All required no-overflow bounds verified.
+[?2004hroot@9ed9c222c234:/workspace/challenge# printf 'safe\n' > /workspace/submission/verdict.txt
+[?2004l[?2004hroot@9ed9c222c234:/workspace/challenge# rmdir /workspace/submission/src
+[?2004l[?2004hroot@9ed9c222c234:/workspace/challenge# printf '\n--- submission contents ---\n'; find /workspace/submission -maxdepth 3 -print
+[?2004l
+--- submission contents ---
+/workspace/submission
+/workspace/submission/verdict.txt
+[?2004hroot@9ed9c222c234:/workspace/challenge# printf '\n--- verdict ---\n'; cat /workspace/submission/verdict.txt
+[?2004l
+--- verdict ---
+safe
+[?2004hroot@9ed9c222c234:/workspace/challenge# test "$(cat /workspace/submission/verdict.txt)" = safe && test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src && printf '\nSafe submission verified.\n'
+[?2004l
+Safe submission verified.
+[?2004hroot@9ed9c222c234:/workspace/challenge# 

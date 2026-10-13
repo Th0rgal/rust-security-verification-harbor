@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-for rel in Spec.lean Audit.lean Proof.lean counterexample.json src/lib.rs; do
+for rel in Spec.lean Audit.lean Proof.lean verdict.txt counterexample.json src/lib.rs; do
   if [[ -f "/solution/$rel" ]]; then
     mkdir -p "$(dirname "/workspace/submission/$rel")"
     cp "/solution/$rel" "/workspace/submission/$rel"

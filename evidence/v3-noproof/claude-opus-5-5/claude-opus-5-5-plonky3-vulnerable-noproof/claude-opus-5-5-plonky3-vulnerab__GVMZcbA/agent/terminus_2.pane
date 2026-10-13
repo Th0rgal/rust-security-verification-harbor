@@ -1,0 +1,229 @@
+[?2004hroot@09f93cdc2bb6:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@09f93cdc2bb6:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@09f93cdc2bb6:/workspace# find /workspace/challenge -type f | grep -v target | head -50
+[?2004l/workspace/challenge/src/lib.rs
+/workspace/challenge/Cargo.toml
+/workspace/challenge/Cargo.lock
+[?2004hroot@09f93cdc2bb6:/workspace# for f in $(find /workspace/challenge/src -name '*.rs'); do echo "=== $f"; cat -n $f; done
+[?2004l=== /workspace/challenge/src/lib.rs
+     1	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+     2	pub struct Authorization {
+     3	    pub total_debit: u64,
+     4	}
+     5	
+     6	pub mod monty31 {
+     7	    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+     8	    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+     9	    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    10	    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+    11	
+    12	    #[inline]
+    13	    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+    14	        let low: u64 = amount & LIMB_MASK;
+    15	        let high: u64 = fee % BABY_BEAR_P;
+    16	        low + high * LIMB_BASE
+    17	    }
+    18	
+    19	    #[inline]
+    20	    pub fn monty_quotient(x: u64) -> u64 {
+    21	        let x_lo: u64 = x & LIMB_MASK;
+    22	        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    23	    }
+    24	
+    25	    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    26	    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    27	    #[inline]
+    28	    pub fn monty_reduce(x: u64) -> u64 {
+    29	        let t: u64 = monty_quotient(x);
+    30	        let u: u64 = t * BABY_BEAR_P;
+    31	        let (diff, borrow) = x.overflowing_sub(u);
+    32	        let hi: u64 = diff >> 32u64;
+    33	        if borrow {
+    34	            if hi == LIMB_MASK {
+    35	                0u64
+    36	            } else {
+    37	                hi + BABY_BEAR_P - LIMB_BASE
+    38	            }
+    39	        } else {
+    40	            hi
+    41	        }
+    42	    }
+    43	}
+    44	
+    45	pub mod settlement {
+    46	    use crate::Authorization;
+    47	    use crate::monty31;
+    48	
+    49	    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    50	    pub struct PlonkyQuote {
+    51	        pub principal: u64,
+    52	        pub monty_surcharge: u64,
+    53	        pub total_debit: u64,
+    54	    }
+    55	
+    56	    #[inline]
+    57	    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+    58	        let transcript: u64 = monty31::pack_transcript(amount, fee);
+    59	        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+    60	        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+    61	        Some(PlonkyQuote {
+    62	            principal: amount,
+    63	            monty_surcharge,
+    64	            total_debit,
+    65	        })
+    66	    }
+    67	
+    68	    #[inline]
+    69	    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+    70	        if quote.total_debit <= balance {
+    71	            Some(Authorization {
+    72	                total_debit: quote.total_debit,
+    73	            })
+    74	        } else {
+    75	            None
+    76	        }
+    77	    }
+    78	}
+    79	
+    80	/// Authorize a Plonky3 BabyBear Montgomery settlement against `balance`.
+    81	///
+    82	/// In exact integer arithmetic:
+    83	/// - `P = 2013265921` (BabyBear prime), `R = 2^32 = 4294967296`, `R_INV = 943718400` (`R * R_INV == 1 mod P`)
+    84	/// - `transcript = (amount mod 2^32) + (fee mod P) * 2^32`
+    85	/// - `monty_surcharge = (transcript * R_INV) mod P`
+    86	/// - `total_debit = amount + monty_surcharge`
+    87	///
+    88	/// The payment is authorized iff `total_debit <= balance`.
+    89	/// Production code in this crate operates on `u64` words only (`u128` is not used).
+    90	pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    91	    let quote: settlement::PlonkyQuote = settlement::build_quote(amount, fee)?;
+    92	    settlement::verify_affordability(balance, quote)
+    93	}
+    94	
+    95	#[cfg(test)]
+    96	mod tests {
+    97	    use super::*;
+    98	
+    99	    #[test]
+   100	    fn zero_payment_is_authorized() {
+   101	        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+   102	    }
+   103	
+   104	    #[test]
+   105	    fn montgomery_identity_element() {
+   106	        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+   107	        assert_eq!(authorize(0, 0, 1), None);
+   108	    }
+   109	
+   110	    #[test]
+   111	    fn small_transcript_reduction_matches_policy() {
+   112	        assert_eq!(
+   113	            authorize(4_294_967_301, 4_294_967_296, 5),
+   114	            Some(Authorization {
+   115	                total_debit: 4_294_967_301
+   116	            })
+   117	        );
+   118	    }
+   119	}
+[?2004hroot@09f93cdc2bb6:/workspace# mkdir -p /workspace/submission/src && cd /workspace/submission && echo vulnerable > verdict.txt && echo '{"balance": 1744830467, "amount": 1744830467, "fee": 0}' > counterexample.json
+[?2004l[?2004hroot@09f93cdc2bb6:/workspace/submission# python3 - <<'EOF'
+[?2004l[?2004h> s=open('/workspace/challenge/src/lib.rs').read()
+[?2004l[?2004h> old='''        if borrow {
+[?2004l[?2004h>             if hi == LIMB_MASK {
+[?2004l[?2004h>                 0u64
+[?2004l[?2004h>             } else {
+[?2004l[?2004h>                 hi + BABY_BEAR_P - LIMB_BASE
+[?2004l[?2004h>             }
+[?2004l[?2004h>         } else {'''
+[?2004l[?2004h> new='''        if borrow {
+[?2004l[?2004h>             hi + BABY_BEAR_P - LIMB_BASE
+[?2004l[?2004h>         } else {'''
+[?2004l[?2004h> assert old in s
+[?2004l[?2004h> open('/workspace/submission/src/lib.rs','w').write(s.replace(old,new))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@09f93cdc2bb6:/workspace/submission# rm -rf /tmp/orig /tmp/fix && cp -r /workspace/challenge /tmp/orig && cp -r /workspace/challenge /tmp/fix && cp /workspace/submission/src/lib.rs /tmp/fix/src/lib.rs
+[?2004l[?2004hroot@09f93cdc2bb6:/workspace/submission# cat > /tmp/reftest.rs <<'EOF'
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod reftests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h>     fn reference(b: u64, a: u64, f: u64) -> Option<u64> {
+[?2004l[?2004h>         let p: u128 = 2013265921; let rinv: u128 = 943718400;
+[?2004l[?2004h>         let tr: u128 = (a as u128 & 0xFFFF_FFFF) + ((f as u128) % p) * (1u128 << 32);
+[?2004l[?2004h>         let s = (tr * rinv) % p;
+[?2004l[?2004h>         let tot = a as u128 + s;
+[?2004l[?2004h>         if tot <= b as u128 { Some(tot as u64) } else { None }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     fn chk(b: u64, a: u64, f: u64) {
+[?2004l[?2004h>         assert_eq!(authorize(b, a, f).map(|x| x.total_debit), reference(b, a, f), "b={} a={} f={}", b, a, f);
+[?2004l[?2004h>     }
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn against_reference() {
+[?2004l[?2004h>         chk(1744830467, 1744830467, 0);
+[?2004l[?2004h>         let edges = [0u64, 1, 2, 2013265920, 2013265921, 2013265922, 1744830467, 0xFFFF_FFFF, 1<<32, (1<<32)+1, u64::MAX, u64::MAX-1, u64::MAX-2013265920, 3758096387];
+[?2004l[?2004h>         for &a in &edges { for &f in &edges { for &b in &edges { chk(b,a,f); } let r = reference(u64::MAX,a,f); if let Some(t)=r { chk(t,a,f); chk(t.wrapping_sub(1),a,f);} } }
+[?2004l[?2004h>         let mut s: u64 = 0x1234567;
+[?2004l[?2004h>         let mut nx = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+[?2004l[?2004h>         for _ in 0..3_000_000 { let a = nx(); let f = nx(); let a = if nx()&1==0 { a & 0xFFFF_FFFF } else { a }; let r = reference(u64::MAX,a,f); let b = match r { Some(t) => t.wrapping_sub(nx()%2), None => nx() }; chk(b,a,f); }
+[?2004l[?2004h>         for t in 3u64..2000000 { let x = t*2013265921 - (1u64<<32); let a = x & 0xFFFF_FFFF; let f = x >> 32; chk(u64::MAX, a, f); let r = reference(u64::MAX,a,f).unwrap(); chk(r-1,a,f); }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@09f93cdc2bb6:/workspace/submission# cat /tmp/reftest.rs >> /tmp/orig/src/lib.rs; cat /tmp/reftest.rs >> /tmp/fix/src/lib.rs
+[?2004l[?2004hroot@09f93cdc2bb6:/workspace/submission# cd /tmp/orig && cargo test --release 2>&1 | tail -15; cd /tmp/fix && cargo test --release 2>&1 | tail -15; cd /workspace
+[?2004l---- reftests::against_reference stdout ----
+
+thread 'reftests::against_reference' panicked at src/lib.rs:131:9:
+assertion `left == right` failed: b=1744830467 a=1744830467 f=0
+  left: Some(1744830467)
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    reftests::against_reference
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+
+running 4 tests
+test tests::montgomery_identity_element ... ok
+test tests::small_transcript_reduction_matches_policy ... ok
+test tests::zero_payment_is_authorized ... ok
+test reftests::against_reference ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@09f93cdc2bb6:/workspace# ls -R /workspace/submission; cat /workspace/submission/verdict.txt /workspace/submission/counterexample.json; sed -n 25,40p /workspace/submission/src/lib.rs
+[?2004l/workspace/submission:
+counterexample.json  [0m[01;34msrc[0m  verdict.txt
+
+/workspace/submission/src:
+lib.rs
+vulnerable
+{"balance": 1744830467, "amount": 1744830467, "fee": 0}
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            hi + BABY_BEAR_P - LIMB_BASE
+        } else {
+            hi
+        }
+    }
+}
+
+[?2004hroot@09f93cdc2bb6:/workspace# 

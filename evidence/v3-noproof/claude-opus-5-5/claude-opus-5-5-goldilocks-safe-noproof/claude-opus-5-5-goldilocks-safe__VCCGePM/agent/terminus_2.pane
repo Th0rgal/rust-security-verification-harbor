@@ -1,0 +1,256 @@
+[?2004hroot@3075acf9b292:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@3075acf9b292:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@3075acf9b292:/workspace# find /workspace/challenge -type f -not -path '*/target/*' | head -50
+[?2004l/workspace/challenge/src/lib.rs
+/workspace/challenge/Cargo.toml
+/workspace/challenge/Cargo.lock
+[?2004hroot@3075acf9b292:/workspace# cat /workspace/challenge/Cargo.toml; for f in $(find /workspace/challenge/src -name '*.rs'); do echo "=== $f"; cat $f; done
+[?2004l[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+=== /workspace/challenge/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod field {
+    pub const GOLDILOCKS_MODULUS: u64 = 0xFFFF_FFFF_0000_0001u64;
+    pub const GOLDILOCKS_EPSILON: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TranscriptLimbs {
+        pub low: u64,
+        pub mid: u64,
+        pub high: u64,
+    }
+
+    #[inline]
+    pub fn split_transcript(amount: u64, fee: u64) -> TranscriptLimbs {
+        TranscriptLimbs {
+            low: amount,
+            mid: fee & GOLDILOCKS_EPSILON,
+            high: fee >> LIMB_SHIFT,
+        }
+    }
+
+    /// Fold the top 32-bit limb `high * 2^96` into `low` using `2^96 == -1 (mod P)`.
+    #[inline]
+    pub fn fold_high_limb(low: u64, high: u64) -> u64 {
+        let (low2, borrow) = low.overflowing_sub(high);
+        if borrow {
+            low2.wrapping_add(GOLDILOCKS_MODULUS)
+        } else {
+            low2
+        }
+    }
+
+    /// Fold the middle 32-bit limb `mid * 2^64` using `2^64 == 2^32 - 1 (mod P)`.
+    #[inline]
+    pub fn fold_mid_limb(low2: u64, mid: u64) -> u64 {
+        let product: u64 = mid * GOLDILOCKS_EPSILON;
+        let (sum1, carry1) = low2.overflowing_add(product);
+        if carry1 {
+            sum1.wrapping_add(GOLDILOCKS_EPSILON)
+        } else {
+            sum1
+        }
+    }
+
+    #[inline]
+    pub fn canonicalize(folded: u64) -> u64 {
+        if folded >= GOLDILOCKS_MODULUS {
+            folded - GOLDILOCKS_MODULUS
+        } else {
+            folded
+        }
+    }
+
+    /// Reduce the 128-bit integer `amount + fee * 2^64` modulo the Goldilocks
+    /// prime `P = 2^64 - 2^32 + 1 = 18446744069414584321` in pure `u64`.
+    #[inline]
+    pub fn reduce_128(amount: u64, fee: u64) -> u64 {
+        let limbs: TranscriptLimbs = split_transcript(amount, fee);
+        let low2: u64 = fold_high_limb(limbs.low, limbs.high);
+        let folded: u64 = fold_mid_limb(low2, limbs.mid);
+        canonicalize(folded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::field;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GoldilocksQuote {
+        pub principal_share: u64,
+        pub field_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<GoldilocksQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let field_surcharge: u64 = field::reduce_128(amount, fee);
+        let total_debit: u64 = principal_share.checked_add(field_surcharge)?;
+        Some(GoldilocksQuote {
+            principal_share,
+            field_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: GoldilocksQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Goldilocks rollup settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2^64 - 2^32 + 1 = 18446744069414584321` (Goldilocks prime)
+/// - `principal_share = floor(amount / 2)`
+/// - `field_surcharge = (amount + fee * 2^64) mod P`
+/// - `total_debit = principal_share + field_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::GoldilocksQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 100, fee = 1:
+        // principal_share = 50
+        // field_surcharge = (100 + 2^64) mod P = 100 + (2^32 - 1) = 4294967395
+        // total_debit = 4294967445
+        assert_eq!(
+            authorize(4_294_967_445, 100, 1),
+            Some(Authorization {
+                total_debit: 4_294_967_445
+            })
+        );
+        assert_eq!(authorize(4_294_967_444, 100, 1), None);
+    }
+
+    #[test]
+    fn canonicalizes_values_above_modulus() {
+        // amount = P + 10 = 18446744069414584331, fee = 0:
+        // principal_share = 9223372034707292165
+        // field_surcharge = 10
+        assert_eq!(
+            authorize(9_223_372_034_707_292_175, 18_446_744_069_414_584_331, 0),
+            Some(Authorization {
+                total_debit: 9_223_372_034_707_292_175
+            })
+        );
+    }
+}
+[?2004hroot@3075acf9b292:/workspace# rm -rf /tmp/chk && cp -r /workspace/challenge /tmp/chk && cat >> /tmp/chk/src/lib.rs <<'EOF'
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod fuzz {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h>     fn reference(b: u64, a: u64, f: u64) -> Option<u64> {
+[?2004l[?2004h>         let p: u128 = 18446744069414584321;
+[?2004l[?2004h>         let v: u128 = (a as u128) + ((f as u128) << 64);
+[?2004l[?2004h>         let t: u128 = (a as u128) / 2 + v % p;
+[?2004l[?2004h>         if t <= b as u128 { Some(t as u64) } else { None }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn fuzz_all() {
+[?2004l[?2004h>         let edges: Vec<u64> = vec![0,1,2,3,0xFFFF_FFFF,0x1_0000_0000,0xFFFF_FFFF_0000_0000,0xFFFF_FFFF_0000_0001,0xFFFF_FFFF_0000_0002,u64::MAX,u64::MAX-1,1u64<<63,(1u64<<63)-1,0xFFFF_FFFE_FFFF_FFFF,0x8000_0000_FFFF_FFFF];
+[?2004l[?2004h>         for &b in &edges { for &a in &edges { for &f in &edges {
+[?2004l[?2004h>             assert_eq!(authorize(b,a,f).map(|x| x.total_debit), reference(b,a,f), "{} {} {}", b,a,f);
+[?2004l[?2004h>         }}}
+[?2004l[?2004h>         let mut s: u64 = 0x1234_5678_9abc_def1;
+[?2004l[?2004h>         let mut r = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+[?2004l[?2004h>         for _ in 0..3_000_000 {
+[?2004l[?2004h>             let a = r(); let f = r(); let pick = r() % 4;
+[?2004l[?2004h>             let a = if pick == 0 { a | 0xFFFF_FFFF_0000_0000 } else { a };
+[?2004l[?2004h>             let f = if pick == 1 { f & 0xFFFF_FFFF } else { f };
+[?2004l[?2004h>             let t = reference(u64::MAX, a, f);
+[?2004l[?2004h>             let b = match t { Some(v) => if r() % 2 == 0 { v } else { v.saturating_sub(1) }, None => r() };
+[?2004l[?2004h>             assert_eq!(authorize(b,a,f).map(|x| x.total_debit), reference(b,a,f), "{} {} {}", b,a,f);
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3075acf9b292:/workspace# cd /tmp/chk && cargo test 2>&1 | tail -15; cd /workspace
+[?2004l
+running 4 tests
+test tests::canonicalizes_values_above_modulus ... ok
+test tests::small_transcript_reduction_matches_policy ... ok
+test tests::zero_payment_is_authorized ... ok
+test fuzz::fuzz_all ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+   Doc-tests settlement_gate
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@3075acf9b292:/workspace# mkdir -p /workspace/submission && echo safe > /workspace/submission/verdict.txt && rm -rf /workspace/submission/src /workspace/submission/counterexample.json && ls -la /workspace/submission && cat /workspace/submission/verdict.txt
+[?2004ltotal 28
+drwxr-xr-x 1 root root 4096 Oct 13 08:03 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 07:52 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  9 07:51 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  9 07:51 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  9 07:51 Spec.lean
+-rw-r--r-- 1 root root    5 Oct 13 08:03 verdict.txt
+safe
+[?2004hroot@3075acf9b292:/workspace# for f in /workspace/submission/*.lean; do echo "=== $f"; cat "$f"; echo; done; ls -la /workspace/submission; cat /workspace/submission/verdict.txt
+[?2004l=== /workspace/submission/Audit.lean
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define verdict : AuditVerdict after auditing the supplied implementation.
+
+=== /workspace/submission/Proof.lean
+-- Only a proof term, for the exact signature in /workspace/lean/Signature.lean.
+by
+  sorry
+
+=== /workspace/submission/Spec.lean
+import SecurityChallenge
+open SecurityChallenge
+
+-- Define candidateSpec : AuthorizationSpec with your inferred business policy.
+
+total 28
+drwxr-xr-x 1 root root 4096 Oct 13 08:03 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 07:52 [01;34m..[0m
+-rw-r--r-- 1 root root  126 Oct  9 07:51 Audit.lean
+-rw-r--r-- 1 root root   92 Oct  9 07:51 Proof.lean
+-rw-r--r-- 1 root root  129 Oct  9 07:51 Spec.lean
+-rw-r--r-- 1 root root    5 Oct 13 08:03 verdict.txt
+safe
+[?2004hroot@3075acf9b292:/workspace# 

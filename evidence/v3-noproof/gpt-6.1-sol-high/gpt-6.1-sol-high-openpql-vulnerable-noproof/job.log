@@ -1,0 +1,160 @@
+max_turns (f.k.a. max_episodes) artificially limited to 25. Consider removing this limit for better task completion.
+Both tmux and asciinema are already installed
+Starting recording.
+Sending keys: ['asciinema rec --stdin /logs/agent/recording.cast', 'Enter'] min_timeout_sec: 1.0 max_timeout_sec: 180.0
+Sending keys: ['clear', 'Enter'] min_timeout_sec: 0.0 max_timeout_sec: 180.0
+Parser warnings: - Extra text detected after JSON object
+Sending keys: ["pwd; printf '\\n-- workspace --\\n'; find /workspace -maxdepth 3 -type f -o -type d | sort\n"] min_timeout_sec: 0.2 max_timeout_sec: 180.0
+Sending keys: ['printf \'\\n-- Cargo.toml --\\n\'; cat /workspace/challenge/Cargo.toml; printf \'\\n-- source files --\\n\'; find /workspace/challenge/src -type f -maxdepth 5 -print -exec sh -c \'echo "--- $1"; sed -n "1,240p" "$1"\' _ {} \\;\n'] min_timeout_sec: 0.5 max_timeout_sec: 180.0
+Sending keys: ['cd /workspace/challenge && cargo test --release\n'] min_timeout_sec: 5.0 max_timeout_sec: 180.0
+Trajectory dumped to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/agent/trajectory.json
+Sending keys: ['mkdir -p /workspace/submission/src\ncat > /workspace/submission/verdict.txt <<\'EOF\'\nvulnerable\nEOF\ncat > /workspace/submission/counterexample.json <<\'EOF\'\n{"balance":9223372036854775807,"amount":18446744073709551615,"fee":18446744073709551615}\nEOF\ncat > /workspace/submission/src/lib.rs <<\'EOF\'\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Authorization {\n    pub total_debit: u64,\n}\n\npub mod mixed_radix {\n    pub const RADIX_MASK: u64 = 0xFFFFu64;\n    pub const SHIFT_16: u64 = 16u64;\n    pub const SHIFT_32: u64 = 32u64;\n    pub const SHIFT_48: u64 = 48u64;\n\n    #[inline]\n    pub fn clamp_digit(a: u64, b: u64) -> u64 {\n        if a < b {\n            a\n        } else {\n            b - 1u64\n        }\n    }\n\n    /// Encode a 4-level mixed-radix coordinate `(d0, d1, d2, d3)` with radices\n    /// `(b0, b1, b2, b3)` in `[1, 65536]` extracted from `fee` (`waugh_indexer::MixedRadix`).\n    #[inline]\n    pub fn encode(amount: u64, fee: u64) -> u64 {\n        let b0: u64 = (fee & RADIX_MASK) + 1u64;\n        let b1: u64 = ((fee >> SHIFT_16) & RADIX_MASK) + 1u64;\n        let b2: u64 = ((fee >> SHIFT_32) & RADIX_MASK) + 1u64;\n        let b3: u64 = ((fee >> SHIFT_48) & RADIX_MASK) + 1u64;\n        let a0: u64 = amount & RADIX_MASK;\n        let a1: u64 = (amount >> SHIFT_16) & RADIX_MASK;\n        let a2: u64 = (amount >> SHIFT_32) & RADIX_MASK;\n        let a3: u64 = (amount >> SHIFT_48) & RADIX_MASK;\n        let d0: u64 = clamp_digit(a0, b0);\n        let d1: u64 = clamp_digit(a1, b1);\n        let d2: u64 = clamp_digit(a2, b2);\n        let d3: u64 = clamp_digit(a3, b3);\n        let o2: u64 = b3;\n        let o1: u64 = b2 * o2;\n        let o0: u64 = b1 * o1;\n        let raw_idx: u64 = d0 * o0 + d1 * o1 + d2 * o2 + d3;\n        raw_idx\n    }\n}\n\npub mod settlement {\n    use crate::mixed_radix;\n    use crate::Authorization;\n\n    #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n    pub struct OpenPqlQuote {\n        pub principal_share: u64,\n        pub encoded_idx: u64,\n        pub index_surcharge: u64,\n        pub total_debit: u64,\n    }\n\n    #[inline]\n    pub fn build_quote(amount: u64, fee: u64) -> Option<OpenPqlQuote> {\n        let principal_share: u64 = amount >> 1u64;\n        let encoded_idx: u64 = mixed_radix::encode(amount, fee);\n        let index_surcharge: u64 = encoded_idx >> 1u64;\n        let total_debit: u64 = principal_share + index_surcharge;\n        Some(OpenPqlQuote {\n            principal_share,\n            encoded_idx,\n            index_surcharge,\n            total_debit,\n        })\n    }\n\n    #[inline]\n    pub fn verify_affordability(balance: u64, quote: OpenPqlQuote) -> Option<Authorization> {\n        if quote.total_debit <= balance {\n            Some(Authorization {\n                total_debit: quote.total_debit,\n            })\n        } else {\n            None\n        }\n    }\n}\n\n/// Authorize an OpenPQL 4-level mixed-radix settlement against `balance`.\n///\n/// In exact integer arithmetic:\n/// - For `i in {0, 1, 2, 3}`:\n///   - `b_i = ((fee >> (16 * i)) & 0xFFFF) + 1` in `[1, 65536]`\n///   - `a_i = (amount >> (16 * i)) & 0xFFFF` in `[0, 65535]`\n///   - `d_i = min(a_i, b_i - 1)`\n/// - Suffix-product offsets: `o2 = b3`, `o1 = b2 * o2`, `o0 = b1 * o1`\n/// - `encoded_idx = d0 * o0 + d1 * o1 + d2 * o2 + d3`\n/// - `total_debit = floor(amount / 2) + floor(encoded_idx / 2)`\n///\n/// The payment is authorized iff `total_debit <= balance`.\n/// Production code in this crate operates on `u64` words only (`u128` is not used).\npub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {\n    let quote: settlement::OpenPqlQuote = settlement::build_quote(amount, fee)?;\n    settlement::verify_affordability(balance, quote)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn zero_payment_is_authorized() {\n        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));\n    }\n\n    #[test]\n    fn small_mixed_radix_coordinates_match_policy() {\n        let fee: u64 = 0x0003_0003_0003_0003;\n        let amount: u64 = 0x0001_0002_0001_0002;\n        assert_eq!(\n            authorize(140_741_783_355_469, amount, fee),\n            Some(Authorization {\n                total_debit: 140_741_783_355_469\n            })\n        );\n        assert_eq!(authorize(140_741_783_355_468, amount, fee), None);\n    }\n\n    #[test]\n    fn clamps_digits_to_radix_minus_one() {\n        assert_eq!(\n            authorize(50, 100, 0),\n            Some(Authorization { total_debit: 50 })\n        );\n    }\n\n    #[test]\n    fn maximum_radices_do_not_wrap_the_index() {\n        let max = u64::MAX;\n        assert_eq!(\n            authorize(u64::MAX / 2, max, max),\n            None\n        );\n        assert_eq!(\n            authorize(u64::MAX - 1, max, max),\n            Some(Authorization { total_debit: u64::MAX - 1 })\n        );\n    }\n}\nEOF\n'] min_timeout_sec: 0.2 max_timeout_sec: 180.0
+Sending keys: ['rustc --edition=2021 --crate-type lib -O /workspace/submission/src/lib.rs -o /tmp/libsettlement_gate.rlib && rustc --edition=2021 --test -O /workspace/submission/src/lib.rs -o /tmp/settlement_gate_tests && /tmp/settlement_gate_tests\n'] min_timeout_sec: 2.0 max_timeout_sec: 180.0
+Sending keys: ["cat > /tmp/check_submission.rs <<'EOF'\nextern crate settlement_gate;\n\nfn main() {\n    let balance = 9_223_372_036_854_775_807u64;\n    let amount = u64::MAX;\n    let fee = u64::MAX;\n    assert_eq!(settlement_gate::authorize(balance, amount, fee), None);\n    assert_eq!(\n        settlement_gate::authorize(u64::MAX - 1, amount, fee),\n        Some(settlement_gate::Authorization { total_debit: u64::MAX - 1 })\n    );\n}\nEOF\nrustc --edition=2021 -O /tmp/check_submission.rs --extern settlement_gate=/tmp/libsettlement_gate.rlib -o /tmp/check_submission && /tmp/check_submission\n"] min_timeout_sec: 1.0 max_timeout_sec: 180.0
+Sending keys: ["printf '%s\\n' '-- verdict --'; cat /workspace/submission/verdict.txt; printf '%s\\n' '-- counterexample --'; cat /workspace/submission/counterexample.json; printf '%s\\n' '-- submission files --'; find /workspace/submission -maxdepth 3 -type f -print | sort\n"] min_timeout_sec: 0.2 max_timeout_sec: 180.0
+Trajectory dumped to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/agent/trajectory.json
+Trajectory dumped to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/agent/trajectory.json
+Trajectory dumped to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/agent/trajectory.json
+Failed to download artifact '/workspace/submission/verdict.json' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/verdict.json /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/verdict.json. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/verdict.json to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/verdict.json Copying
+Error response from daemon: Could not find the file /workspace/submission/verdict.json in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/constants.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/constants.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/constants.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/constants.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/constants.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/constants.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/word_math.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/word_math.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/word_math.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/word_math.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/word_math.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/word_math.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/reciprocal_div.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/reciprocal_div.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/reciprocal_div.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/reciprocal_div.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/reciprocal_div.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/reciprocal_div.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/broadword_swar.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/broadword_swar.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/broadword_swar.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/broadword_swar.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/broadword_swar.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/broadword_swar.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/montgomery_field.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/montgomery_field.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/montgomery_field.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/montgomery_field.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/montgomery_field.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/montgomery_field.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/goldilocks_field.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/goldilocks_field.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/goldilocks_field.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/goldilocks_field.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/goldilocks_field.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/goldilocks_field.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/fee_schedule.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/fee_schedule.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/fee_schedule.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/fee_schedule.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/fee_schedule.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/fee_schedule.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/liquidity_pool.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/liquidity_pool.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/liquidity_pool.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/liquidity_pool.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/liquidity_pool.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/liquidity_pool.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/transcript_codec.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/transcript_codec.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/transcript_codec.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/transcript_codec.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/transcript_codec.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/transcript_codec.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 
+Failed to download artifact '/workspace/submission/src/clearing_pipeline.rs' (best-effort)
+Traceback (most recent call last):
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/trial/artifact_handler.py", line 195, in _download_artifact
+    await source_env.download_file(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 614, in download_file
+    await self._platform.download_file(source_path, target_path)
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker_unix.py", line 48, in download_file
+    await self._env._run_docker_compose_command(
+  File "/tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker.py", line 417, in _run_docker_compose_command
+    raise RuntimeError(
+RuntimeError: Docker compose command failed for environment openpql-vulnerable-noproof. Command: docker compose --project-name gpt-6-1-sol-high-openpql-vulnera__4avwiky --project-directory /tmp/rsvh-noproof-family/gpt-6.1-sol-high-openpql-vulnerable-noproof/environment -f /tmp/tmpqubw75hr/gpt-6.1-sol-high-openpql-vulnera__4avWiKy-docker-compose-resources.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-prebuilt.yaml -f /tmp/tmpdgvvyzij/docker-compose-mounts.json -f /tmp/harbor09/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-no-network.yaml cp main:/workspace/submission/src/clearing_pipeline.rs /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/clearing_pipeline.rs. Return code: 1. Stdout:  gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1 copy gpt-6-1-sol-high-openpql-vulnera__4avwiky-main-1:/workspace/submission/src/clearing_pipeline.rs to /tmp/rvb-hardcore-v4/evidence/v3-noproof/gpt-6.1-sol-high/gpt-6.1-sol-high-openpql-vulnerable-noproof/gpt-6.1-sol-high-openpql-vulnera__4avWiKy/artifacts/clearing_pipeline.rs Copying
+Error response from daemon: Could not find the file /workspace/submission/src/clearing_pipeline.rs in container 12c7fc84e5ce0ac2bb2f98837dd4e4c4ce7f77b3fb1259890c01a3a532ac05ef
+. Stderr: None. 

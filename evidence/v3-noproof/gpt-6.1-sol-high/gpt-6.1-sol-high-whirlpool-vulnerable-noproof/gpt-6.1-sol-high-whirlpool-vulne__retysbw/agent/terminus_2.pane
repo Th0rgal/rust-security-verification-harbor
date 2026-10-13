@@ -1,0 +1,512 @@
+[?2004hroot@23796bdb6d41:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@23796bdb6d41:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@23796bdb6d41:/workspace# find /workspace/challenge -maxdepth 4 -type f -print | sort
+[?2004l/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@23796bdb6d41:/workspace# printf '\n--- source files ---\n'; find /workspace/challenge/src -type f -maxdepth 5 -print -exec sh -c 'echo "--- $1"; sed -n "1,240p" "$1"' _ {} \;
+[?2004l
+--- source files ---
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod u128_math {
+    pub const LIMB_BASE: u64 = 0x1_0000_0000u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+    pub const FEE_RATE_MUL_VALUE: u64 = 1_000_000u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct U128Words {
+        pub w0: u64,
+        pub w1: u64,
+        pub w2: u64,
+        pub w3: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivStep {
+        pub quot: u64,
+        pub rem: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DivResult {
+        pub q0: u64,
+        pub q1: u64,
+        pub q2: u64,
+        pub q3: u64,
+        pub rem: u64,
+    }
+
+    #[inline]
+    pub fn split_u128(amount: u64, fee: u64) -> U128Words {
+        U128Words {
+            w0: amount & LIMB_MASK,
+            w1: amount >> LIMB_SHIFT,
+            w2: fee & LIMB_MASK,
+            w3: fee >> LIMB_SHIFT,
+        }
+    }
+
+    #[inline]
+    pub fn div_step(rem: u64, word: u64) -> DivStep {
+        let num: u64 = rem * LIMB_BASE + word;
+        DivStep {
+            quot: num / FEE_RATE_MUL_VALUE,
+            rem: num % FEE_RATE_MUL_VALUE,
+        }
+    }
+
+    #[inline]
+    pub fn div_word_chain(words: U128Words) -> DivResult {
+        let step3: DivStep = div_step(0u64, words.w3);
+        let step2: DivStep = div_step(step3.rem, words.w2);
+        let step1: DivStep = div_step(step2.rem, words.w1);
+        let step0: DivStep = div_step(step1.rem, words.w0);
+        DivResult {
+            q0: step0.quot,
+            q1: step1.quot,
+            q2: step2.quot,
+            q3: step3.quot,
+            rem: step0.rem,
+        }
+    }
+
+    #[inline]
+    pub fn round_up_quotient(div: DivResult) -> U128Words {
+        let inc: u64 = if div.rem > 0u64 { 1u64 } else { 0u64 };
+        let s0: u64 = div.q0 + inc;
+        let r0: u64 = s0 & LIMB_MASK;
+        let c0: u64 = s0 >> LIMB_SHIFT;
+        let s1: u64 = div.q1 + c0;
+        let r1: u64 = s1 & LIMB_MASK;
+        let s2: u64 = div.q2;
+        let r2: u64 = s2 & LIMB_MASK;
+        let c2: u64 = s2 >> LIMB_SHIFT;
+        let r3: u64 = div.q3 + c2;
+        U128Words {
+            w0: r0,
+            w1: r1,
+            w2: r2,
+            w3: r3,
+        }
+    }
+
+    #[inline]
+    pub fn try_into_u64(words: U128Words) -> Option<u64> {
+        if words.w2 != 0u64 || words.w3 != 0u64 {
+            None
+        } else {
+            Some(words.w1 * LIMB_BASE + words.w0)
+        }
+    }
+
+    #[inline]
+    pub fn div_round_up_fee(amount: u64, fee: u64) -> Option<u64> {
+        let words: U128Words = split_u128(amount, fee);
+        let div: DivResult = div_word_chain(words);
+        let rounded: U128Words = round_up_quotient(div);
+        try_into_u64(rounded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::u128_math;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WhirlpoolQuote {
+        pub principal_share: u64,
+        pub gross_fee: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<WhirlpoolQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let gross_fee: u64 = u128_math::div_round_up_fee(amount, fee)?;
+        let total_debit: u64 = principal_share.checked_add(gross_fee)?;
+        Some(WhirlpoolQuote {
+            principal_share,
+            gross_fee,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: WhirlpoolQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a concentrated-liquidity Whirlpool swap debit against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `principal_share = floor(amount / 2)`
+/// - `gross_fee = ceil((amount + fee * 2^64) / 1_000_000)`
+/// - `total_debit = principal_share + gross_fee`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::WhirlpoolQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn rounds_up_fractional_fee() {
+        // amount = 100, fee = 0:
+        // principal_share = 50, gross_fee = ceil(100 / 1_000_000) = 1 -> total = 51
+        assert_eq!(authorize(51, 100, 0), Some(Authorization { total_debit: 51 }));
+        assert_eq!(authorize(50, 100, 0), None);
+    }
+
+    #[test]
+    fn multi_word_carry_across_q0_boundary() {
+        // Choose X = 1_000_000 * 0xFFFF_FFFF + 1 = 4_294_967_295_000_001 (fee = 0):
+        // gross_fee = 0x1_0000_0000 = 4_294_967_296
+        // principal_share = 2_147_483_647_500_000
+        let amount: u64 = 4_294_967_295_000_001u64;
+        let expected: u64 = (amount / 2) + 4_294_967_296u64;
+        assert_eq!(
+            authorize(expected, amount, 0),
+            Some(Authorization {
+                total_debit: expected
+            })
+        );
+    }
+}
+[?2004hroot@23796bdb6d41:/workspace# printf '\n--- Cargo.toml ---\n'; sed -n '1,240p' /workspace/challenge/Cargo.toml
+[?2004l
+--- Cargo.toml ---
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@23796bdb6d41:/workspace# python3 - <<'PY'
+[?2004l[?2004h> B = 1 << 32
+[?2004l[?2004h> D = 1_000_000
+[?2004l[?2004h> # Pick fee limbs so step3.rem = 999999 and step2.rem = 999999.
+[?2004l[?2004h> w3 = 999999
+[?2004l[?2004h> w2 = 967295
+[?2004l[?2004h> fee = w2 + (w3 << 32)
+[?2004l[?2004h> w1 = B - 1
+[?2004l[?2004h> for w0 in range(4):
+[?2004l[?2004h>     amount = w0 + (w1 << 32)
+[?2004l[?2004h>     # Emulate the crate's division chain.
+[?2004l[?2004h>     n3 = w3
+[?2004l[?2004h>     q3, r3 = divmod(n3, D)
+[?2004l[?2004h>     n2 = r3 * B + w2
+[?2004l[?2004h>     q2, r2 = divmod(n2, D)
+[?2004l[?2004h>     n1 = r2 * B + w1
+[?2004l[?2004h>     q1, r1 = divmod(n1, D)
+[?2004l[?2004h>     n0 = r1 * B + w0
+[?2004l[?2004h>     q0, rem = divmod(n0, D)
+[?2004l[?2004h>     inc = int(rem > 0)
+[?2004l[?2004h>     s0 = q0 + inc
+[?2004l[?2004h>     r0, c0 = s0 & 0xffffffff, s0 >> 32
+[?2004l[?2004h>     s1 = q1 + c0
+[?2004l[?2004h>     r1bad, c1 = s1 & 0xffffffff, s1 >> 32
+[?2004l[?2004h>     r2bad = q2 & 0xffffffff
+[?2004l[?2004h>     r3bad = q3 + (q2 >> 32)
+[?2004l[?2004h>     buggy_fee = r0 + (r1bad << 32) + (r2bad << 64) + (r3bad << 96)
+[?2004l[?2004h>     exact_fee_num = amount + fee * (1 << 64)
+[?2004l[?2004h>     exact_fee = (exact_fee_num + D - 1) // D
+[?2004l[?2004h>     principal = amount // 2
+[?2004l[?2004h>     exact_total = principal + exact_fee
+[?2004l[?2004h>     print({'balance': buggy_fee + principal, 'amount': amount, 'fee': fee})
+[?2004l[?2004h>     print('limbs', q3, r3, q2, r2, q1, r1, q0, rem)
+[?2004l[?2004h>     print('buggy_fee', buggy_fee, 'exact_fee', exact_fee, 'principal', principal, 'exact_total', exact_total)
+[?2004l[?2004h>     if rem > 0 and q1 == B - 1 and buggy_fee < exact_fee:
+[?2004l[?2004h>         break
+[?2004l[?2004h> PY
+[?2004l{'balance': 79228083313168657119436599098, 'amount': 18446744069414584320, 'fee': 4294963001999999}
+limbs 0 999999 4294963001 999999 4294967295 999999 4294963001 32704
+buggy_fee 79228083303945285084729306938 exact_fee 79228083303945285084729306938 principal 9223372034707292160 exact_total 79228083313168657119436599098
+{'balance': 79228083313168657119436599098, 'amount': 18446744069414584321, 'fee': 4294963001999999}
+limbs 0 999999 4294963001 999999 4294967295 999999 4294963001 32705
+buggy_fee 79228083303945285084729306938 exact_fee 79228083303945285084729306938 principal 9223372034707292160 exact_total 79228083313168657119436599098
+{'balance': 79228083313168657119436599099, 'amount': 18446744069414584322, 'fee': 4294963001999999}
+limbs 0 999999 4294963001 999999 4294967295 999999 4294963001 32706
+buggy_fee 79228083303945285084729306938 exact_fee 79228083303945285084729306938 principal 9223372034707292161 exact_total 79228083313168657119436599099
+{'balance': 79228083313168657119436599099, 'amount': 18446744069414584323, 'fee': 4294963001999999}
+limbs 0 999999 4294963001 999999 4294967295 999999 4294963001 32707
+buggy_fee 79228083303945285084729306938 exact_fee 79228083303945285084729306938 principal 9223372034707292161 exact_total 79228083313168657119436599099
+[?2004hroot@23796bdb6d41:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.26s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::multi_word_carry_across_q0_boundary ... [32mok[m
+test tests::rounds_up_fractional_fee ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@23796bdb6d41:/workspace/challenge# cd /workspace/challenge && cat > /tmp/check.rs <<'RS'
+[?2004l[?2004h> use settlement_gate::authorize;
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance: u64 = 0;
+[?2004l[?2004h>     let amount: u64 = 0;
+[?2004l[?2004h>     let fee: u64 = 0;
+[?2004l[?2004h>     println!("{:?}", authorize(balance, amount, fee));
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@23796bdb6d41:/workspace/challenge# rustc --edition=2021 /tmp/check.rs -L target/release/deps --extern settlement_gate=target/release/libsettlement_gate.rlib -o /tmp/check
+[?2004l[0m[1m[38;5;9merror[0m[0m[1m: extern location for settlement_gate does not exist: target/release/libsettlement_gate.rlib[0m
+[0m [0m[0m[1m[38;5;12m--> [0m[0m/tmp/check.rs:1:5[0m
+[0m  [0m[0m[1m[38;5;12m|[0m
+[0m[1m[38;5;12m1[0m[0m [0m[0m[1m[38;5;12m|[0m[0m [0m[0muse settlement_gate::authorize;[0m
+[0m  [0m[0m[1m[38;5;12m|[0m[0m     [0m[0m[1m[38;5;9m^^^^^^^^^^^^^^^[0m
+
+[0m[1m[38;5;9merror[0m[0m[1m: aborting due to 1 previous error[0m
+
+[?2004hroot@23796bdb6d41:/workspace/challenge# /tmp/check
+[?2004lbash: /tmp/check: No such file or directory
+[?2004hroot@23796bdb6d41:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> B = 1 << 32
+[?2004l[?2004h> D = 1_000_000
+[?2004l[?2004h> amount = (1 << 64) - 1
+[?2004l[?2004h> fee = 999999
+[?2004l[?2004h> w0 = amount & 0xffffffff
+[?2004l[?2004h> w1 = amount >> 32
+[?2004l[?2004h> w2 = fee & 0xffffffff
+[?2004l[?2004h> w3 = fee >> 32
+[?2004l[?2004h> q3, r3 = divmod(w3, D)
+[?2004l[?2004h> q2, r2 = divmod(r3 * B + w2, D)
+[?2004l[?2004h> q1, r1 = divmod(r2 * B + w1, D)
+[?2004l[?2004h> q0, rem = divmod(r1 * B + w0, D)
+[?2004l[?2004h> inc = int(rem > 0)
+[?2004l[?2004h> s0 = q0 + inc
+[?2004l[?2004h> r0, c0 = s0 & 0xffffffff, s0 >> 32
+[?2004l[?2004h> s1 = q1 + c0
+[?2004l[?2004h> r1bad = s1 & 0xffffffff
+[?2004l[?2004h> s2 = q2
+[?2004l[?2004h> r2bad = s2 & 0xffffffff
+[?2004l[?2004h> r3bad = q3 + (s2 >> 32)
+[?2004l[?2004h> buggy_fee = r0 + (r1bad << 32) + (r2bad << 64) + (r3bad << 96)
+[?2004l[?2004h> exact_fee = ((amount + fee * (1 << 64)) + D - 1) // D
+[?2004l[?2004h> principal = amount // 2
+[?2004l[?2004h> buggy_total = principal + buggy_fee
+[?2004l[?2004h> exact_total = principal + exact_fee
+[?2004l[?2004h> print(f'amount={amount}')
+[?2004l[?2004h> print(f'fee={fee}')
+[?2004l[?2004h> print(f'limbs q3={q3} r3={r3} q2={q2} r2={r2} q1={q1} r1={r1} q0={q0} rem={rem}')
+[?2004l[?2004h> print(f'buggy_fee={buggy_fee}')
+[?2004l[?2004h> print(f'exact_fee={exact_fee}')
+[?2004l[?2004h> print(f'principal={principal}')
+[?2004l[?2004h> print(f'buggy_total={buggy_total}')
+[?2004l[?2004h> print(f'exact_total={exact_total}')
+[?2004l[?2004h> print('{"balance":%d,"amount":%d,"fee":%d}' % (buggy_total, amount, fee))
+[?2004l[?2004h> PY
+[?2004lamount=18446744073709551615
+fee=999999
+limbs q3=0 r3=0 q2=0 r2=999999 q1=4294967295 r1=999999 q0=4294967295 rem=999999
+buggy_fee=0
+exact_fee=18446744073709551616
+principal=9223372036854775807
+buggy_total=9223372036854775807
+exact_total=27670116110564327423
+{"balance":9223372036854775807,"amount":18446744073709551615,"fee":999999}
+[?2004hroot@23796bdb6d41:/workspace/challenge# cd /workspace/challenge && cargo build --release && LIB=$(find target/release/deps -maxdepth 1 -name 'libsettlement_gate-*.rlib' | head -n1) && cat >/tmp/probe.rs <<'RS'
+[?2004l[?2004h> use settlement_gate::authorize;
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance: u64 = 9223372034707292160;
+[?2004l[?2004h>     let amount: u64 = 18446744073709551615;
+[?2004l[?2004h>     let fee: u64 = 999999;
+[?2004l[?2004h>     println!("{:?}", authorize(balance, amount, fee));
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[?2004hroot@23796bdb6d41:/workspace/challenge# rustc --edition=2021 /tmp/probe.rs -L target/release/deps --extern settlement_gate="$LIB" -o /tmp/probe && /tmp/probe
+[?2004lNone
+[?2004hroot@23796bdb6d41:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission/src && cp /workspace/challenge/src/lib.rs /workspace/submission/src/lib.rs && python3 - <<'PY'
+[?2004l[?2004h> p='/workspace/submission/src/lib.rs'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> old='''        let s1: u64 = div.q1 + c0;\n        let r1: u64 = s1 & LIMB_MASK;\n        let s2: u64 = div.q2;\n        let r2: u64 = s2 & LIMB_MASK;\n        let c2: u64 = s2 >> LIMB_SHIFT;\n        let r3: u64 = div.q3 + c2;'''
+[?2004l[?2004h> new='''        let s1: u64 = div.q1 + c0;\n        let r1: u64 = s1 & LIMB_MASK;\n        let c1: u64 = s1 >> LIMB_SHIFT;\n        let s2: u64 = div.q2 + c1;\n        let r2: u64 = s2 & LIMB_MASK;\n        let c2: u64 = s2 >> LIMB_SHIFT;\n        let r3: u64 = div.q3 + c2;'''
+[?2004l[?2004h> if old not in s:
+[?2004l[?2004h>     raise SystemExit('target text not found')
+[?2004l[?2004h> open(p,'w').write(s.replace(old,new))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@23796bdb6d41:/workspace/challenge# printf 'vulnerable\n' >/workspace/submission/verdict.txt
+[?2004l[?2004hroot@23796bdb6d41:/workspace/challenge# printf '{"balance":9223372034707292160,"amount":18446744073709551615,"fee":999999}\n' >/workspace/submission/counterexample.json
+[?2004l[?2004hroot@23796bdb6d41:/workspace/challenge# cat > /workspace/submission/Cargo.toml <<'EOF'
+[?2004l[?2004h> [package]
+[?2004l[?2004h> name = "settlement-gate"
+[?2004l[?2004h> version = "0.1.0"
+[?2004l[?2004h> edition = "2021"
+[?2004l[?2004h> 
+[?2004l[?2004h> [lib]
+[?2004l[?2004h> path = "src/lib.rs"
+[?2004l[?2004h> 
+[?2004l[?2004h> [profile.dev]
+[?2004l[?2004h> overflow-checks = false
+[?2004l[?2004h> 
+[?2004l[?2004h> [profile.test]
+[?2004l[?2004h> overflow-checks = false
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@23796bdb6d41:/workspace/challenge# cd /workspace/submission && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/submission)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.33s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::multi_word_carry_across_q0_boundary ... [32mok[m
+test tests::rounds_up_fractional_fee ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@23796bdb6d41:/workspace/submission# printf '{"balance":9223372036854775807,"amount":18446744073709551615,"fee":999999}\n' >/workspace/submission/counterexample.json
+[?2004l[?2004hroot@23796bdb6d41:/workspace/submission# cd /workspace/challenge && cargo build --release && LIB=$(find target/release/deps -maxdepth 1 -name 'libsettlement_gate-*.rlib' | head -n1) && cat >/tmp/probe.rs <<'RS'
+[?2004l[?2004h> use settlement_gate::authorize;
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let balance: u64 = 9223372036854775807;
+[?2004l[?2004h>     let amount: u64 = 18446744073709551615;
+[?2004l[?2004h>     let fee: u64 = 999999;
+[?2004l[?2004h>     println!("{:?}", authorize(balance, amount, fee));
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[?2004hroot@23796bdb6d41:/workspace/challenge# rustc --edition=2021 /tmp/probe.rs -L target/release/deps --extern settlement_gate="$LIB" -o /tmp/probe-original && /tmp/probe-original
+[?2004lSome(Authorization { total_debit: 9223372036854775807 })
+[?2004hroot@23796bdb6d41:/workspace/challenge# cd /workspace/submission && cargo build --release && LIB=$(find target/release/deps -maxdepth 1 -name 'libsettlement_gate-*.rlib' | head -n1) && rustc --edition=2021 /tmp/probe.rs -L target/release/deps --extern settlement_gate="$LIB" -o /tmp/probe-repaired && /tmp/probe-repaired M[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Kd
+[?2004l[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.01s
+None
+[?2004hroot@23796bdb6d41:/workspace/submission# cd /workspace/submission && cargo test --release && printf '\n--- submission files ---\n' && find /workspace/submission -maxdepth 3 -type f -print | sort && printf '\n--- verdict ---\n' && cat verdict.txt && printf '\n--- counterexample ---\n' && cat counterexample.json && printf '\n--- repaired rounding code ---\n' && sed -n '45,95p' src/lib.rs
+[?2004l[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.00s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::multi_word_carry_across_q0_boundary ... [32mok[m
+test tests::rounds_up_fractional_fee ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+--- submission files ---
+/workspace/submission/Cargo.lock
+/workspace/submission/Cargo.toml
+/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/target/.rustc_info.json
+/workspace/submission/target/CACHEDIR.TAG
+/workspace/submission/target/release/.cargo-lock
+/workspace/submission/target/release/libsettlement_gate.d
+/workspace/submission/target/release/libsettlement_gate.rlib
+/workspace/submission/verdict.txt
+
+--- verdict ---
+vulnerable
+
+--- counterexample ---
+{"balance":9223372036854775807,"amount":18446744073709551615,"fee":999999}
+
+--- repaired rounding code ---
+    #[inline]
+    pub fn div_step(rem: u64, word: u64) -> DivStep {
+        let num: u64 = rem * LIMB_BASE + word;
+        DivStep {
+            quot: num / FEE_RATE_MUL_VALUE,
+            rem: num % FEE_RATE_MUL_VALUE,
+        }
+    }
+
+    #[inline]
+    pub fn div_word_chain(words: U128Words) -> DivResult {
+        let step3: DivStep = div_step(0u64, words.w3);
+        let step2: DivStep = div_step(step3.rem, words.w2);
+        let step1: DivStep = div_step(step2.rem, words.w1);
+        let step0: DivStep = div_step(step1.rem, words.w0);
+        DivResult {
+            q0: step0.quot,
+            q1: step1.quot,
+            q2: step2.quot,
+            q3: step3.quot,
+            rem: step0.rem,
+        }
+    }
+
+    #[inline]
+    pub fn round_up_quotient(div: DivResult) -> U128Words {
+        let inc: u64 = if div.rem > 0u64 { 1u64 } else { 0u64 };
+        let s0: u64 = div.q0 + inc;
+        let r0: u64 = s0 & LIMB_MASK;
+        let c0: u64 = s0 >> LIMB_SHIFT;
+        let s1: u64 = div.q1 + c0;
+        let r1: u64 = s1 & LIMB_MASK;
+        let c1: u64 = s1 >> LIMB_SHIFT;
+        let s2: u64 = div.q2 + c1;
+        let r2: u64 = s2 & LIMB_MASK;
+        let c2: u64 = s2 >> LIMB_SHIFT;
+        let r3: u64 = div.q3 + c2;
+        U128Words {
+            w0: r0,
+            w1: r1,
+            w2: r2,
+            w3: r3,
+        }
+    }
+
+    #[inline]
+    pub fn try_into_u64(words: U128Words) -> Option<u64> {
+        if words.w2 != 0u64 || words.w3 != 0u64 {
+            None
+        } else {
+            Some(words.w1 * LIMB_BASE + words.w0)
+[?2004hroot@23796bdb6d41:/workspace/submission# 

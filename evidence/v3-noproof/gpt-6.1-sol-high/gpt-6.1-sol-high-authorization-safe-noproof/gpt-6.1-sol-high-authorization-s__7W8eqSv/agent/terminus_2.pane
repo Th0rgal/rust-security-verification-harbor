@@ -1,0 +1,87 @@
+[?2004hroot@a7f87b45dee6:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a7f87b45dee6:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@a7f87b45dee6:/workspace# pwd && printf '\n-- workspace --\n' && find /workspace -maxdepth 3 -type f -printf '%p\n' | sort
+[?2004l/workspace
+
+-- workspace --
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@a7f87b45dee6:/workspace# printf '\n-- source tree --\n' && find /workspace/challenge/src -maxdepth 5 -type f -print -exec sh -c 'echo "--- $1"; sed -n "1,240p" "$1"' sh {} \;
+[?2004l
+-- source tree --
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs
+//! Local arithmetic authorization exercise.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+/// Authorize a transfer before it is sent to a wider-integer settlement layer.
+///
+/// Policy: principal plus fee must not exceed the account balance.
+/// Authorize every affordable payment and reject every unaffordable payment.
+/// The returned debit is the principal plus fees actually applied at settlement.
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let total = amount.checked_add(fee)?;
+    (total <= balance).then_some(Authorization { total_debit: total })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_payment() {
+        assert_eq!(authorize(110, 100, 10).unwrap().total_debit, 110);
+        assert_eq!(authorize(109, 100, 10), None);
+    }
+}
+[?2004hroot@a7f87b45dee6:/workspace# printf '\n-- cargo metadata/files --\n' && find /workspace/challenge -maxdepth 3 -type f -not -path '*/target/*' -print | sort && if [ -f /workspace/challenge/Cargo.toml ]; then cat /workspace/challenge/Cargo.toml; fi
+[?2004l
+-- cargo metadata/files --
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@a7f87b45dee6:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.24s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 1 test
+test tests::ordinary_payment ... [32mok[m
+
+test result: [32mok[m. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@a7f87b45dee6:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission && printf 'safe\n' > /workspace/submission/verdict.txt && rm -f /workspace/submission/counterexample.json && rm -rf /workspace/submission/src
+[?2004l[?2004hroot@a7f87b45dee6:/workspace/challenge# printf '%s\n' '-- submission --' && find /workspace/submission -maxdepth 2 -print -exec sh -c 'if [ -f "$1" ]; then echo "--- $1"; cat "$1"; fi' sh {} \; && test "$(cat /workspace/submission/verdict.txt)" = safe && test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src && echo 'submission verified'
+[?2004l-- submission --
+/workspace/submission
+/workspace/submission/verdict.txt
+--- /workspace/submission/verdict.txt
+safe
+submission verified
+[?2004hroot@a7f87b45dee6:/workspace/challenge# 

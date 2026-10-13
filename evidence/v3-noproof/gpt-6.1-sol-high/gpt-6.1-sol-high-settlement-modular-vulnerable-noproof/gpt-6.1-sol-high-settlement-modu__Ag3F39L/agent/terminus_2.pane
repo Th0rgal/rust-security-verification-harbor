@@ -1,0 +1,751 @@
+[?2004hroot@62135d6401cf:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@62135d6401cf:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@62135d6401cf:/workspace# pwd; printf '\n--- workspace ---\n'; find /workspace -maxdepth 3 -type f -printf '%p\n' | sort
+[?2004l/workspace
+
+--- workspace ---
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@62135d6401cf:/workspace# printf '\n--- source tree ---\n'; find /workspace/challenge/src -maxdepth 5 -type f -print -exec sh -c 'echo "--- $1 ---"; sed -n "1,240p" "$1"' _ {} \;
+[?2004l
+--- source tree ---
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs ---
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod constants {
+    /// Basis-point denominator (100% = 10_000 bps).
+    pub const BPS_DENOM: u64 = 10_000;
+    /// Ceiling-division bias for `BPS_DENOM` (`BPS_DENOM - 1`).
+    pub const BPS_MAX_REM: u64 = 9_999;
+    /// Floor quotient of `2^64` by `BPS_DENOM`: `floor(2^64 / 10_000)`.
+    pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+    /// Exact remainder of `2^64` modulo `BPS_DENOM`: `2^64 % 10_000 = 1_616`.
+    pub const U64_MOD_BPS_REM: u64 = 1_616;
+    /// Protocol tier rebate divisor (10% rebate on gross fee, rounded down).
+    pub const REBATE_DIVISOR: u64 = 10;
+    /// Reference liquidity band threshold for diagnostics.
+    pub const HIGH_VALUE_THRESHOLD: u64 = 1_000_000_000_000;
+}
+
+pub mod bps_math {
+    use crate::constants::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SumFold {
+        pub low_word: u64,
+        pub wrapped_u64: bool,
+    }
+
+    /// Folds the unbounded notional sum `amount + fee` into a 64-bit low word
+    /// and an explicit `2^64` carry flag without `u128` promotion.
+    #[inline]
+    pub fn fold_u64_sum(amount: u64, fee: u64) -> SumFold {
+        let low_word = amount.wrapping_add(fee);
+        let wrapped_u64 = low_word < amount;
+        SumFold { low_word, wrapped_u64 }
+    }
+
+    /// Computes the floor basis-point levy `floor((amount + fee) / 10_000)`
+    /// in pure `u64` arithmetic across the `2^64` boundary.
+    #[inline]
+    pub fn floor_div_bps_folded(fold: SumFold) -> u64 {
+        if fold.wrapped_u64 {
+            let rem_sum = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + (rem_sum / BPS_DENOM)
+        } else {
+            fold.low_word / BPS_DENOM
+        }
+    }
+
+    /// Computes the ceiling basis-point levy `ceil((amount + fee) / 10_000)`
+    /// in pure `u64` arithmetic from a folded 64-bit sum.
+    #[inline]
+    pub fn ceil_div_bps_folded(fold: SumFold) -> u64 {
+        if fold.wrapped_u64 {
+            let folded_rem = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+        } else {
+            let biased = fold.low_word.wrapping_add(BPS_MAX_REM);
+            if biased < fold.low_word {
+                (fold.low_word / BPS_DENOM) + ((biased + U64_MOD_BPS_REM) / BPS_DENOM)
+            } else {
+                biased / BPS_DENOM
+            }
+        }
+    }
+}
+
+pub mod rebate {
+    use crate::constants::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FeeBreakdown {
+        pub gross_fee: u64,
+        pub rebate: u64,
+        pub net_fee: u64,
+    }
+
+    /// Computes the floor tier rebate `floor(gross_fee / 10)` in favor of the protocol.
+    #[inline]
+    pub fn tier_rebate_floor(gross_fee: u64) -> u64 {
+        gross_fee / REBATE_DIVISOR
+    }
+
+    /// Assembles the gross fee, floor rebate, and net settlement fee `gross_fee - rebate`.
+    #[inline]
+    pub fn compute_fee_breakdown(gross_fee: u64) -> FeeBreakdown {
+        let rebate = tier_rebate_floor(gross_fee);
+        let net_fee = gross_fee - rebate;
+        FeeBreakdown { gross_fee, rebate, net_fee }
+    }
+
+    /// Diagnostic helper checking whether a fee breakdown qualifies as high-volume.
+    #[inline]
+    pub fn is_high_volume_levy(breakdown: FeeBreakdown) -> bool {
+        breakdown.gross_fee >= HIGH_VALUE_THRESHOLD
+    }
+}
+
+pub mod quote {
+    use crate::Authorization;
+    use crate::rebate::FeeBreakdown;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SettlementQuote {
+        pub principal: u64,
+        pub net_fee: u64,
+        pub total_debit: u64,
+    }
+
+    /// Combines the payment principal `amount` with `breakdown.net_fee`, rejecting
+    /// if the resulting settlement debit exceeds `u64::MAX`.
+    #[inline]
+    pub fn build_settlement_quote(amount: u64, breakdown: FeeBreakdown) -> Option<SettlementQuote> {
+        let total_debit = amount.checked_add(breakdown.net_fee)?;
+        Some(SettlementQuote {
+            principal: amount,
+            net_fee: breakdown.net_fee,
+            total_debit,
+        })
+    }
+
+    /// Authorizes the settlement quote iff `quote.total_debit <= balance`.
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: SettlementQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization { total_debit: quote.total_debit })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+///
+/// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+/// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+/// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+///    rounded down (`floor(gross_fee / 10)`).
+/// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+///
+/// Authorize every affordable transfer (`total_debit <= balance`) and return
+/// the exact net settlement debit; reject every unaffordable transfer (`None`).
+/// Target word constraint: production code must use `u64` only (no `u128`).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let fold = bps_math::fold_u64_sum(amount, fee);
+    let gross_fee = bps_math::ceil_div_bps_folded(fold);
+    let breakdown = rebate::compute_fee_breakdown(gross_fee);
+    let settlement_quote = quote::build_settlement_quote(amount, breakdown)?;
+    quote::verify_affordability(balance, settlement_quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_settlement() {
+        assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+        assert_eq!(authorize(100_011, 100_000, 25_000), None);
+    }
+
+    #[test]
+    fn ceiling_rounding_and_rebate() {
+        assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+        assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+        assert_eq!(authorize(8, 0, 99_991), None);
+    }
+
+    #[test]
+    fn wide_basis_carry_folding() {
+        let expected = 1_660_206_966_643_862;
+        assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_bias_wrap_at_u64_max() {
+        let expected = 1_660_206_966_633_861;
+        assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+        assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+    }
+
+    #[test]
+    fn total_debit_overflow_rejected() {
+        assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+        assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn floor_div_helper_matches_exact_quotient() {
+        let fold = bps_math::fold_u64_sum(10_000, 18_446_744_073_709_550_000);
+        assert_eq!(bps_math::floor_div_bps_folded(fold), 1_844_674_407_370_956);
+    }
+}
+[?2004hroot@62135d6401cf:/workspace# printf '\n--- Cargo.toml ---\n'; cat /workspace/challenge/Cargo.toml 2>/dev/null || true; printf '\n--- tests ---\n'; find /workspace/challenge -maxdepth 4 -type f \( -name '*test*' -o -path '*/tests/*' \) -print
+[?2004l
+--- Cargo.toml ---
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+
+--- tests ---
+[?2004hroot@62135d6401cf:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.30s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 6 tests
+test tests::ceiling_bias_wrap_at_u64_max ... [32mok[m
+test tests::ceiling_rounding_and_rebate ... [32mok[m
+test tests::floor_div_helper_matches_exact_quotient ... [32mok[m
+test tests::ordinary_settlement ... [32mok[m
+test tests::total_debit_overflow_rejected ... [32mok[m
+test tests::wide_basis_carry_folding ... [32mok[m
+
+test result: [32mok[m. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@62135d6401cf:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> import random
+[?2004l[?2004h> U=(1<<64)
+[?2004l[?2004h> D=10000
+[?2004l[?2004h> Q=U//D
+[?2004l[?2004h> R=U%D
+[?2004l[?2004h> 
+[?2004l[?2004h> def folded_ceil(a,f):
+[?2004l[?2004h>     low=(a+f)&(U-1)
+[?2004l[?2004h>     wrapped=low<a
+[?2004l[?2004h>     if wrapped:
+[?2004l[?2004h>         folded_rem=(low%D)+R
+[?2004l[?2004h>         return Q+(low//D)+((folded_rem+D-1)//D)
+[?2004l[?2004h>     biased=(low+(D-1))&(U-1)
+[?2004l[?2004h>     if biased<low:
+[?2004l[?2004h>         return (low//D)+((biased+R)//D)
+[?2004l[?2004h>     return biased//D
+[?2004l[?2004h> 
+[?2004l[?2004h> def rust_policy(b,a,f):
+[?2004l[?2004h>     gross=folded_ceil(a,f)
+[?2004l[?2004h>     net=gross-gross//10
+[?2004l[?2004h>     total=a+net
+[?2004l[?2004h>     return total if total<=b and total < U else None
+[?2004l[?2004h> 
+[?2004l[?2004h> def exact_policy(b,a,f):
+[?2004l[?2004h>     gross=((a+f)+D-1)//D
+[?2004l[?2004h>     net=gross-gross//10
+[?2004l[?2004h>     total=a+net
+[?2004l[?2004h>     return total if total<=b and total<U else None
+[?2004l[?2004h> 
+[?2004l[?2004h> vals=[0,1,2,9,10,9998,9999,10000,10001,1844674407370955,1844674407370956,(1<<64)-10000,(1<<64)-9999,(1<<64)-9998,(1<<64)-2,(1<<64)-1]
+[?2004l[?2004h> for a in vals:
+[?2004l[?2004h>   for f in vals:
+[?2004l[?2004h>     assert folded_ceil(a,f)==((a+f+D-1)//D), (a,f,folded_ceil(a,f),((a+f+D-1)//D))
+[?2004l[?2004h> for _ in range(200000):
+[?2004l[?2004h>     a=random.randrange(U); f=random.randrange(U); b=random.randrange(U)
+[?2004l[?2004h>     assert rust_policy(b,a,f)==exact_policy(b,a,f), (b,a,f,rust_policy(b,a,f),exact_policy(b,a,f))
+[?2004l[?2004h> print('differential verification passed: boundary cases and 200000 random u64 triples')
+[?2004l[?2004h> PY
+[?2004lTraceback (most recent call last):
+  File "<stdin>", line 33, in <module>
+AssertionError: (0, 18446744073709541617, 1844674407370954, 1844674407370955)
+[?2004hroot@62135d6401cf:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission && printf 'safe\n' > /workspace/submission/verdict.txt && test "$(cat /workspace/submission/verdict.txt)" = safe && test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src && find /workspace/submission -maxdepth 2 -type f -printf '%p: '; cat /workspace/submission/verdict.txt
+[?2004l/workspace/submission/verdict.txt: safe
+[?2004hroot@62135d6401cf:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> U=1<<64
+[?2004l[?2004h> D=10000
+[?2004l[?2004h> fee=U-9999
+[?2004l[?2004h> Q=U//D
+[?2004l[?2004h> orig_gross=(fee//D)+(((fee+D-1-U)+(U%D))//D)
+[?2004l[?2004h> exact_gross=(fee+D-1)//D
+[?2004l[?2004h> orig_net=orig_gross-orig_gross//10
+[?2004l[?2004h> exact_net=exact_gross-exact_gross//10
+[?2004l[?2004h> print('fee', fee)
+[?2004l[?2004h> print('orig_gross', orig_gross)
+[?2004l[?2004h> print('exact_gross', exact_gross)
+[?2004l[?2004h> print('orig_total', orig_net)
+[?2004l[?2004h> print('exact_total', exact_net)
+[?2004l[?2004h> print('difference', exact_net-orig_net)
+[?2004l[?2004h> PY
+[?2004lfee 18446744073709541617
+orig_gross 1844674407370954
+exact_gross 1844674407370955
+orig_total 1660206966633859
+exact_total 1660206966633860
+difference 1
+[?2004hroot@62135d6401cf:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission/src && printf 'vulnerable\n' > /workspace/submission/verdict.txt && python3 - <<'PY'
+[?2004l[?2004h> import json
+[?2004l[?2004h> U=1<<64
+[?2004l[?2004h> fee=U-9999
+[?2004l[?2004h> D=10000
+[?2004l[?2004h> biased=(fee+D-1)&(U-1)
+[?2004l[?2004h> orig_gross=fee//D+((biased+(U%D))//D)
+[?2004l[?2004h> orig_net=orig_gross-orig_gross//10
+[?2004l[?2004h> with open('/workspace/submission/counterexample.json','w') as f:
+[?2004l[?2004h>     json.dump({'balance':orig_net,'amount':0,'fee':fee},f,separators=(',',':'))
+[?2004l[?2004h>     f.write('\n')
+[?2004l[?2004h> print(open('/workspace/submission/counterexample.json').read(), end='')
+[?2004l[?2004h> PY
+[?2004l{"balance":1660206966633859,"amount":0,"fee":18446744073709541617}
+[?2004hroot@62135d6401cf:/workspace/challenge# cat > /workspace/submission/src/lib.rs <<'RS'
+[?2004l[?2004h> #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h> pub struct Authorization {
+[?2004l[?2004h>     pub total_debit: u64,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod constants {
+[?2004l[?2004h>     /// Basis-point denominator (100% = 10_000 bps).
+[?2004l64, breakdown: FeeBreakdown) -> Option<SettlementQuot[?2004h>     pub const BPS_DENOM: u64 = 10_000;
+[?2004l[?2004h>     /// Ceiling-division bias for `BPS_DENOM` (`BPS_DENOM - 1`).
+[?2004l[?2004h>     pub const BPS_MAX_REM: u64 = 9_999;
+[?2004l[?2004h>     /// Floor quotient of `2^64` by `BPS_DENOM`: `floor(2^64 / 10_000)`.
+[?2004l[?2004h>     pub const U64_MOD_BPS_QUOT: u64 = 1_844_674_407_370_955;
+[?2004l[?2004h>     /// Exact remainder of `2^64` modulo `BPS_DENOM`: `2^64 % 10_000 = 1_616`.
+[?2004l[?2004h>     pub const U64_MOD_BPS_REM: u64 = 1_616;
+[?2004l[?2004h>     /// Protocol tier rebate divisor (10% rebate on gross fee, rounded down).
+[?2004l[?2004h>     pub const REBATE_DIVISOR: u64 = 10;
+[?2004l[?2004h>     /// Reference liquidity band threshold for diagnostics.
+[?2004l[?2004h>     pub const HIGH_VALUE_THRESHOLD: u64 = 1_000_000_000_000;
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l.[?2004h> pub mod bps_math {
+[?2004l[?2004h>     use crate::constants::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h>     pub struct SumFold {
+[?2004l[?2004h>         pub low_word: u64,
+[?2004l[?2004h>         pub wrapped_u64: bool,
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Folds the unbounded notional sum `amount + fee` into a 64-bit low word
+[?2004l[?2004h>     /// and an explicit `2^64` carry flag without `u128` promotion.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn fold_u64_sum(amount: u64, fee: u64) -> SumFold {
+[?2004l[?2004h>         let low_word = amount.wrapping_add(fee);
+[?2004l[?2004h>         let wrapped_u64 = low_word < amount;
+[?2004l[?2004h>         SumFold { low_word, wrapped_u64 }
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Computes the floor basis-point levy `floor((amount + fee) / 10_000)`
+[?2004l[?2004h>     /// in pure `u64` arithmetic across the `2^64` boundary.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn floor_div_bps_folded(fold: SumFold) -> u64 {
+[?2004l[?2004h>         if fold.wrapped_u64 {
+[?2004l[?2004h>             let rem_sum = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+[?2004l[?2004h>             U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + (rem_sum / BPS_DENOM)
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             fold.low_word / BPS_DENOM
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Computes the ceiling basis-point levy `ceil((amount + fee) / 10_000)`
+[?2004l[?2004h>     /// in pure `u64` arithmetic from a folded 64-bit sum.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn ceil_div_bps_folded(fold: SumFold) -> u64 {
+[?2004l[?2004h>         if fold.wrapped_u64 {
+[?2004l[?2004h>             let folded_rem = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+[?2004l[?2004h>             U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             let biased = fold.low_word.wrapping_add(BPS_MAX_REM);
+[?2004l[?2004h>             if biased < fold.low_word {
+[?2004l[?2004h>                 // The bias addition overflowed.  The original sum is the
+[?2004l[?2004h>                 // non-wrapped low word itself, so compute its ceiling
+[?2004l[?2004h>                 // directly instead of trying to use the wrapped bias.
+[?2004l[?2004h>                 (fold.low_word / BPS_DENOM)
+[?2004l[?2004h>                     + if fold.low_word % BPS_DENOM == 0 { 0 } else { 1 }
+[?2004l[?2004h>             } else {
+[?2004l[?2004h>                 biased / BPS_DENOM
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod rebate {
+[?2004l[?2004h>     use crate::constants::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h>     pub struct FeeBreakdown {
+[?2004l[?2004h>         pub gross_fee: u64,
+[?2004l[?2004h>         pub rebate: u64,
+[?2004l[?2004h>         pub net_fee: u64,
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Computes the floor tier rebate `floor(gross_fee / 10)` in favor of the protocol.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn tier_rebate_floor(gross_fee: u64) -> u64 {
+[?2004l[?2004h>         gross_fee / REBATE_DIVISOR
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Assembles the gross fee, floor rebate, and net settlement fee `gross_fee - rebate`.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn compute_fee_breakdown(gross_fee: u64) -> FeeBreakdown {
+[?2004l[?2004h>         let rebate = tier_rebate_floor(gross_fee);
+[?2004l[?2004h>         let net_fee = gross_fee - rebate;
+[?2004l[?2004h>         FeeBreakdown { gross_fee, rebate, net_fee }
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Diagnostic helper checking whether a fee breakdown qualifies as high-volume.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn is_high_volume_levy(breakdown: FeeBreakdown) -> bool {
+[?2004l[?2004h>         breakdown.gross_fee >= HIGH_VALUE_THRESHOLD
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> pub mod quote {
+[?2004l[?2004h>     use crate::Authorization;
+[?2004l[?2004h>     use crate::rebate::FeeBreakdown;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[?2004l[?2004h>     pub struct SettlementQuote {
+[?2004l[?2004h>         pub principal: u64,
+[?2004l[?2004h>         pub net_fee: u64,
+[?2004l[?2004h>         pub total_debit: u64,
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Combines the payment principal `amount` with `breakdown.net_fee`, rejecting
+[?2004l[?2004h>     /// if the resulting settlement debit exceeds `u64::MAX`.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn build_settlement_quote(amount: u64, breakdown: FeeBreakdown) -> Option<SettlementQuote> {
+[?2004l[?2004h>         let total_debit = amount.checked_add(breakdown.net_fee)?;
+[?2004l[?2004h>         Some(SettlementQuote {
+[?2004l[?2004h>             principal: amount,
+[?2004l[?2004h>             net_fee: breakdown.net_fee,
+[?2004l[?2004h>             total_debit,
+[?2004l[?2004h>         })
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     /// Authorizes the settlement quote iff `quote.total_debit <= balance`.
+[?2004l[?2004h>     #[inline]
+[?2004l[?2004h>     pub fn verify_affordability(balance: u64, quote: SettlementQuote) -> Option<Authorization> {
+[?2004l[?2004h>         if quote.total_debit <= balance {
+[?2004l[?2004h>             Some(Authorization { total_debit: quote.total_debit })
+[?2004l[?2004h>         } else {
+[?2004l[?2004h>             None
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> /// Authorize a liquidity transfer in pure `u64` arithmetic before settlement.
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// Policy over exact unbounded integers (`balance`, `amount`, `fee`):
+[?2004l[?2004h> /// 1. The gross protocol fee is the combined basis `amount + fee` divided by
+[?2004l[?2004h> ///    `BPS_DENOM` (`10_000`), rounded up (`ceil((amount + fee) / 10_000)`).
+[?2004l[?2004h> /// 2. The tier rebate is `gross_fee` divided by `REBATE_DIVISOR` (`10`),
+[?2004l[?2004h> ///    rounded down (`floor(gross_fee / 10)`).
+[?2004l[?2004h> /// 3. The net settlement debit is `amount + (gross_fee - rebate)`.
+[?2004l[?2004h> ///
+[?2004l[?2004h> /// Authorize every affordable transfer (`total_debit <= balance`) and return
+[?2004l[?2004h> /// the exact net settlement debit; reject every unaffordable transfer (`None`).
+[?2004l[?2004h> /// Target word constraint: production code must use `u64` only (no `u128`).
+[?2004l[?2004h> pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+[?2004l[?2004h>     let fold = bps_math::fold_u64_sum(amount, fee);
+[?2004l[?2004h>     let gross_fee = bps_math::ceil_div_bps_folded(fold);
+[?2004l[?2004h>     let breakdown = rebate::compute_fee_breakdown(gross_fee);
+[?2004l[?2004h>     let settlement_quote = quote::build_settlement_quote(amount, breakdown)?;
+[?2004l[?2004h>     quote::verify_affordability(balance, settlement_quote)
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod tests {
+[?2004l[?2004h>     use super::*;
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn ordinary_settlement() {
+[?2004l[?2004h>         assert_eq!(authorize(100_012, 100_000, 25_000).unwrap().total_debit, 100_012);
+[?2004l[?2004h>         assert_eq!(authorize(100_011, 100_000, 25_000), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn ceiling_rounding_and_rebate() {
+[?2004l[?2004h>         assert_eq!(authorize(2, 1, 0).unwrap().total_debit, 2);
+[?2004l[?2004h>         assert_eq!(authorize(9, 0, 99_991).unwrap().total_debit, 9);
+[?2004l[?2004h>         assert_eq!(authorize(8, 0, 99_991), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn wide_basis_carry_folding() {
+[?2004l[?2004h>         let expected = 1_660_206_966_643_862;
+[?2004l[?2004h>         assert_eq!(authorize(expected, 10_000, u64::MAX).unwrap().total_debit, expected);
+[?2004l[?2004h>         assert_eq!(authorize(expected - 1, 10_000, u64::MAX), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn ceiling_bias_wrap_at_u64_max() {
+[?2004l[?2004h>         let expected = 1_660_206_966_633_861;
+[?2004l[?2004h>         assert_eq!(authorize(expected, 0, u64::MAX).unwrap().total_debit, expected);
+[?2004l[?2004h>         assert_eq!(authorize(expected - 1, 0, u64::MAX), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn total_debit_overflow_rejected() {
+[?2004l[?2004h>         assert_eq!(authorize(u64::MAX, u64::MAX, 1), None);
+[?2004l[?2004h>         assert_eq!(authorize(u64::MAX, u64::MAX, u64::MAX), None);
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn floor_div_helper_matches_exact_quotient() {
+[?2004l[?2004h>         let fold = bps_math::fold_u64_sum(10_000, 18_446_744_073_709_550_000);
+[?2004l[?2004h>         assert_eq!(bps_math::floor_div_bps_folded(fold), 1_844_674_407_370_956);
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@62135d6401cf:/workspace/challenge# cd /workspace/submission && cargo init --lib --name settlement-gate --quiet 2>/dev/null || true
+[?2004l[?2004hroot@62135d6401cf:/workspace/submission# rm -rf /tmp/repaired-check && mkdir -p /tmp/repaired-check/src && cp /workspace/submission/src/lib.rs /tmp/repaired-check/src/lib.rs && cat > /tmp/repaired-check/Cargo.toml <<'EOF'
+[?2004l[?2004h> [package]
+[?2004l[?2004h> name = "settlement-gate"
+[?2004l[?2004h> version = "0.1.0"
+[?2004l[?2004h> edition = "2021"
+[?2004l[?2004h> 
+[?2004l[?2004h> [lib]
+[?2004l[?2004h> path = "src/lib.rs"
+[?2004l[?2004h> 
+[?2004l[?2004h> [profile.release]
+[?2004l[?2004h> overflow-checks = false
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@62135d6401cf:/workspace/submission# cd /tmp/repaired-check && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/repaired-check)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.23s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 6 tests
+test tests::ceiling_bias_wrap_at_u64_max ... [32mok[m
+test tests::ceiling_rounding_and_rebate ... [32mok[m
+test tests::floor_div_helper_matches_exact_quotient ... [32mok[m
+test tests::ordinary_settlement ... [32mok[m
+test tests::total_debit_overflow_rejected ... [32mok[m
+test tests::wide_basis_carry_folding ... [32mok[m
+
+test result: [32mok[m. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@62135d6401cf:/tmp/repaired-check# cat >> /tmp/repaired-check/src/lib.rs <<'RS'
+[?2004l[?2004h> 
+[?2004l[?2004h> #[cfg(test)]
+[?2004l[?2004h> mod focused_repair_test {
+[?2004l[?2004h>     use super::authorize;
+[?2004l[?2004h>     #[test]
+[?2004l[?2004h>     fn repaired_counterexample_has_exact_debit() {
+[?2004l[?2004h>         let balance = 1660206966633860u64;
+[?2004l[?2004h>         let fee = 18446744073709541617u64;
+[?2004l[?2004h>         assert_eq!(authorize(balance, 0, fee), None);
+[?2004l[?2004h>         assert_eq!(authorize(1660206966633861u64, 0, fee).unwrap().total_debit, 1660206966633861u64);
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> RS
+[?2004l[?2004hroot@62135d6401cf:/tmp/repaired-check# cd /tmp/repaired-check && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/repaired-check)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate                                                                                             [1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.23s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 7 tests
+test tests::ceiling_bias_wrap_at_u64_max ... [32mok[m
+test focused_repair_test::repaired_counterexample_has_exact_debit ... [31mFAILED[m
+test tests::ceiling_rounding_and_rebate ... [32mok[m
+test tests::floor_div_helper_matches_exact_quotient ... [32mok[m
+test tests::ordinary_settlement ... [32mok[m
+test tests::total_debit_overflow_rejected ... [32mok[m
+test tests::wide_basis_carry_folding ... [32mok[m
+
+failures:
+
+---- focused_repair_test::repaired_counterexample_has_exact_debit stdout ----
+
+thread 'focused_repair_test::repaired_counterexample_has_exact_debit' panicked at src/lib.rs:209:9:
+assertion `left == right` failed
+  left: Some(Authorization { total_debit: 1660206966633860 })
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    focused_repair_test::repaired_counterexample_has_exact_debit
+
+test result: [31mFAILED[m. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[31merror[0m[1m:[0m test failed, to rerun pass `--lib`
+[?2004hroot@62135d6401cf:/tmp/repaired-check# printf '%s\n' '--- verdict ---'; cat /workspace/submission/verdict.txt; printf '%s\n' '--- counterexample ---'; cat /workspace/submission/counterexample.json; printf '%s\n' '--- artifacts ---'; find /workspace/submission -maxdepth 3 -type f -printf '%p\n' | sort; printf '%s\n' '--- repaired branch ---'; grep -A14 -B4 'let biased' /workspace/submission/src/lib.rs
+[?2004l--- verdict ---
+vulnerable
+--- counterexample ---
+{"balance":1660206966633859,"amount":0,"fee":18446744073709541617}
+--- artifacts ---
+/workspace/submission/.git/HEAD
+/workspace/submission/.git/config
+/workspace/submission/.git/description
+/workspace/submission/.git/hooks/applypatch-msg.sample
+/workspace/submission/.git/hooks/commit-msg.sample
+/workspace/submission/.git/hooks/fsmonitor-watchman.sample
+/workspace/submission/.git/hooks/post-update.sample
+/workspace/submission/.git/hooks/pre-applypatch.sample
+/workspace/submission/.git/hooks/pre-commit.sample
+/workspace/submission/.git/hooks/pre-merge-commit.sample
+/workspace/submission/.git/hooks/pre-push.sample
+/workspace/submission/.git/hooks/pre-rebase.sample
+/workspace/submission/.git/hooks/pre-receive.sample
+/workspace/submission/.git/hooks/prepare-commit-msg.sample
+/workspace/submission/.git/hooks/push-to-checkout.sample
+/workspace/submission/.git/hooks/sendemail-validate.sample
+/workspace/submission/.git/hooks/update.sample
+/workspace/submission/.git/info/exclude
+/workspace/submission/.gitignore
+/workspace/submission/Cargo.toml
+/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/verdict.txt
+--- repaired branch ---
+        if fold.wrapped_u64 {
+            let folded_rem = (fold.low_word % BPS_DENOM) + U64_MOD_BPS_REM;
+            U64_MOD_BPS_QUOT + (fold.low_word / BPS_DENOM) + ((folded_rem + BPS_MAX_REM) / BPS_DENOM)
+        } else {
+            [01;31m[Klet biased[m[K = fold.low_word.wrapping_add(BPS_MAX_REM);
+            if biased < fold.low_word {
+                // The bias addition overflowed.  The original sum is the
+                // non-wrapped low word itself, so compute its ceiling
+                // directly instead of trying to use the wrapped bias.
+                (fold.low_word / BPS_DENOM)
+                    + if fold.low_word % BPS_DENOM == 0 { 0 } else { 1 }
+            } else {
+                biased / BPS_DENOM
+            }
+        }
+    }
+}
+
+pub mod rebate {
+[?2004hroot@62135d6401cf:/tmp/repaired-check# python3 - <<'PY'
+[?2004l[?2004h> p='/tmp/repaired-check/src/lib.rs'
+[?2004l[?2004h> s=open(p).read()
+[?2004l[?2004h> s=s.replace('assert_eq!(authorize(balance, 0, fee), None);\n        assert_eq!(authorize(1660206966633861u64, 0, fee).unwrap().total_debit, 1660206966633861u64);', 'assert_eq!(authorize(balance - 1, 0, fee), None);\n        assert_eq!(authorize(balance, 0, fee).unwrap().total_debit, balance);')
+[?2004l[?2004h> open(p,'w').write(s)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@62135d6401cf:/tmp/repaired-check# cd /tmp/repaired-check && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/tmp/repaired-check)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate                                                                                             [1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.25s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 7 tests
+test focused_repair_test::repaired_counterexample_has_exact_debit ... [32mok[m
+test tests::ceiling_bias_wrap_at_u64_max ... [32mok[m
+test tests::ceiling_rounding_and_rebate ... [32mok[m
+test tests::floor_div_helper_matches_exact_quotient ... [32mok[m
+test tests::ordinary_settlement ... [32mok[m
+test tests::total_debit_overflow_rejected ... [32mok[m
+test tests::wide_basis_carry_folding ... [32mok[m
+
+test result: [32mok[m. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@62135d6401cf:/tmp/repaired-check# python3 - <<'PY'
+[?2004l[?2004h> import random
+[?2004l[?2004h> U=1<<64
+[?2004l[?2004h> D=10000
+[?2004l[?2004h> B=D-1
+[?2004l[?2004h> Q=U//D
+[?2004l[?2004h> R=U%D
+[?2004l[?2004h> 
+[?2004l[?2004h> def repaired_ceil(a,f):
+[?2004l[?2004h>     low=(a+f)&(U-1)
+[?2004l[?2004h>     wrapped=low<a
+[?2004l[?2004h>     if wrapped:
+[?2004l[?2004h>         rem=(low%D)+R
+[?2004l[?2004h>         return Q+(low//D)+((rem+B)//D)
+[?2004l[?2004h>     biased=(low+B)&(U-1)
+[?2004l[?2004h>     if biased<low:
+[?2004l[?2004h>         return low//D + (0 if low%D==0 else 1)
+[?2004l[?2004h>     return biased//D
+[?2004l[?2004h> 
+[?2004l[?2004h> vals=[0,1,2,9998,9999,10000,10001,Q,Q+1,U-21615,U-10000,U-9999,U-9998,U-2,U-1]
+[?2004l[?2004h> for a in vals:
+[?2004l[?2004h>     for f in vals:
+[?2004l[?2004h>         assert repaired_ceil(a,f)==((a+f+B)//D), (a,f,repaired_ceil(a,f),(a+f+B)//D)
+[?2004l[?2004h> for _ in range(300000):
+[?2004l[?2004h>     a=random.randrange(U); f=random.randrange(U)
+[?2004l[?2004h>     got=repaired_ceil(a,f)
+[?2004l[?2004h>     want=(a+f+B)//D
+[?2004l[?2004h>     assert got==want, (a,f,got,want)
+[?2004l[?2004h> print('repaired arithmetic differential verification passed: boundaries and 300000 random pairs')
+[?2004l[?2004h> PY
+[?2004lrepaired arithmetic differential verification passed: boundaries and 300000 random pairs
+[?2004hroot@62135d6401cf:/tmp/repaired-check# rm -rf /workspace/submission/.git /workspace/submission/.gitignore /workspace/submission/Cargo.toml /workspace/submission/Cargo.lock /workspace/submission/target && find /workspace/submission -maxdepth 3 -type f -printf '%p\n' | sort && printf '%s\n' '--- verdict ---' && cat /workspace/submission/verdict.txt && printf '%s\n' '--- counterexample ---' && cat /workspace/submission/counterexample.json
+[?2004l/workspace/submission/counterexample.json
+/workspace/submission/src/lib.rs
+/workspace/submission/verdict.txt
+--- verdict ---
+vulnerable
+--- counterexample ---
+{"balance":1660206966633859,"amount":0,"fee":18446744073709541617}
+[?2004hroot@62135d6401cf:/tmp/repaired-check# python3 - <<'PY'
+[?2004l[?2004h> import json
+[?2004l[?2004h> p='/workspace/submission/counterexample.json'
+[?2004l[?2004h> d=json.load(open(p))
+[?2004l[?2004h> assert set(d)=={'balance','amount','fee'}
+[?2004l[?2004h> assert all(isinstance(v,int) and 0<=v<(1<<64) for v in d.values())
+[?2004l[?2004h> U=1<<64; D=10000
+[?2004l[?2004h> b,a,f=d.values()
+[?2004l[?2004h> orig_low=(a+f)&(U-1)
+[?2004l[?2004h> orig_wrap=orig_low<a
+[?2004l[?2004h> if orig_wrap:
+[?2004l[?2004h>     gross=(U//D)+(orig_low//D)+(((orig_low%D)+(U%D)+(D-1))//D)
+[?2004l[?2004h> else:
+[?2004l[?2004h>     biased=(orig_low+D-1)&(U-1)
+[?2004l[?2004h>     gross=orig_low//D+(((biased+(U%D))//D) if biased<orig_low else biased//D)
+[?2004l[?2004h> net=gross-gross//10
+[?2004l[?2004h> exact=((a+f+D-1)//D)
+[?2004l[?2004h> exact_net=exact-exact//10
+[?2004l[?2004h> assert net==b and net<exact_net
+[?2004l[?2004h> print('counterexample verified:', d, 'original debit=', net, 'exact debit=', exact_net)
+[?2004l[?2004h> PY
+[?2004lcounterexample verified: {'balance': 1660206966633859, 'amount': 0, 'fee': 18446744073709541617} original debit= 1660206966633859 exact debit= 1660206966633860
+[?2004hroot@62135d6401cf:/tmp/repaired-check# 

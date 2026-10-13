@@ -21,6 +21,7 @@ from isolation import restrict
 
 MAX = spec.MAX
 WEIGHTS = {'spec': .25, 'verdict': .15, 'proof': .25, 'response': .35}
+WEIGHTS_NOPROOF = {'verdict': .20, 'response': .80}
 STATUSES = ('pass', 'partial', 'fail', 'missing', 'unknown', 'timeout', 'unsupported', 'infrastructure_error')
 MAX_ARTIFACT_BYTES = 65536
 
@@ -499,19 +500,93 @@ def unexpected_safe_artifacts(submission):
     return found
 
 
-def read_submission_rust(submission: Path, verifier: Path, artifacts: dict[str, str]) -> str:
+def read_mode(verifier: Path) -> str:
+    path = verifier / 'mode.txt'
+    if not path.exists():
+        return 'proof'
+    mode = path.read_text().strip()
+    if mode not in ('proof', 'noproof'):
+        raise RuntimeError('invalid trusted mode')
+    return mode
+
+
+def _strip_cfg_test(text: str) -> str:
+    idx = text.find('#[cfg(test)]')
+    return text[:idx].strip() if idx != -1 else text.strip()
+
+
+def read_verdict_noproof(submission: Path, artifacts: dict[str, str]) -> dict:
+    vpath = submission / 'verdict.txt'
+    rel = 'verdict.txt'
+    if not vpath.exists() and not vpath.is_symlink() and (submission / 'verdict.json').exists():
+        vpath = submission / 'verdict.json'
+        rel = 'verdict.json'
+    raw = read_artifact(vpath)
+    if not raw.strip():
+        raise FileNotFoundError('empty ' + rel)
+    artifacts[rel] = hashlib.sha256(raw.encode()).hexdigest()
+    cleaned = raw.strip()
+    if cleaned.startswith('{'):
+        obj = json_object(cleaned)
+        val = str(obj.get('verdict', '')).strip().lower().lstrip('.')
+    else:
+        tokens = re.findall(r'[A-Za-z_]+', cleaned.lower())
+        if tokens and tokens[0] == 'verdict' and len(tokens) == 2:
+            val = tokens[1]
+        elif len(tokens) == 1:
+            val = tokens[0]
+        else:
+            val = cleaned.lower().strip('"\' .')
+    if val not in ('vulnerable', 'safe'):
+        raise ValueError(f'verdict must be "vulnerable" or "safe", got: {cleaned[:80]!r}')
+    return {'status': 'pass', 'verdict': val, 'source': rel}
+
+
+def read_submission_rust(
+    submission: Path,
+    verifier: Path,
+    artifacts: dict[str, str],
+    challenge_dir: Path | None = None,
+) -> str:
     pristine_src = verifier / 'pristine/src'
     if not pristine_src.is_dir():
-        t = read_artifact(submission / 'src/lib.rs')
-        if not t.strip():
-            raise FileNotFoundError('empty src/lib.rs')
-        artifacts['src/lib.rs'] = hashlib.sha256(t.encode()).hexdigest()
-        return t
+        sub_lib = submission / 'src/lib.rs'
+        if sub_lib.exists() or sub_lib.is_symlink() or sub_lib.parent.is_symlink():
+            t = read_artifact(sub_lib)
+            if not t.strip():
+                raise FileNotFoundError('empty src/lib.rs')
+            artifacts['src/lib.rs'] = hashlib.sha256(t.encode()).hexdigest()
+            return t
+        if challenge_dir is not None:
+            chal_lib = challenge_dir / 'src/lib.rs'
+            if chal_lib.exists() and not chal_lib.is_symlink() and not chal_lib.parent.is_symlink():
+                t = read_artifact(chal_lib)
+                pristine_text = (verifier / 'pristine/lib.rs').read_text()
+                if _strip_cfg_test(t) != _strip_cfg_test(pristine_text):
+                    artifacts['challenge/src/lib.rs'] = hashlib.sha256(t.encode()).hexdigest()
+                    return t
+        raise FileNotFoundError(str(sub_lib))
     sub_src = submission / 'src'
-    if sub_src.is_symlink() or not sub_src.is_dir():
-        raise FileNotFoundError(str(sub_src))
+    if sub_src.is_symlink():
+        raise ValueError('symlink artifact rejected')
     allowed_rs = {p.name for p in pristine_src.glob('*.rs')}
-    rs_files = sorted(sub_src.iterdir())
+    rs_files = sorted(sub_src.iterdir()) if sub_src.is_dir() else []
+    active_src = sub_src
+    artifact_prefix = 'src'
+    if not rs_files and challenge_dir is not None:
+        chal_src = challenge_dir / 'src'
+        if chal_src.is_dir() and not chal_src.is_symlink():
+            chal_rs = [p for p in sorted(chal_src.iterdir()) if p.name in allowed_rs]
+            any_diff = any(
+                not p.is_symlink()
+                and p.is_file()
+                and _strip_cfg_test(p.read_text()) != _strip_cfg_test((pristine_src / p.name).read_text())
+                for p in chal_rs
+            )
+            if any_diff:
+                rs_files = chal_rs
+                active_src = chal_src
+                artifact_prefix = 'challenge/src'
     if not rs_files:
         raise FileNotFoundError(str(sub_src / 'lib.rs'))
     changed_rs = 0
@@ -521,9 +596,11 @@ def read_submission_rust(submission: Path, verifier: Path, artifacts: dict[str, 
         t = read_artifact(item)
         if not t.strip():
             raise FileNotFoundError(f'empty src/{item.name}')
-        artifacts[f'src/{item.name}'] = hashlib.sha256(t.encode()).hexdigest()
         pristine_text = (pristine_src / item.name).read_text()
-        if t.strip() != pristine_text.strip():
+        is_changed = _strip_cfg_test(t) != _strip_cfg_test(pristine_text)
+        if active_src == sub_src or is_changed:
+            artifacts[f'{artifact_prefix}/{item.name}'] = hashlib.sha256(t.encode()).hexdigest()
+        if is_changed:
             if item.name in PROTECTED_RUST_MODULES:
                 raise ValueError(f'src/{item.name} is a protected protocol orchestration module; patch the defective low-level arithmetic module instead')
             changed_rs += 1
@@ -531,10 +608,95 @@ def read_submission_rust(submission: Path, verifier: Path, artifacts: dict[str, 
         raise ValueError('submission/src must patch the vulnerable Rust arithmetic module')
     if changed_rs > 1:
         raise ValueError('submission/src patch must modify only the single defective arithmetic module')
-    return rust_symbolic.bundle_crate_source(sub_src, fallback_dir=pristine_src)
+    return rust_symbolic.bundle_crate_source(active_src, fallback_dir=pristine_src)
+
+
+def grade_noproof(workspace: Path, verifier: Path):
+    submission = workspace / 'submission'
+    if submission.is_symlink():
+        return {'version': 3, 'mode': 'noproof', 'status': 'fail', 'reward': 0, 'reason': 'submission symlink'}
+    variant = (verifier / 'variant.txt').read_text().strip()
+    if variant not in ('safe', 'vulnerable'):
+        raise RuntimeError('invalid trusted variant')
+    problem = read_problem(verifier)
+    checks = {}
+    artifacts = {}
+
+    def artifact(rel):
+        t = read_artifact(submission / rel)
+        if not t.strip():
+            raise FileNotFoundError('empty ' + rel)
+        artifacts[rel] = hashlib.sha256(t.encode()).hexdigest()
+        return t
+
+    start = time.monotonic()
+    checks['verdict'] = capture(lambda: read_verdict_noproof(submission, artifacts))
+    verdict = checks['verdict'].get('verdict')
+    if verdict is not None:
+        checks['verdict']['raw_verdict'] = verdict
+        checks['verdict']['verdict_matches_variant'] = (verdict == variant)
+        checks['verdict']['status'] = 'pass' if verdict == variant else 'fail'
+        checks['verdict']['reason'] = 'compared with pristine implementation'
+
+    if variant == 'vulnerable':
+        witness = capture(lambda: check_counterexample(artifact('counterexample.json'), verifier, problem=problem))
+        patch = capture(lambda: check_patch(
+            read_submission_rust(submission, verifier, artifacts, challenge_dir=workspace / 'challenge'),
+            problem=problem,
+        ))
+        resp_score = .30 * (witness['status'] == 'pass') + .50 * (patch['status'] == 'pass')
+        justified = (verdict == 'vulnerable') and (witness['status'] == 'pass' or patch['status'] == 'pass')
+        if not justified:
+            if checks['verdict']['status'] == 'pass':
+                checks['verdict']['status'] = 'fail'
+                checks['verdict']['reason'] = 'vulnerable verdict requires a valid counterexample or verified Rust repair'
+            if verdict == 'safe':
+                resp_score = 0.0
+        checks['response'] = {
+            'status': 'pass' if resp_score == .80 and verdict == 'vulnerable' else 'partial' if resp_score > 0 else 'fail',
+            'credit_fraction': resp_score / .80,
+            'checks': {'counterexample': witness, 'patch': patch},
+            'reason': 'noproof vulnerable response grades counterexample witness (30%) and universal Rust repair (50%)',
+        }
+        if any(r['status'] == 'infrastructure_error' for r in (witness, patch)):
+            checks['response']['status'] = 'infrastructure_error'
+    else:
+        original = capture(lambda: check_patch(_pristine_rust_source(verifier), problem=problem))
+        unwanted = unexpected_safe_artifacts(submission)
+        justified = (verdict == 'safe' and original['status'] == 'pass' and not unwanted)
+        checks['response'] = {
+            'status': 'pass' if justified else 'fail',
+            'checks': {'original_universal_conformance': original},
+            'unnecessary_artifacts': unwanted,
+            'reason': 'noproof safe response requires safe verdict, no spurious repair/counterexample artifacts, and universal Rust conformance',
+        }
+        if original['status'] == 'infrastructure_error':
+            checks['response']['status'] = 'infrastructure_error'
+        if not justified and checks['verdict']['status'] == 'pass':
+            checks['verdict']['status'] = 'fail'
+
+    for name, r in checks.items():
+        r['passed'] = r['status'] == 'pass'
+        r['score'] = round(WEIGHTS_NOPROOF[name] * r.get('credit_fraction', float(r['passed'])), 4)
+    reward = round(sum(r['score'] for r in checks.values()), 4)
+    return {
+        'version': 3,
+        'mode': 'noproof',
+        'problem': problem,
+        'variant': variant,
+        'status': 'infrastructure_error' if any(r['status'] == 'infrastructure_error' for r in checks.values()) else 'ok',
+        'reward': reward,
+        'weights': WEIGHTS_NOPROOF,
+        'checkpoints': checks,
+        'artifact_sha256': artifacts,
+        'elapsed_seconds': round(time.monotonic() - start, 3),
+        'scoring': 'noproof track: justified verdict (20%) + universal Rust verification & counterexample response (80%)',
+    }
 
 
 def grade(workspace,verifier,profile=None):
+    if read_mode(verifier) == 'noproof':
+        return grade_noproof(workspace, verifier)
     submission=workspace/'submission'
     if submission.is_symlink(): return {'version':3,'status':'fail','reward':0,'reason':'submission symlink'}
     # Variant and problem belong to the pristine verifier, never to submitted files.

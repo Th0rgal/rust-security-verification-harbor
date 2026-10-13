@@ -102,7 +102,7 @@ def _needs_divmod_purification(expr):
             continue
         if e.decl().kind() in (z3.Z3_OP_IDIV, z3.Z3_OP_MOD) and e.num_args() == 2:
             c_simp = z3.simplify(e.arg(1))
-            if z3.is_int_value(c_simp) and (c_simp.as_long() >= 1_000_000 or c_simp.as_long() in (128, 256, 5000, 10000, 32771, 65536)):
+            if z3.is_int_value(c_simp) and (c_simp.as_long() >= 1_000_000 or c_simp.as_long() in (128, 256, 32771, 65536)):
                 return True
         for i in range(e.num_args()):
             stack.append(e.arg(i))
@@ -301,6 +301,9 @@ def purify_divmod(expr):
         for vid, (cf, vexpr) in terms.items():
             if (is_pow2 or c_val == GOLDILOCKS_P) and vid in pow2_var_splits:
                 acc = acc + z3.IntVal(cf) * pow2_var_splits[vid]
+                changed = True
+            elif c_val == GOLDILOCKS_P and (vid, 4294967296) in var_splits:
+                acc = acc + z3.IntVal(cf) * var_splits[(vid, 4294967296)]
                 changed = True
             elif (vid, c_val) in var_splits:
                 acc = acc + z3.IntVal(cf) * var_splits[(vid, c_val)]

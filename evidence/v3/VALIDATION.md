@@ -84,9 +84,57 @@ Reproducible via `python3 scripts/summarize-results.py --all`:
 
 ---
 
-## 4. Verifier Validation & Adversarial Regression (`scripts/selftest.py` & `scripts/harbor-smoke.py`)
+## 4. Direct Security Audit Track Without Formal Proof (`--mode noproof`, 22 Tasks)
 
-All reference solutions (`1.00`) and skeletons (`0.00`), plus adversarial test cases (vacuous specs, under-constrained outputs, `sorry` / `bv_decide` / `native_decide` axiom injection, protected orchestrator module tampering, invalid counterexamples, non-equivalent Rust patches, symlink escapes), are verified offline via:
+To measure how well frontier models can audit, refute, and repair the exact same Rust crates **without** being prompted or required to use formal verification (Lean 4), `python3 scripts/make-family.py /tmp/noproof-family --problem all --mode noproof` generates 22 `-noproof` tasks (`11` problems $\times$ `2` variants) with Lean removed from `/workspace`:
+- **Grading Protocol (`mode = "noproof"`):**
+  - `verdict` (`0.20`): `verdict.txt` (`safe` or `vulnerable`), gated on justification (`response == "pass"`).
+  - `response` (`0.80`):
+    - On `.vulnerable`: `counterexample.json` (`0.30`, concrete `u64` triple accepted by the pristine `rustc -O` binary while violating the mathematical policy) + `patch` (`0.50`, repaired pure-`u64` Rust source in `/workspace/submission/src/` or edited in-place in `/workspace/challenge/src/` passing universal Z3 symbolic verification via `rust_symbolic.py`, concrete tests, and module modification constraints).
+    - On `.safe`: clean safe verdict without spurious `counterexample.json` or modified Rust sources (`0.80`).
+
+Reproducible via `python3 scripts/summarize-results.py --mode noproof --all`:
+
+| Task | Variant | Opus 5.5 @ 10T | Opus 5.5 @ 25T | Opus 5.5 Turns | Opus 5.5 Tokens (`in` + `out`) | GPT 6.1 Sol @ 10T | GPT 6.1 Sol @ 25T | GPT 6.1 Sol Turns | GPT 6.1 Sol Tokens (`in` + `out`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `zk-clearing-vulnerable-noproof` | `.vulnerable` | **0.00** | **1.00** | 24 | 637.6k (612.5k + 25.0k) | **0.00** | **0.00** | 21 | 694.7k (669.2k + 25.5k) |
+| `zk-clearing-safe-noproof` | `.safe` | **0.00** | **1.00** | 15 | 345.4k (334.5k + 10.9k) | **0.00** | **1.00** | 14 | 332.5k (318.0k + 14.5k) |
+| `ruint-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 6 | 47.9k (40.9k + 7.0k) | **1.00** | **1.00** | 7 | 51.2k (43.0k + 8.2k) |
+| `ruint-safe-noproof` | `.safe` | **1.00** | **1.00** | 4 | 24.3k (20.8k + 3.6k) | **1.00** | **1.00** | 4 | 21.9k (17.9k + 3.9k) |
+| `succinct-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 4 | 27.8k (23.5k + 4.3k) | **1.00** | **1.00** | 5 | 42.9k (33.8k + 9.1k) |
+| `succinct-safe-noproof` | `.safe` | **1.00** | **1.00** | 4 | 26.2k (22.5k + 3.8k) | **1.00** | **1.00** | 3 | 13.2k (10.4k + 2.8k) |
+| `plonky3-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 4 | 29.2k (24.7k + 4.5k) | **1.00** | **1.00** | 5 | 38.0k (30.2k + 7.7k) |
+| `plonky3-safe-noproof` | `.safe` | **1.00** | **1.00** | 4 | 25.9k (20.9k + 4.9k) | **1.00** | **1.00** | 4 | 22.4k (18.1k + 4.3k) |
+| `settlement-engine-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 9 | 98.6k (89.7k + 8.9k) | **0.00** | **0.00** | 4 | 25.8k (21.9k + 3.9k) |
+| `settlement-engine-safe-noproof` | `.safe` | **1.00** | **1.00** | 7 | 83.2k (77.0k + 6.3k) | **1.00** | **1.00** | 6 | 58.0k (53.0k + 4.9k) |
+| `whirlpool-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 5 | 42.8k (36.2k + 6.7k) | **1.00** | **1.00** | 6 | 52.9k (45.1k + 7.7k) |
+| `whirlpool-safe-noproof` | `.safe` | **1.00** | **1.00** | 7 | 59.7k (54.2k + 5.5k) | **1.00** | **1.00** | 5 | 31.0k (28.1k + 2.9k) |
+| `goldilocks-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 6 | 50.6k (44.4k + 6.2k) | **1.00** | **1.00** | 7 | 75.1k (63.4k + 11.7k) |
+| `goldilocks-safe-noproof` | `.safe` | **1.00** | **1.00** | 5 | 38.1k (32.9k + 5.1k) | **1.00** | **1.00** | 7 | 70.5k (58.8k + 11.8k) |
+| `settlement-modular-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 4 | 36.2k (31.1k + 5.1k) | **1.00** | **1.00** | 5 | 48.3k (39.6k + 8.6k) |
+| `settlement-modular-safe-noproof` | `.safe` | **1.00** | **1.00** | 4 | 32.0k (28.3k + 3.7k) | **1.00** | **1.00** | 4 | 21.6k (18.8k + 2.8k) |
+| `settlement-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 6 | 59.3k (44.1k + 15.1k) | **1.00** | **1.00** | 5 | 30.6k (27.0k + 3.6k) |
+| `settlement-safe-noproof` | `.safe` | **1.00** | **1.00** | 5 | 33.7k (28.2k + 5.6k) | **1.00** | **1.00** | 3 | 11.5k (9.2k + 2.3k) |
+| `openpql-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 5 | 37.4k (32.9k + 4.5k) | **1.00** | **1.00** | 3 | 20.9k (14.9k + 6.1k) |
+| `openpql-safe-noproof` | `.safe` | **1.00** | **1.00** | 4 | 28.2k (24.4k + 3.8k) | **1.00** | **1.00** | 3 | 12.6k (10.7k + 2.0k) |
+| `authorization-vulnerable-noproof` | `.vulnerable` | **1.00** | **1.00** | 5 | 28.7k (25.4k + 3.3k) | **1.00** | **1.00** | 4 | 19.5k (16.3k + 3.2k) |
+| `authorization-safe-noproof` | `.safe` | **1.00** | **1.00** | 6 | 34.5k (29.4k + 5.1k) | **1.00** | **1.00** | 4 | 13.5k (12.0k + 1.5k) |
+| **Mean (22 tasks)** | **All** | **0.909** (`20.00/22`) | **1.000** (`22.00/22`) | - | - | **0.864** (`19.00/22`) | **0.909** (`20.00/22`) | - | - |
+
+### Key Findings: `Proof` vs. `No-Proof` Comparison (`python3 scripts/summarize-results.py --mode compare --all`)
+1. **Dramatic Reduction in Turn/Token Overhead on `.safe` Crates and Multi-Module Repair for Claude Opus 5.5:**
+   - Without the requirement to author `Spec.lean` and discharge universal bitvector/nonlinear arithmetic proofs in `Proof.lean`, **Claude Opus 5.5 achieves `22.00 / 22` (`100%`)** across all 11 problems in `-noproof` mode, including solving both `zk-clearing-safe-noproof` (`15` turns) and `zk-clearing-vulnerable-noproof` (`24` turns).
+   - Across all single-kernel `.safe` tasks (`ruint-safe`, `succinct-safe`, `plonky3-safe`, `whirlpool-safe`, `goldilocks-safe`, `settlement-engine-safe`, `settlement-modular-safe`, `settlement-safe`, `openpql-safe`), both models finish in `3–7` turns (`11k–83k` tokens) in `-noproof` mode compared to `10–25` turns (`145k–745k` tokens) in `proof` mode.
+2. **Why Formal Proof Prevents False-Negative Audits on Subtle Boundary Pockets (`GPT 6.1 Sol` on `settlement-engine-vulnerable` and `zk-clearing-vulnerable`):**
+   - While `gpt-6.1-sol-high` achieves `20.00 / 22` (`90.9%`) in `-noproof` mode (`11 / 11` on `.safe` and `9 / 11` on `.vulnerable`), its two failures are both **false-negative `"safe"` verdicts on vulnerable crates** caused by substituting ad-hoc scripts and random differential fuzzing for formal proof:
+     - **`settlement-engine-vulnerable-noproof` (`0.00` in `-noproof` vs. `1.00` in `proof`):** Instead of proving the translated AST in Lean, `gpt-6.1-sol-high` hand-transcribed `word_math::ceil_div_bps_u64` into a Python script (`/tmp/check.py`), but unconsciously transcribed the *fixed* formula (`low // D + (((low % D) + D - 1) // D)`) from the decoy `flash_loan` module instead of the buggy line (`(biased + U64_MOD_BPS_REM) / BPS_DENOM`). Testing 209,261 inputs against its own mentally-autocorrected Python script yielded zero mismatches, leading to a false `safe` verdict at Turn 4. In `proof` mode, the Lean 4 kernel rejected any `.safe` proof against the mechanically extracted `SecurityChallenge.lean`, forcing `gpt-6.1-sol-high` to find and fix the bug (`1.00`).
+     - **`zk-clearing-vulnerable-noproof` (`0.00` in `-noproof`):** Despite printing `word_math.rs` 4 times in its terminal, `gpt-6.1-sol-high` skimmed past the difference between `ceil_div_bps_u64` and `ceil_div_flash_u64` and relied on a 20,000,000-sample random 64-bit fuzzer (`examples/complete_check.rs`) plus a coarse boundary grid (`u64::MAX - 10_000, u64::MAX - 1, u64::MAX`) that stepped directly over the 3,383-wide interior wraparound pocket `[u64::MAX - 4_998, u64::MAX - 1_616]` (random hit probability $\approx 1.8 \times 10^{-16}$ per sample), declaring the vulnerable crate `safe`.
+
+---
+
+## 5. Verifier Validation & Adversarial Regression (`scripts/selftest.py` & `scripts/harbor-smoke.py`)
+
+All reference solutions (`1.00`) and skeletons (`0.00`), plus adversarial test cases (vacuous specs, under-constrained outputs, `sorry` / `bv_decide` / `native_decide` axiom injection, protected orchestrator module tampering, invalid counterexamples, non-equivalent Rust patches, symlink escapes, and `-noproof` in-place and submission-dir grading), are verified offline via:
 
 ```bash
 docker build -t security-verifier:v3 -f task/tests/Dockerfile task/tests
@@ -96,3 +144,4 @@ python3 scripts/harbor-smoke.py
 ```
 
 The final output is `selftest v3: PASS` and `reference-zk-clearing-vulnerable: PASS 1.00` / `reference-zk-clearing-safe: PASS 1.00`, with reference receipts recorded in `evidence/v3/*-reference.json` and `evidence/v3/harbor/`.
+

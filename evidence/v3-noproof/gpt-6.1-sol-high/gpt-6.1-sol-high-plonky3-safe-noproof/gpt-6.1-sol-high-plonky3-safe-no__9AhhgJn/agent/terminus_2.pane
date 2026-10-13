@@ -1,0 +1,281 @@
+[?2004hroot@0f2d8ccb7d3a:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@0f2d8ccb7d3a:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@0f2d8ccb7d3a:/workspace# pwd; printf '\n-- workspace --\n'; find /workspace -maxdepth 3 -type f -printf '%p\n' | sort
+[?2004l/workspace
+
+-- workspace --
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@0f2d8ccb7d3a:/workspace# printf '\n-- source tree --\n'; find /workspace/challenge/src -maxdepth 5 -type f -print -exec sh -c 'echo "--- $1"; sed -n "1,240p" "$1"' _ {} \;
+[?2004l
+-- source tree --
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod monty31 {
+    pub const BABY_BEAR_P: u64 = 2_013_265_921u64;
+    pub const BABY_BEAR_MU: u64 = 2_281_701_377u64;
+    pub const LIMB_BASE: u64 = 4_294_967_296u64;
+    pub const LIMB_MASK: u64 = 0xFFFF_FFFFu64;
+
+    #[inline]
+    pub fn pack_transcript(amount: u64, fee: u64) -> u64 {
+        let low: u64 = amount & LIMB_MASK;
+        let high: u64 = fee % BABY_BEAR_P;
+        low + high * LIMB_BASE
+    }
+
+    #[inline]
+    pub fn monty_quotient(x: u64) -> u64 {
+        let x_lo: u64 = x & LIMB_MASK;
+        (x_lo * BABY_BEAR_MU) & LIMB_MASK
+    }
+
+    /// Montgomery reduction of `x < P * 2^32` over the BabyBear prime
+    /// `P = 2013265921` (`MU = P^-1 mod 2^32 = 2281701377`).
+    #[inline]
+    pub fn monty_reduce(x: u64) -> u64 {
+        let t: u64 = monty_quotient(x);
+        let u: u64 = t * BABY_BEAR_P;
+        let (diff, borrow) = x.overflowing_sub(u);
+        let hi: u64 = diff >> 32u64;
+        if borrow {
+            hi + BABY_BEAR_P - LIMB_BASE
+        } else {
+            hi
+        }
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::monty31;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PlonkyQuote {
+        pub principal: u64,
+        pub monty_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<PlonkyQuote> {
+        let transcript: u64 = monty31::pack_transcript(amount, fee);
+        let monty_surcharge: u64 = monty31::monty_reduce(transcript);
+        let total_debit: u64 = amount.checked_add(monty_surcharge)?;
+        Some(PlonkyQuote {
+            principal: amount,
+            monty_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: PlonkyQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Plonky3 BabyBear Montgomery settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2013265921` (BabyBear prime), `R = 2^32 = 4294967296`, `R_INV = 943718400` (`R * R_INV == 1 mod P`)
+/// - `transcript = (amount mod 2^32) + (fee mod P) * 2^32`
+/// - `monty_surcharge = (transcript * R_INV) mod P`
+/// - `total_debit = amount + monty_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::PlonkyQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn montgomery_identity_element() {
+        // transcript = R = 2^32 (amount = 0, fee = 1):
+        // monty_surcharge = (R * R_INV) mod P = 1
+        assert_eq!(authorize(1, 0, 1), Some(Authorization { total_debit: 1 }));
+        assert_eq!(authorize(0, 0, 1), None);
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 4294967296 (low = 0), fee = 5:
+        // transcript = 5 * 2^32 -> monty_surcharge = 5
+        // total_debit = 4294967301
+        assert_eq!(
+            authorize(4_294_967_301, 4_294_967_296, 5),
+            Some(Authorization {
+                total_debit: 4_294_967_301
+            })
+        );
+    }
+}
+[?2004hroot@0f2d8ccb7d3a:/workspace# printf '\n-- Cargo files/tests --\n'; find /workspace/challenge -maxdepth 4 -type f \( -name 'Cargo.toml' -o -name '*.md' -o -path '*/tests/*' \) -print -exec sh -c 'echo "--- $1"; sed -n "1,260p" "$1"' _ {} \;
+[?2004l
+-- Cargo files/tests --
+/workspace/challenge/Cargo.toml
+--- /workspace/challenge/Cargo.toml
+[package]
+name = "settlement-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+overflow-checks = false
+
+[profile.test]
+overflow-checks = false
+[?2004hroot@0f2d8ccb7d3a:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement_gate(test), settlement-gate                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.28s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::montgomery_identity_element ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@0f2d8ccb7d3a:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> P=2013265921
+[?2004l[?2004h> R=1<<32
+[?2004l[?2004h> MU=2281701377
+[?2004l[?2004h> R_INV=943718400
+[?2004l[?2004h> print('P*MU mod R =', (P*MU)%R)
+[?2004l[?2004h> print('P inverse mod R =', pow(P,-1,R))
+[?2004l[?2004h> print('-P inverse mod R =', (-pow(P,-1,R))%R)
+[?2004l[?2004h> print('R*R_INV mod P =', (R*R_INV)%P)
+[?2004l[?2004h> print('max pack =', (P-1)*R + (R-1), '<', 1<<64)
+[?2004l[?2004h> print('max xlo*MU =', (R-1)*MU, '<', 1<<64)
+[?2004l[?2004h> print('max t*P =', (R-1)*P, '<', 1<<64)
+[?2004l[?2004h> PY
+[?2004lP*MU mod R = 1
+P inverse mod R = 2281701377
+-P inverse mod R = 2013265919
+R*R_INV mod P = 1
+max pack = 8646911288846319615 < 18446744073709551616
+max xlo*MU = 9799832791171465215 < 18446744073709551616
+max t*P = 8646911286833053695 < 18446744073709551616
+[?2004hroot@0f2d8ccb7d3a:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> import random
+[?2004l[?2004h> P=2013265921
+[?2004l[?2004h> R=1<<32
+[?2004l[?2004h> MASK=R-1
+[?2004l[?2004h> MU=2281701377
+[?2004l[?2004h> R_INV=943718400
+[?2004l[?2004h> U64=(1<<64)-1
+[?2004l[?2004h> 
+[?2004l[?2004h> def impl(amount, fee):
+[?2004l[?2004h>     low=amount&MASK
+[?2004l[?2004h>     high=fee%P
+[?2004l[?2004h>     x=low+high*R
+[?2004l[?2004h>     t=((x&MASK)*MU)&MASK
+[?2004l[?2004h>     u=t*P
+[?2004l[?2004h>     diff=(x-u)&U64
+[?2004l[?2004h>     borrow=x<u
+[?2004l[?2004h>     hi=diff>>32
+[?2004l[?2004h>     if borrow:
+[?2004l[?2004h>         hi=hi+P-R
+[?2004l[?2004h>     return hi
+[?2004l[?2004h> 
+[?2004l[?2004h> def spec(amount, fee):
+[?2004l[?2004h>     x=(amount&MASK)+(fee%P)*R
+[?2004l[?2004h>     return (x*R_INV)%P
+[?2004l[?2004h> 
+[?2004l[?2004h> vals=[0,1,2,P-1,P,P+1,R-1,R,R+1,U64]
+[?2004l[?2004h> for a in vals:
+[?2004l[?2004h>   for f in vals:
+[?2004l[?2004h>     x=impl(a,f); y=spec(a,f)
+[?2004l[?2004h>     if x!=y:
+[?2004l[?2004h>       print('MISMATCH',a,f,x,y)
+[?2004l[?2004h>       raise SystemExit(1)
+[?2004l[?2004h> for i in range(1000000):
+[?2004l[?2004h>     a=random.getrandbits(64); f=random.getrandbits(64)
+[?2004l[?2004h>     x=impl(a,f); y=spec(a,f)
+[?2004l[?2004h>     if x!=y:
+[?2004l[?2004h>       print('MISMATCH',a,f,x,y)
+[?2004l[?2004h>       raise SystemExit(1)
+[?2004l[?2004h> print('all boundary and 1,000,000 random reduction checks passed')
+[?2004l[?2004h> PY
+[?2004lall boundary and 1,000,000 random reduction checks passed
+[?2004hroot@0f2d8ccb7d3a:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> import random
+[?2004l[?2004h> P=2013265921
+[?2004l[?2004h> R=1<<32
+[?2004l[?2004h> MASK=R-1
+[?2004l[?2004h> RINV=943718400
+[?2004l[?2004h> U64=(1<<64)-1
+[?2004l[?2004h> 
+[?2004l[?2004h> def expected(balance, amount, fee):
+[?2004l[?2004h>     surcharge=(((amount&MASK)+(fee%P)*R)*RINV)%P
+[?2004l[?2004h>     debit=amount+surcharge
+[?2004l[?2004h>     return debit if debit<=U64 and debit<=balance else None
+[?2004l[?2004h> 
+[?2004l[?2004h> def implementation_model(balance, amount, fee):
+[?2004l[?2004h>     x=(amount&MASK)+(fee%P)*R
+[?2004l[?2004h>     t=((x&MASK)*2281701377)&MASK
+[?2004l[?2004h>     u=t*P
+[?2004l[?2004h>     diff=(x-u)&U64
+[?2004l[?2004h>     hi=diff>>32
+[?2004l[?2004h>     if x<u:
+[?2004l[?2004h>         hi=hi+P-R
+[?2004l[?2004h>     if amount > U64-hi:
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     total=amount+hi
+[?2004l[?2004h>     return total if total<=balance else None
+[?2004l[?2004h> 
+[?2004l[?2004h> vals=[0,1,2,P-1,P,P+1,R-1,R,R+1,U64]
+[?2004l[?2004h> for b in vals:
+[?2004l[?2004h>     for a in vals:
+[?2004l[?2004h>         for f in vals:
+[?2004l[?2004h>             if expected(b,a,f)!=implementation_model(b,a,f):
+[?2004l[?2004h>                 raise SystemExit(f'mismatch: {b} {a} {f}')
+[?2004l[?2004h> for _ in range(1000000):
+[?2004l[?2004h>     b=random.getrandbits(64)
+[?2004l[?2004h>     a=random.getrandbits(64)
+[?2004l[?2004h>     f=random.getrandbits(64)
+[?2004l[?2004h>     if expected(b,a,f)!=implementation_model(b,a,f):
+[?2004l[?2004h>         raise SystemExit(f'mismatch: {b} {a} {f}')
+[?2004l[?2004h> print('authorization model matches mathematical policy on boundary cases and 1,000,000 random triples')
+[?2004l[?2004h> PY
+[?2004lauthorization model matches mathematical policy on boundary cases and 1,000,000 random triples
+[?2004hroot@0f2d8ccb7d3a:/workspace/challenge# rm -rf /workspace/submission && mkdir -p /workspace/submission && printf 'safe\n' > /workspace/submission/verdict.txt && test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src && printf '\n-- submission --\n' && find /workspace/submission -maxdepth 3 -type f -printf '%P\n' -exec cat {} \;
+[?2004l
+-- submission --
+verdict.txt
+safe
+[?2004hroot@0f2d8ccb7d3a:/workspace/challenge# 

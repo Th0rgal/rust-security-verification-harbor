@@ -8,12 +8,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 tmux as
  && rm -rf /var/lib/apt/lists/*
 COPY workspace/ /workspace/
 WORKDIR /workspace
-RUN cd /workspace/lean \
- && if [ -d LeanModel ]; then \
-      for m in Constants WordMath ReciprocalDiv BroadwordSwar MontgomeryField GoldilocksField FeeSchedule LiquidityPool TranscriptCodec ClearingPipeline; do \
-        if [ -f "LeanModel/${m}.lean" ]; then lean -o "LeanModel/${m}.olean" "LeanModel/${m}.lean"; fi; \
-      done; \
+RUN if [ -d /workspace/lean ]; then \
+      cd /workspace/lean \
+      && if [ -d LeanModel ]; then \
+           for m in Constants WordMath ReciprocalDiv BroadwordSwar MontgomeryField GoldilocksField FeeSchedule LiquidityPool TranscriptCodec ClearingPipeline; do \
+             if [ -f "LeanModel/${m}.lean" ]; then lean -o "LeanModel/${m}.olean" "LeanModel/${m}.lean"; fi; \
+           done; \
+         fi \
+      && lean -o SecurityChallenge.olean SecurityChallenge.lean \
+      && mkdir -p /workspace/submission/LeanModel \
+      && lean Signature.lean; \
     fi \
- && lean -o SecurityChallenge.olean SecurityChallenge.lean \
- && cd /workspace/challenge && cargo test --release && mkdir -p /workspace/submission/src /workspace/submission/LeanModel \
- && cd /workspace/lean && lean Signature.lean
+ && cd /workspace/challenge && cargo test --release && mkdir -p /workspace/submission/src \
+ && printf 'set-option -g history-limit 1000000\nset-option -g default-command "while true; do bash --login; done"\n' > /etc/tmux.conf

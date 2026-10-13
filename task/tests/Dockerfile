@@ -3,7 +3,7 @@ FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098feb
 FROM ${LEAN_BASE} AS api
 COPY verifier/ /build-api/
 WORKDIR /build-api
-RUN lake build SecurityChallenge SpecAudit
+RUN if [ "$(cat mode.txt 2>/dev/null)" = "noproof" ]; then mkdir -p .lake/build/lib/lean; else lake build SecurityChallenge SpecAudit; fi
 
 FROM ${LEAN_BASE}
 COPY --from=rust /usr/local/rustup /usr/local/rustup
@@ -18,8 +18,9 @@ COPY verifier/*.py /opt/security-verifier/
 COPY verifier/pristine/ /opt/security-verifier/pristine/
 COPY verifier/variant.txt /opt/security-verifier/variant.txt
 COPY verifier/problem.txt /opt/security-verifier/problem.txt
+COPY verifier/mode.txt /opt/security-verifier/mode.txt
 COPY --from=api /build-api/.lake/build/lib/lean/ /opt/security-verifier/api/
 COPY verifier/SpecAudit.lean /opt/security-verifier/SpecAudit.lean
 COPY test.sh /tests/test.sh
-RUN chmod 0555 /tests/test.sh && mkdir -p /workspace/submission/src /workspace/submission/LeanModel /logs/verifier
+RUN chmod 0555 /tests/test.sh && mkdir -p /workspace/submission/src /workspace/submission/LeanModel /workspace/challenge/src /logs/verifier
 WORKDIR /workspace

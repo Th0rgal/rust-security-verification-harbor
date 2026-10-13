@@ -1,0 +1,519 @@
+[?2004hroot@850a700a9803:/workspace# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@850a700a9803:/workspace# clear
+[?2004l[H[J[3J[?2004hroot@850a700a9803:/workspace# pwd; printf '\n-- workspace --\n'; ls -la; printf '\n-- challenge files --\n'; find /workspace/challenge -maxdepth 4 -type f -print | sort
+[?2004l/workspace
+
+-- workspace --
+total 16
+drwxr-xr-x 1 root root 4096 Oct 13 08:49 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 4096 Oct 13 09:03 [01;34m..[0m
+drwxr-xr-x 3 root root 4096 Oct 13 08:49 [01;34mchallenge[0m
+drwxr-xr-x 3 root root 4096 Oct 13 08:46 [01;34msubmission[0m
+
+-- challenge files --
+/workspace/challenge/Cargo.lock
+/workspace/challenge/Cargo.toml
+/workspace/challenge/src/lib.rs
+[?2004hroot@850a700a9803:/workspace# printf '\n-- source files --\n'; find /workspace/challenge/src -type f -maxdepth 5 -print -exec sh -c 'echo "--- $1"; sed -n "1,240p" "$1"' _ {} \;
+[?2004l
+-- source files --
+find: warning: you have specified the global option -maxdepth after the argument -type, but global options are not positional, i.e., -maxdepth affects tests specified before it as well as those specified after it.  Please specify global options before other arguments.
+/workspace/challenge/src/lib.rs
+--- /workspace/challenge/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authorization {
+    pub total_debit: u64,
+}
+
+pub mod field {
+    pub const GOLDILOCKS_MODULUS: u64 = 0xFFFF_FFFF_0000_0001u64;
+    pub const GOLDILOCKS_EPSILON: u64 = 0xFFFF_FFFFu64;
+    pub const LIMB_SHIFT: u64 = 32u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TranscriptLimbs {
+        pub low: u64,
+        pub mid: u64,
+        pub high: u64,
+    }
+
+    #[inline]
+    pub fn split_transcript(amount: u64, fee: u64) -> TranscriptLimbs {
+        TranscriptLimbs {
+            low: amount,
+            mid: fee & GOLDILOCKS_EPSILON,
+            high: fee >> LIMB_SHIFT,
+        }
+    }
+
+    /// Fold the top 32-bit limb `high * 2^96` into `low` using `2^96 == -1 (mod P)`.
+    #[inline]
+    pub fn fold_high_limb(low: u64, high: u64) -> u64 {
+        let (low2, borrow) = low.overflowing_sub(high);
+        if borrow {
+            low2.wrapping_add(GOLDILOCKS_MODULUS)
+        } else {
+            low2
+        }
+    }
+
+    /// Fold the middle 32-bit limb `mid * 2^64` using `2^64 == 2^32 - 1 (mod P)`.
+    #[inline]
+    pub fn fold_mid_limb(low2: u64, mid: u64) -> u64 {
+        let product: u64 = mid * GOLDILOCKS_EPSILON;
+        let (sum1, carry1) = low2.overflowing_add(product);
+        if carry1 {
+            sum1.wrapping_add(GOLDILOCKS_EPSILON)
+        } else {
+            sum1
+        }
+    }
+
+    #[inline]
+    pub fn canonicalize(folded: u64) -> u64 {
+        if folded >= GOLDILOCKS_MODULUS {
+            folded - GOLDILOCKS_MODULUS
+        } else {
+            folded
+        }
+    }
+
+    /// Reduce the 128-bit integer `amount + fee * 2^64` modulo the Goldilocks
+    /// prime `P = 2^64 - 2^32 + 1 = 18446744069414584321` in pure `u64`.
+    #[inline]
+    pub fn reduce_128(amount: u64, fee: u64) -> u64 {
+        let limbs: TranscriptLimbs = split_transcript(amount, fee);
+        let low2: u64 = fold_high_limb(limbs.low, limbs.high);
+        let folded: u64 = fold_mid_limb(low2, limbs.mid);
+        canonicalize(folded)
+    }
+}
+
+pub mod settlement {
+    use crate::Authorization;
+    use crate::field;
+
+    pub const PRINCIPAL_DIVISOR: u64 = 2u64;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GoldilocksQuote {
+        pub principal_share: u64,
+        pub field_surcharge: u64,
+        pub total_debit: u64,
+    }
+
+    #[inline]
+    pub fn build_quote(amount: u64, fee: u64) -> Option<GoldilocksQuote> {
+        let principal_share: u64 = amount / PRINCIPAL_DIVISOR;
+        let field_surcharge: u64 = field::reduce_128(amount, fee);
+        let total_debit: u64 = principal_share.checked_add(field_surcharge)?;
+        Some(GoldilocksQuote {
+            principal_share,
+            field_surcharge,
+            total_debit,
+        })
+    }
+
+    #[inline]
+    pub fn verify_affordability(balance: u64, quote: GoldilocksQuote) -> Option<Authorization> {
+        if quote.total_debit <= balance {
+            Some(Authorization {
+                total_debit: quote.total_debit,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Authorize a Goldilocks rollup settlement against `balance`.
+///
+/// In exact integer arithmetic:
+/// - `P = 2^64 - 2^32 + 1 = 18446744069414584321` (Goldilocks prime)
+/// - `principal_share = floor(amount / 2)`
+/// - `field_surcharge = (amount + fee * 2^64) mod P`
+/// - `total_debit = principal_share + field_surcharge`
+///
+/// The payment is authorized iff `total_debit <= balance`.
+/// Production code in this crate operates on `u64` words only (`u128` is not used).
+pub fn authorize(balance: u64, amount: u64, fee: u64) -> Option<Authorization> {
+    let quote: settlement::GoldilocksQuote = settlement::build_quote(amount, fee)?;
+    settlement::verify_affordability(balance, quote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_payment_is_authorized() {
+        assert_eq!(authorize(0, 0, 0), Some(Authorization { total_debit: 0 }));
+    }
+
+    #[test]
+    fn small_transcript_reduction_matches_policy() {
+        // amount = 100, fee = 1:
+        // principal_share = 50
+        // field_surcharge = (100 + 2^64) mod P = 100 + (2^32 - 1) = 4294967395
+        // total_debit = 4294967445
+        assert_eq!(
+            authorize(4_294_967_445, 100, 1),
+            Some(Authorization {
+                total_debit: 4_294_967_445
+            })
+        );
+        assert_eq!(authorize(4_294_967_444, 100, 1), None);
+    }
+
+    #[test]
+    fn canonicalizes_values_above_modulus() {
+        // amount = P + 10 = 18446744069414584331, fee = 0:
+        // principal_share = 9223372034707292165
+        // field_surcharge = 10
+        assert_eq!(
+            authorize(9_223_372_034_707_292_175, 18_446_744_069_414_584_331, 0),
+            Some(Authorization {
+                total_debit: 9_223_372_034_707_292_175
+            })
+        );
+    }
+}
+[?2004hroot@850a700a9803:/workspace# printf '\''\n-- manifest --\n'\''; sed -n '1,240p' /workspace/challenge/Cargo.toml
+[?2004l[?2004h> ^C[?2004l[?2004h[?2004l
+[?2004hroot@850a700a9803:/workspace# cd /workspace/challenge && cargo test --release
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate                                                                                             [1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `release` profile [optimized] target(s) in 0.83s
+[1m[32m     Running[0m unittests src/lib.rs (target/release/deps/settlement_gate-ebd00f5d27994bc9)
+
+running 3 tests
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+test tests::canonicalizes_values_above_modulus ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+[1m[32m   Doc-tests[0m settlement_gate
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@850a700a9803:/workspace/challenge# cd /workspace/challenge && cargo test
+[?2004l[1m[32m   Compiling[0m settlement-gate v0.1.0 (/workspace/challenge)
+[1m[36m    Building[0m [                             ] 0/3: settlement-gate                                                                                             [1m[36m    Building[0m [                             ] 0/3: settlement-gate, settlement_gate(test)                                                                      [1m[36m    Building[0m [==================>          ] 2/3: settlement_gate(test)                                                                                       [K[1m[32m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1.49s
+[1m[32m     Running[0m unittests src/lib.rs (target/debug/deps/settlement_gate-ab1d5f00257bbce0)
+
+running 3 tests
+test tests::small_transcript_reduction_matches_policy ... [32mok[m
+test tests::zero_payment_is_authorized ... [32mok[m
+test tests::canonicalizes_values_above_modulus ... [32mok[m
+
+test result: [32mok[m. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+[1m[32m   Doc-tests[0m settlement_gate
+cat > /tmp/check.rs <<'EOF'
+const P: u64 = 0xFFFF_FFFF_0000_0001;
+const E: u64 = 0xFFFF_FFFF;
+fn impl_reduce(amount: u64, fee: u64) -> u64 {
+    let high = fee >> 32;
+    let mid = fee & E;
+    let (low2, borrow) = amount.overflowing_sub(high);
+    let low2 = if borrow { low2.wrapping_add(P) } else { low2 };
+    let product = mid * E;
+    let (sum1, carry) = low2.overflowing_add(product);
+    let folded = if carry { sum1.wrapping_add(E) } else { sum1 };
+    if folded >= P { folded - P } else { folded }
+}
+fn main() {
+    let mut x: u64 = 0x1234_5678_9abc_def0;
+    for i in 0..5_000_000u64 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let amount = x;
+        x = x.rotate_left(17).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        let fee = x;
+        let expected = ((amount as u128 + (fee as u128) * (1u128 << 64)) % (P as u128)) as u64;
+        let actual = impl_reduce(amount, fee);
+        if actual != expected {
+            println!("mismatch i={i} amount={amount} fee={fee} actual={actual} expected={expected}");
+            std::process::exit(1);
+        }
+    }
+    println!("5,000,000 differential cases matched");
+}
+EOF
+rustc -C opt-level=3 -C overflow-checks=off /tmp/check.rs -o /tmp/check && /tmp/check
+
+running 0 tests
+
+test result: [32mok[m. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[?2004hroot@850a700a9803:/workspace/challenge# cat > /tmp/check.rs <<'EOF'
+[?2004l[?2004h> const P: u64 = 0xFFFF_FFFF_0000_0001;
+[?2004l[?2004h> const E: u64 = 0xFFFF_FFFF;
+[?2004l[?2004h> fn impl_reduce(amount: u64, fee: u64) -> u64 {
+[?2004l[?2004h>     let high = fee >> 32;
+[?2004l[?2004h>     let mid = fee & E;
+[?2004l[?2004h>     let (low2, borrow) = amount.overflowing_sub(high);
+[?2004l[?2004h>     let low2 = if borrow { low2.wrapping_add(P) } else { low2 };
+[?2004l[?2004h>     let product = mid * E;
+[?2004l[?2004h>     let (sum1, carry) = low2.overflowing_add(product);
+[?2004l[?2004h>     let folded = if carry { sum1.wrapping_add(E) } else { sum1 };
+[?2004l[?2004h>     if folded >= P { folded - P } else { folded }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let mut x: u64 = 0x1234_5678_9abc_def0;
+[?2004l[?2004h>     for i in 0..5_000_000u64 {
+[?2004l[?2004h>         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+[?2004l[?2004h>         let amount = x;
+[?2004l[?2004h>         x = x.rotate_left(17).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+[?2004l[?2004h>         let fee = x;
+[?2004l[?2004h>         let expected = ((amount as u128 + (fee as u128) * (1u128 << 64)) % (P as u128)) as u64;
+[?2004l[?2004h>         let actual = impl_reduce(amount, fee);
+[?2004l[?2004h>         if actual != expected {
+[?2004l[?2004h>             println!("mismatch i={i} amount={amount} fee={fee} actual={actual} expected={expected}");
+[?2004l[?2004h>             std::process::exit(1);
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("5,000,000 differential cases matched");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@850a700a9803:/workspace/challenge# rustc -C opt-level=3 -C overflow-checks=off /tmp/check.rs -o /tmp/check && /tmp/check
+[?2004l5,000,000 differential cases matched
+[?2004hroot@850a700a9803:/workspace/challenge# printf '\n-- submission --\n'; find /workspace/submission -maxdepth 4 -print -exec ls -ld {} \;
+[?2004l
+-- submission --
+/workspace/submission
+drwxr-xr-x 3 root root 4096 Oct 13 08:46 /workspace/submission
+/workspace/submission/src
+drwxr-xr-x 2 root root 4096 Oct 13 08:46 /workspace/submission/src
+[?2004hroot@850a700a9803:/workspace/challenge# cat > /tmp/check_auth.rs <<'EOF'
+[?2004l[?2004h> const P: u128 = 18446744069414584321u128;
+[?2004l[?2004h> const U64MAX: u128 = 18446744073709551615u128;
+[?2004l[?2004h> fn reduce(amount: u64, fee: u64) -> u64 {
+[?2004l[?2004h>     const MOD: u64 = 0xFFFF_FFFF_0000_0001;
+[?2004l[?2004h>     const EPS: u64 = 0xFFFF_FFFF;
+[?2004l[?2004h>     let high = fee >> 32;
+[?2004l[?2004h>     let mid = fee & EPS;
+[?2004l[?2004h>     let (low, borrow) = amount.overflowing_sub(high);
+[?2004l[?2004h>     let low = if borrow { low.wrapping_add(MOD) } else { low };
+[?2004l[?2004h>     let product = mid * EPS;
+[?2004l[?2004h>     let (sum, carry) = low.overflowing_add(product);
+[?2004l[?2004h>     let folded = if carry { sum.wrapping_add(EPS) } else { sum };
+[?2004l[?2004h>     if folded >= MOD { folded - MOD } else { folded }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn actual(balance: u64, amount: u64, fee: u64) -> Option<u64> {
+[?2004l[?2004h>     let surcharge = reduce(amount, fee);
+[?2004l[?2004h>     let total = (amount / 2).checked_add(surcharge)?;
+[?2004l[?2004h>     if total <= balance { Some(total) } else { None }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn expected(balance: u64, amount: u64, fee: u64) -> Option<u64> {
+[?2004l[?2004h>     let surcharge = ((amount as u128 + (fee as u128) * (1u128 << 64)) % P) as u128;
+[?2004l[?2004h>     let total = amount as u128 / 2 + surcharge;
+[?2004l[?2004h>     if total <= U64MAX && total <= balance as u128 { Some(total as u64) } else { None }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let vals: [u64; 25] = [
+[?2004l[?2004h>         0, 1, 2, 3, 0xFFFF_FFFF, 0x1_0000_0000,
+[?2004l[?2004h>         0x1_0000_0001, 0xFFFF_FFFE_FFFF_FFFF, 0xFFFF_FFFF_0000_0000,
+[?2004l[?2004h>         0xFFFF_FFFF_0000_0001, 0xFFFF_FFFF_0000_0002,
+[?2004l[?2004h>         0xFFFF_FFFF_FFFF_FFFE, u64::MAX,
+[?2004l[?2004h>         18446744069414584319, 18446744069414584320, 18446744069414584321,
+[?2004l[?2004h>         18446744069414584322, 18446744069414584330,
+[?2004l[?2004h>         9223372034707292160, 9223372034707292161, 9223372034707292165,
+[?2004l[?2004h>         9223372036854775807, 9223372036854775808, 9223372036854775809,
+[?2004l[?2004h>         4294967295,
+[?2004l[?2004h>     ];
+[?2004l[?2004h>     let mut cases: u64 = 0;
+[?2004l[?2004h>     for &b in &vals {
+[?2004l[?2004h>         for &a in &vals {
+[?2004l[?2004h>             for &f in &vals {
+[?2004l[?2004h>                 let x = actual(b, a, f);
+[?2004l[?2004h>                 let y = expected(b, a, f);
+[?2004l[?2004h>                 if x != y { panic!("boundary mismatch b={b} a={a} f={f}: {:?} != {:?}", x, y); }
+[?2004l[?2004h>                 cases += 1;
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     let mut x: u64 = 0x243f_6a88_85a3_08d3;
+[?2004l[?2004h>     for i in 0..10_000_000u64 {
+[?2004l[?2004h>         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+[?2004l[?2004h>         let b = x;
+[?2004l[?2004h>         x = x.rotate_left(23).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+[?2004l[?2004h>         let a = x;
+[?2004l[?2004h>         x = x.rotate_left(41).wrapping_mul(3202034522624059733).wrapping_add(1);
+[?2004l[?2004h>         let f = x;
+[?2004l[?2004h>         let got = actual(b, a, f);
+[?2004l[?2004h>         let want = expected(b, a, f);
+[?2004l[?2004h>         if got != want { panic!("random mismatch i={i} b={b} a={a} f={f}: {:?} != {:?}", got, want); }
+[?2004l[?2004h>         cases += 1;
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("{cases} complete authorization cases matched independent u128 specification");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@850a700a9803:/workspace/challenge# rustc -C opt-level=3 -C overflow-checks=off /tmp/check_auth.rs -o /tmp/check_auth && /tmp/check_auth
+[?2004l10015625 complete authorization cases matched independent u128 specification
+[?2004hroot@850a700a9803:/workspace/challenge# rm -rf /workspace/submission/src /workspace/submission/counterexample.json; printf 'safe\n' > /workspace/submission/verdict.txt; printf '\n-- final submission --\n'; find /workspace/submission -maxdepth 2 -print -exec ls -ld {} \;; printf '\n-- verdict --\n'; cat /workspace/submission/verdict.txt
+[?2004l
+-- final submission --
+/workspace/submission
+drwxr-xr-x 1 root root 4096 Oct 13 09:11 /workspace/submission
+/workspace/submission/verdict.txt
+-rw-r--r-- 1 root root 5 Oct 13 09:11 /workspace/submission/verdict.txt
+
+-- verdict --
+safe
+[?2004hroot@850a700a9803:/workspace/challenge# python3 - <<'PY'
+[?2004l[?2004h> P = 2**64 - 2**32 + 1
+[?2004l[?2004h> E = 2**32 - 1
+[?2004l[?2004h> 
+[?2004l[?2004h> def impl_reduce(amount, fee):
+[?2004l[?2004h>     high = fee >> 32
+[?2004l[?2004h>     mid = fee & E
+[?2004l[?2004h>     low2 = (amount - high) & ((1<<64)-1)
+[?2004l[?2004h>     if amount < high:
+[?2004l[?2004h>         low2 = (low2 + P) & ((1<<64)-1)
+[?2004l[?2004h>     product = mid * E
+[?2004l[?2004h>     total = low2 + product
+[?2004l[?2004h>     sum1 = total & ((1<<64)-1)
+[?2004l[?2004h>     if total >> 64:
+[?2004l[?2004h>         sum1 = (sum1 + E) & ((1<<64)-1)
+[?2004l[?2004h>     return sum1 - P if sum1 >= P else sum1
+[?2004l[?2004h> 
+[?2004l[?2004h> def expected(amount, fee):
+[?2004l[?2004h>     return (amount + fee * (1<<64)) % P
+[?2004l[?2004h> 
+[?2004l[?2004h> for amount in [0, 1, 2, E, 1<<32, 2**64-2, 2**64-1]:
+[?2004l[?2004h>   for fee in [E, 1<<32, (1<<32)|E, 2**64-1]:
+[?2004l[?2004h>     a = impl_reduce(amount, fee); b = expected(amount, fee)
+[?2004l[?2004h>     if a != b: print('mismatch', amount, fee, a, b)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Search a simple witness where the incorrect accepted debit is affordable but exact debit is not.
+[?2004l[?2004h> # Since the implementation is one too high in the relevant case, choose balance=bad total.
+[?2004l[?2004h> for amount in range(0, 1000):
+[?2004l[?2004h>   for fee in [E, (1<<32)|E, 2**64-1]:
+[?2004l[?2004h>     bad = impl_reduce(amount, fee); good = expected(amount, fee)
+[?2004l[?2004h>     if bad != good:
+[?2004l[?2004h>       total_bad = amount//2 + bad
+[?2004l[?2004h>       total_good = amount//2 + good
+[?2004l[?2004h>       if total_bad <= 2**64-1 and total_good > total_bad:
+[?2004l[?2004h>         print('witness', {'balance': total_bad, 'amount': amount, 'fee': fee, 'bad_surcharge': bad, 'good_surcharge': good, 'bad_total': total_bad, 'good_total': total_good})
+[?2004l[?2004h>         raise SystemExit
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@850a700a9803:/workspace/challenge# cat > /tmp/find.rs <<'EOF'
+[?2004l[?2004h> const P: u128 = 18446744069414584321;
+[?2004l[?2004h> const E: u64 = 0xFFFF_FFFF;
+[?2004l[?2004h> fn bad(amount: u64, fee: u64) -> u64 {
+[?2004l[?2004h>     let high = fee >> 32;
+[?2004l[?2004h>     let mid = fee & E;
+[?2004l[?2004h>     let (low2, borrow) = amount.overflowing_sub(high);
+[?2004l[?2004h>     let low2 = if borrow { low2.wrapping_add(P as u64) } else { low2 };
+[?2004l[?2004h>     let product = mid * E;
+[?2004l[?2004h>     let (sum1, carry1) = low2.overflowing_add(product);
+[?2004l[?2004h>     let folded = if carry1 { sum1.wrapping_add(E) } else { sum1 };
+[?2004l[?2004h>     if folded >= P as u64 { folded - P as u64 } else { folded }
+[?2004l[?2004h> }
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     for amount in 0u64..1000 {
+[?2004l[?2004h>         for fee in [E, 1u64 << 32, (1u64 << 32) | E, u64::MAX] {
+[?2004l[?2004h>             let got = bad(amount, fee);
+[?2004l[?2004h>             let want = ((amount as u128 + fee as u128 * (1u128 << 64)) % P) as u64;
+[?2004l[?2004h>             if got != want {
+[?2004l[?2004h>                 let bad_total = amount / 2 + got;
+[?2004l[?2004h>                 let good_total = amount as u128 / 2 + want as u128;
+[?2004l[?2004h>                 println!("amount={amount} fee={fee} bad_surcharge={got} good_surcharge={want} bad_total={bad_total} good_total={good_total}");
+[?2004l[?2004h>                 return;
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("no witness");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@850a700a9803:/workspace/challenge# rustc -C opt-level=3 -C overflow-checks=off /tmp/find.rs -o /tmp/find && /tmp/find
+[?2004lno witness
+[?2004hroot@850a700a9803:/workspace/challenge# cat > /tmp/check_real.rs <<'EOF'
+[?2004l[?2004h> #![allow(dead_code)]
+[?2004l[?2004h> include!("/workspace/challenge/src/lib.rs");
+[?2004l[?2004h> 
+[?2004l[?2004h> const P: u128 = 18446744069414584321u128;
+[?2004l[?2004h> const U64_MAX: u128 = 18446744073709551615u128;
+[?2004l[?2004h> 
+[?2004l[?2004h> fn expected(balance: u64, amount: u64, fee: u64) -> Option<u64> {
+[?2004l[?2004h>     let surcharge = ((amount as u128) + (fee as u128) * (1u128 << 64)) % P;
+[?2004l[?2004h>     let total = (amount as u128) / 2 + surcharge;
+[?2004l[?2004h>     if total <= U64_MAX && total <= balance as u128 {
+[?2004l[?2004h>         Some(total as u64)
+[?2004l[?2004h>     } else {
+[?2004l[?2004h>         None
+[?2004l[?2004h>     }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn check(balance: u64, amount: u64, fee: u64) {
+[?2004l[?2004h>     let got = authorize(balance, amount, fee).map(|x| x.total_debit);
+[?2004l[?2004h>     let want = expected(balance, amount, fee);
+[?2004l[?2004h>     assert_eq!(got, want, "mismatch balance={balance} amount={amount} fee={fee}: got={got:?} want={want:?}");
+[?2004l[?2004h>     let got_field = field::reduce_128(amount, fee) as u128;
+[?2004l[?2004h>     let want_field = ((amount as u128) + (fee as u128) * (1u128 << 64)) % P;
+[?2004l[?2004h>     assert_eq!(got_field, want_field, "field mismatch amount={amount} fee={fee}");
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> fn main() {
+[?2004l[?2004h>     let vals: [u64; 31] = [
+[?2004l[?2004h>         0, 1, 2, 3, 4, 0xFFFF_FFFF, 0x1_0000_0000,
+[?2004l[?2004h>         0x1_0000_0001, 0xFFFF_FFFE_FFFF_FFFF, 0xFFFF_FFFF_0000_0000,
+[?2004l[?2004h>         0xFFFF_FFFF_0000_0001, 0xFFFF_FFFF_0000_0002,
+[?2004l[?2004h>         0xFFFF_FFFF_FFFF_FFFE, u64::MAX,
+[?2004l[?2004h>         18446744069414584319, 18446744069414584320, 18446744069414584321,
+[?2004l[?2004h>         18446744069414584322, 18446744069414584330,
+[?2004l[?2004h>         9223372034707292160, 9223372034707292161, 9223372034707292165,
+[?2004l[?2004h>         9223372036854775807, 9223372036854775808, 9223372036854775809,
+[?2004l[?2004h>         4294967294, 4294967295, 4294967296,
+[?2004l[?2004h>         8589934590, 8589934591, 8589934592,
+[?2004l[?2004h>     ];
+[?2004l[?2004h>     let mut cases = 0u64;
+[?2004l[?2004h>     for &balance in &vals {
+[?2004l[?2004h>         for &amount in &vals {
+[?2004l[?2004h>             for &fee in &vals {
+[?2004l[?2004h>                 check(balance, amount, fee);
+[?2004l[?2004h>                 cases += 1;
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     // Explicitly exercise the middle-fold carry and high-fold borrow paths.
+[?2004l[?2004h>     for amount in [0, 1, 2, 0xFFFF_FFFF, 0x1_0000_0000, u64::MAX] {
+[?2004l[?2004h>         for fee in [0x0000_0000_FFFF_FFFF, 0x0000_0001_FFFF_FFFF, u64::MAX, 0xFFFF_FFFF_0000_0000] {
+[?2004l[?2004h>             for balance in [0, u64::MAX, amount / 2] {
+[?2004l[?2004h>                 check(balance, amount, fee);
+[?2004l[?2004h>                 cases += 1;
+[?2004l[?2004h>             }
+[?2004l[?2004h>         }
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     let mut x = 0x243f_6a88_85a3_08d3u64;
+[?2004l[?2004h>     for _ in 0..5_000_000u64 {
+[?2004l[?2004h>         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+[?2004l[?2004h>         let balance = x;
+[?2004l[?2004h>         x = x.rotate_left(23).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+[?2004l[?2004h>         let amount = x;
+[?2004l[?2004h>         x = x.rotate_left(41).wrapping_mul(3202034522624059733).wrapping_add(1);
+[?2004l[?2004h>         let fee = x;
+[?2004l[?2004h>         check(balance, amount, fee);
+[?2004l[?2004h>         cases += 1;
+[?2004l[?2004h>     }
+[?2004l[?2004h>     println!("{cases} cases matched the independent mathematical specification");
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@850a700a9803:/workspace/challenge# rustc -C opt-level=3 -C overflow-checks=off /tmp/check_real.rs -o /tmp/check_real && /tmp/check_real
+[?2004l5029863 cases matched the independent mathematical specification
+[?2004hroot@850a700a9803:/workspace/challenge# printf '\n-- submission contents --\n'; find /workspace/submission -mindepth 1 -maxdepth 3 -print; printf '\n-- verdict bytes --\n'; od -An -tx1c /workspace/submission/verdict.txt; test "$(cat /workspace/submission/verdict.txt)" = safe && test ! -e /workspace/submission/counterexample.json && test ! -e /workspace/submission/src && echo 'clean safe submission verified'
+[?2004l
+-- submission contents --
+/workspace/submission/verdict.txt
+
+-- verdict bytes --
+  73  61  66  65  0a
+   s   a   f   e  \n
+clean safe submission verified
+[?2004hroot@850a700a9803:/workspace/challenge# 

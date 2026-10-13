@@ -260,6 +260,11 @@ class Parser:
                     ty = self.parse_type() if self.accept(':') else None
                     self.take('='); value = self.expr(); self.take(';')
                     statements.append(('let_tuple', names, ty, value))
+                elif self.accept('Some'):
+                    self.take('('); self.accept('mut'); binding = self.name(); self.take(')')
+                    self.take('='); cond = self.expr(); self.take('else'); no = self.block(); self.take(';')
+                    arms = {'Some': (binding, ('var', binding)), 'None': (None, no)}
+                    statements.append(('let', binding, None, ('match', cond, arms)))
                 else:
                     self.accept('mut')
                     name = self.name(); ty = None
@@ -270,6 +275,11 @@ class Parser:
             elif re.fullmatch('[A-Za-z_][A-Za-z_0-9]*', self.peek()) and self.peek(1) == '=':
                 name = self.take(); self.take('='); value = self.expr(); self.take(';')
                 statements.append(('assign', name, value))
+            elif (re.fullmatch('[A-Za-z_][A-Za-z_0-9]*', self.peek())
+                  and self.peek(1) in ('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>')
+                  and self.peek(2) == '='):
+                name = self.take(); op = self.take(); self.take('='); value = self.expr(); self.take(';')
+                statements.append(('assign', name, ('binary', op, ('var', name), value)))
             else:
                 value = self.expr()
                 if self.accept(';'): statements.append(('stmt', value))
@@ -340,6 +350,8 @@ class Parser:
             item = self.take()
             width = 32 if t == 'u32' else 64 if t == 'u64' else 128
             if item == 'MAX': left = ('num', 2**width - 1, t)
+            elif item == 'MIN': left = ('num', 0, t)
+            elif item == 'BITS': left = ('num', width, 'u32' if 'u32' in self.int_types else t)
             elif item == 'from' and t in ('u64', 'u128'):
                 self.take('('); val = self.expr(); self.take(')'); left = ('cast', val, t)
             else: raise Unsupported('unsupported associated item')
@@ -385,13 +397,17 @@ class Parser:
                     continue
                 member = self.name()
                 if self.accept('('):
-                    arg = self.expr(); self.take(')')
-                    if member not in ('checked_add', 'checked_sub', 'checked_mul', 'checked_div', 'checked_rem',
-                                      'wrapping_add', 'wrapping_sub', 'wrapping_mul',
-                                      'overflowing_add', 'overflowing_sub', 'overflowing_mul',
-                                      'saturating_add', 'saturating_sub', 'div_ceil', 'then_some'):
-                        raise Unsupported('unsupported method ' + member)
-                    left = ('method', member, left, arg)
+                    if member in ('is_some', 'is_none'):
+                        self.take(')')
+                        left = ('method0', member, left)
+                    else:
+                        arg = self.expr(); self.take(')')
+                        if member not in ('checked_add', 'checked_sub', 'checked_mul', 'checked_div', 'checked_rem',
+                                          'wrapping_add', 'wrapping_sub', 'wrapping_mul',
+                                          'overflowing_add', 'overflowing_sub', 'overflowing_mul',
+                                          'saturating_add', 'saturating_sub', 'div_ceil', 'then_some', 'unwrap_or'):
+                            raise Unsupported('unsupported method ' + member)
+                        left = ('method', member, left, arg)
                 elif self.allow_modules:
                     left = ('field', left, member)
                 else:
@@ -804,6 +820,15 @@ class Interpreter:
                         if name: local[name] = val.data
                     out += self.evaluate(arm, local, g)
             return out
+        if k == 'method0':
+            op, target = e[1], e[2]
+            out = []
+            for g, val in self.evaluate(target, env, guard):
+                if val.ty == 'return': out.append((g, val)); continue
+                if val.ty not in ('some', 'none'): raise Unsupported(f'{op} requires Option')
+                res = (val.ty == 'some') if op == 'is_some' else (val.ty == 'none')
+                out.append((g, Value('bool', z3.BoolVal(res))))
+            return out
         if k in ('binary', 'method'):
             op = e[1]; out = []
             for g, a in self.evaluate(e[2], env, guard):
@@ -821,6 +846,16 @@ class Interpreter:
                     if op == 'then_some':
                         condition = typed(a, 'bool').data
                         out += [(z3.And(h, condition), Value('some', b)), (z3.And(h, z3.Not(condition)), Value('none'))]
+                        continue
+                    if op == 'unwrap_or':
+                        if a.ty not in ('some', 'none'): raise Unsupported('unwrap_or requires Option')
+                        if a.ty == 'some':
+                            if b.ty == 'literal': _ = typed(b, a.data.ty)
+                            elif a.data.ty == 'literal': out.append((h, typed(a.data, b.ty))); continue
+                            elif a.data.ty != b.ty: raise Unsupported('unwrap_or type mismatch')
+                            out.append((h, a.data))
+                        else:
+                            out.append((h, b))
                         continue
                     if op in ('<<', '>>'):
                         a_typed = typed(a, b.ty) if a.ty == 'literal' and b.ty in ('u32', 'u64', 'u128') else a
